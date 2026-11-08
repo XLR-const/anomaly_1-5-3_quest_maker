@@ -1,4 +1,13 @@
-﻿.venv/
+﻿$gitignore = @"
+venv/
+.venv/
 __pycache__/
-*.sqlite
+*.pyc
 _unpacked/
+RULE.md
+output/
+build/
+dist/
+*.spec
+"@
+Set-Content -Path .gitignore -Value $gitignore -Encoding UTF8
