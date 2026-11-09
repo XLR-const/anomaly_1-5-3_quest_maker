@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.core.models import (
@@ -42,8 +43,13 @@ from src.logger import get_logger
 
 if TYPE_CHECKING:
     from src.core.models import BaseAction, BaseCondition, ModProject
+    from src.db.repository import GameDatabase
 
 logger = get_logger("compiler.lua_gen")
+
+#: База ассетов проекта, используемая генератором как запасной источник
+#: соответствий ``npc_alias -> игровой id``, если клиент БД не передан явно.
+_DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "anomaly_db.sqlite"
 
 #: Имя глобальной таблицы, которую образует файл ``mymod_quests.script``.
 SCRIPT_TABLE = "mymod_quests"
@@ -82,16 +88,46 @@ class LuaGenerator:
     # Публичная точка входа
     # ------------------------------------------------------------------
 
-    def generate_quests_script(self, project: "ModProject") -> str:
+    def __init__(self, db_client: "GameDatabase | None" = None) -> None:
+        """Инициализирует генератор и запоминает клиент базы ассетов.
+
+        Args:
+            db_client (GameDatabase | None):
+                Необязательный клиент SQLite-базы Anomaly. Через него
+                генератор разрешает ``Dialog.npc_alias`` в реальный игровой
+                идентификатор NPC для автоматической инжекции диалогов.
+                Если клиент не передан, при генерации будет предпринята
+                попытка открыть базу проекта по стандартному пути.
+
+        Returns:
+            None: Конструктор ничего не возвращает.
+        """
+        self.db_client = db_client
+        logger.debug(
+            "LuaGenerator инициализирован: клиент БД=%s.",
+            type(db_client).__name__ if db_client is not None else "не передан",
+        )
+
+    def generate_quests_script(
+        self,
+        project: "ModProject",
+        db_client: "GameDatabase | None" = None,
+    ) -> str:
         """Формирует единый Lua-скрипт ``mymod_quests.script``.
 
-        Метод собирает шапку с хелперами, затем блоки всех квестов и всех
-        диалогов проекта. Ошибка в одном квесте или диалоге перехватывается,
-        журналируется и не мешает генерации остальных сущностей.
+        Метод собирает шапку с хелперами, функцией автоматической инжекции
+        диалогов и глобальным ``on_game_start()``, затем блоки всех квестов и
+        всех диалогов проекта. Ошибка в одном квесте или диалоге
+        перехватывается, журналируется и не мешает генерации остальных
+        сущностей.
 
         Args:
             project (ModProject):
                 Корневая модель проекта с картами ``quests`` и ``dialogs``.
+            db_client (GameDatabase | None):
+                Необязательный клиент базы, переопределяющий клиент,
+                сохранённый в конструкторе. Используется для разрешения
+                ``npc_alias`` при генерации инжекции диалогов.
 
         Returns:
             str: Готовый текст Lua 5.1 скрипта. Даже для пустого проекта
@@ -124,7 +160,8 @@ class LuaGenerator:
             )
             raise
 
-        blocks: list[str] = [self._build_header()]
+        active_db = db_client if db_client is not None else self.db_client
+        blocks: list[str] = [self._build_header(project, active_db)]
         generated_quests = 0
         generated_dialogs = 0
         skipped_quests = 0
@@ -191,12 +228,26 @@ class LuaGenerator:
     # Шапка и служебные хелперы
     # ------------------------------------------------------------------
 
-    def _build_header(self) -> str:
+    def _build_header(
+        self,
+        project: Any = None,
+        db_client: "GameDatabase | None" = None,
+    ) -> str:
         """Собирает шапку скрипта со служебными функциями.
 
         Шапка содержит безопасные обёртки над штатными ``save_var`` и
-        ``load_var``, resolver целей, проверку захвата смарта и спавн отряда.
-        Именно эти хелперы используют сгенерированные квестовые функторы.
+        ``load_var``, resolver целей, проверку захвата смарта, спавн отряда,
+        а также функцию ``inject_mymod_dialogs()`` и глобальный
+        ``on_game_start()``. Именно эти хелперы используют сгенерированные
+        квестовые функторы и механизм подключения диалогов.
+
+        Args:
+            project (Any):
+                Проект, из карты ``dialogs`` которого собираются пары
+                ``npc_alias -> dialog_id``. Может быть ``None`` при прямом
+                вызове шапки без проекта.
+            db_client (GameDatabase | None):
+                Клиент базы для разрешения NPC-алиасов в игровые id.
 
         Returns:
             str: Текст шапки без завершающих пустых строк.
@@ -352,12 +403,276 @@ class LuaGenerator:
                 "    squad.force_online = true",
                 "end",
             ]
+            lines.extend(
+                self._build_dialog_injection(project, db_client)
+            )
 
             logger.debug("Шапка Lua-скрипта сформирована: строк — %d.", len(lines))
             return "\n".join(lines)
         except Exception as exc:
             logger.exception("Не удалось сформировать шапку Lua-скрипта: %s", exc)
             raise
+
+    def _build_dialog_injection(
+        self,
+        project: Any,
+        db_client: "GameDatabase | None",
+    ) -> list[str]:
+        """Собирает Lua-блок автоматической инжекции диалогов в NPC.
+
+        В блок входит таблица пар ``npc_id -> dialog_id``, глобальная функция
+        ``inject_mymod_dialogs()`` и глобальный ``on_game_start()``, который
+        вызывает её сразу после старта игры. Алиасы NPC разрешаются через
+        :class:`~src.db.repository.GameDatabase` ещё на этапе компиляции,
+        поэтому сгенерированный Lua-скрипт не зависит от SQLite-базы.
+
+        Args:
+            project (Any):
+                Проект с картой ``dialogs``. Если проект пуст или передан
+                ``None``, создаётся функция с пустой таблицей инжекций.
+            db_client (GameDatabase | None):
+                Клиент базы для поиска NPC по алиасу. При ``None``
+                предпринимается попытка открыть стандартную базу проекта.
+
+        Returns:
+            list[str]: Строки Lua-блока без завершающего перевода строки.
+        """
+        injections = self._collect_dialog_injections(project, db_client)
+
+        lines = [
+            "",
+            "-- Автоматическая инжекция диалогов мода в профили NPC.",
+            "local MYMOD_DIALOG_INJECTIONS = {",
+        ]
+
+        for npc_literal, dialog_id in injections:
+            lines.append(
+                "    { npc_id = "
+                f"{npc_literal}, dialog_id = {self._lua_string(dialog_id)} }},"
+            )
+
+        if not injections:
+            lines.append(
+                "    -- Диалоги не найдены или NPC-алиасы не разрешились."
+            )
+
+        lines.extend(
+            [
+                "}",
+                "",
+                "-- Принудительно регистрирует диалоги мода в памяти профилей NPC.",
+                "function inject_mymod_dialogs()",
+                "    if not character_community then",
+                "        return",
+                "    end",
+                "",
+                "    if not character_community.get_character_profile then",
+                "        return",
+                "    end",
+                "",
+                "    for _, injection in ipairs(MYMOD_DIALOG_INJECTIONS) do",
+                "        local npc_id = injection.npc_id",
+                "        local dialog_id = injection.dialog_id",
+                (
+                    "        local profile = "
+                    "character_community.get_character_profile(npc_id)"
+                ),
+                "",
+                "        if profile then",
+                "            profile:add_actor_dialog(dialog_id)",
+                "        end",
+                "    end",
+                "end",
+                "",
+                "-- Автозагрузка Anomaly: диалоги подключаются сразу после старта.",
+                "function on_game_start()",
+                "    inject_mymod_dialogs()",
+                "end",
+            ]
+        )
+
+        logger.debug(
+            "Блок инжекции диалогов сформирован: записей — %d.",
+            len(injections),
+        )
+        return lines
+
+    def _collect_dialog_injections(
+        self,
+        project: Any,
+        db_client: "GameDatabase | None",
+    ) -> list[tuple[str, str]]:
+        """Разрешает все диалоги проекта в пары ``(npc_id, dialog_id)``.
+
+        Для каждого диалога берётся ``npc_alias`` и ищется в
+        :class:`~src.db.repository.GameDatabase` методом
+        ``find_npc_by_alias``. Если алиас не найден, база недоступна или
+        запись повреждена, диалог пропускается с предупреждением в логе.
+
+        Args:
+            project (Any):
+                Проект мода с картой ``dialogs``.
+            db_client (GameDatabase | None):
+                Клиент базы. Если ``None``, используется клиент генератора
+                или стандартная база проекта.
+
+        Returns:
+            list[tuple[str, str]]: Список пар «Lua-литерал игрового id NPC» и
+            «идентификатор диалога». Пустой список означает, что инжекция
+            сгенерируется без записей.
+        """
+        dialogs = getattr(project, "dialogs", None)
+        if not isinstance(dialogs, Mapping) or not dialogs:
+            logger.debug("В проекте нет диалогов для инжекции.")
+            return []
+
+        active_db = db_client if db_client is not None else self.db_client
+        owned_db = None
+        if active_db is None:
+            active_db, owned_db = self._open_default_database()
+
+        injections: list[tuple[str, str]] = []
+        try:
+            for dialog_id, dialog in dialogs.items():
+                try:
+                    dialog_key = str(dialog_id)
+                    npc_alias = getattr(dialog, "npc_alias", None)
+
+                    if not isinstance(npc_alias, str) or not npc_alias.strip():
+                        logger.warning(
+                            "Диалог '%s' пропущен для инжекции: "
+                            "некорректный npc_alias=%r.",
+                            dialog_key,
+                            npc_alias,
+                        )
+                        continue
+
+                    if active_db is None:
+                        logger.warning(
+                            "Диалог '%s' пропущен для инжекции: "
+                            "база ассетов недоступна.",
+                            dialog_key,
+                        )
+                        continue
+
+                    npc = active_db.find_npc_by_alias(npc_alias)
+                    if not isinstance(npc, Mapping):
+                        logger.warning(
+                            "Диалог '%s' пропущен для инжекции: NPC по "
+                            "алиасу '%s' не найден.",
+                            dialog_key,
+                            npc_alias,
+                        )
+                        continue
+
+                    npc_id = npc.get("id") or npc.get("entity_id")
+                    if npc_id is None:
+                        logger.warning(
+                            "Диалог '%s' пропущен для инжекции: у NPC '%s' "
+                            "нет игрового id.",
+                            dialog_key,
+                            npc_alias,
+                        )
+                        continue
+
+                    injections.append(
+                        (self._lua_scalar(npc_id), dialog_key)
+                    )
+                    logger.debug(
+                        "Диалог '%s' привязан к NPC '%s' (id=%r).",
+                        dialog_key,
+                        npc_alias,
+                        npc_id,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Не удалось разрешить NPC для диалога '%s': %s",
+                        dialog_id,
+                        exc,
+                        exc_info=True,
+                    )
+        finally:
+            if owned_db is not None:
+                try:
+                    owned_db.__exit__(None, None, None)
+                except Exception as exc:
+                    logger.exception(
+                        "Не удалось закрыть временное подключение к БД: %s",
+                        exc,
+                    )
+
+        logger.info(
+            "Разрешено диалогов для инжекции: %d из %d.",
+            len(injections),
+            len(dialogs),
+        )
+        return injections
+
+    def _open_default_database(
+        self,
+    ) -> tuple["GameDatabase | None", "GameDatabase | None"]:
+        """Открывает стандартную базу проекта как запасной источник алиасов.
+
+        Returns:
+            tuple[GameDatabase | None, GameDatabase | None]:
+                Пара ``(клиент, владелец)``. Второй элемент не равен ``None``,
+                если соединение открыто этим методом и должно быть закрыто
+                вызывающим кодом.
+
+        Raises:
+            None: Ошибки открытия базы журналируются и не пробрасываются.
+        """
+        if not _DEFAULT_DB_PATH.is_file():
+            logger.warning(
+                "База ассетов не найдена для инжекции диалогов: %s",
+                _DEFAULT_DB_PATH,
+            )
+            return None, None
+
+        try:
+            from src.db.repository import GameDatabase
+
+            db_client = GameDatabase(_DEFAULT_DB_PATH)
+            logger.debug(
+                "Для инжекции диалогов открыта база: %s",
+                _DEFAULT_DB_PATH,
+            )
+            return db_client, db_client
+        except Exception as exc:
+            logger.exception(
+                "Не удалось открыть базу для инжекции диалогов: %s",
+                exc,
+            )
+            return None, None
+
+    def _lua_scalar(self, value: Any) -> str:
+        """Преобразует скалярное значение в безопасный Lua-литерал.
+
+        Args:
+            value (Any):
+                Игровой id NPC: обычно строка вида
+                ``"esc_3_16_military_trader"``, но допускается и число.
+
+        Returns:
+            str: Строковый или числовой Lua-литерал.
+
+        Raises:
+            TypeError:
+                Если значение имеет неподдерживаемый тип.
+        """
+        if isinstance(value, bool):
+            return "true" if value else "false"
+
+        if isinstance(value, (int, float)):
+            return str(value)
+
+        if isinstance(value, str):
+            return self._lua_string(value)
+
+        raise TypeError(
+            "Игровой id NPC должен быть строкой или числом, а получен "
+            f"{type(value).__name__}."
+        )
 
     def _build_footer(self) -> str:
         """Собирает завершающий комментарий скрипта.

@@ -31,6 +31,7 @@ from src.logger import get_logger
 
 if TYPE_CHECKING:
     from src.core.models import ModProject
+    from src.db.repository import GameDatabase
 
 logger = get_logger("compiler.builder")
 
@@ -163,13 +164,23 @@ class ModBuilder:
             отдельных проектов.
     """
 
-    def __init__(self, output_dir: Path = Path("output")) -> None:
+    def __init__(
+        self,
+        output_dir: Path = Path("output"),
+        db_client: "GameDatabase | None" = None,
+    ) -> None:
         """Инициализирует сборщик и запоминает корневую директорию экспорта.
 
         Args:
             output_dir (Path):
                 Базовая директория, внутри которой будет создан каталог
                 ``<slug>/gamedata``. Может быть передана строкой.
+            db_client (GameDatabase | None):
+                Необязательный клиент SQLite-базы Anomaly. Передаётся в
+                :class:`~src.compiler.lua_gen.LuaGenerator`, чтобы при сборке
+                разрешить ``Dialog.npc_alias`` и сгенерировать автоматическую
+                инжекцию диалогов в профили NPC. Если клиент не передан,
+                генератор попытается открыть стандартную базу проекта.
 
         Returns:
             None: Конструктор ничего не возвращает.
@@ -188,9 +199,11 @@ class ModBuilder:
                 )
 
             self.output_dir = Path(output_dir)
+            self.db_client = db_client
             logger.info(
-                "ModBuilder инициализирован: output_dir='%s'.",
+                "ModBuilder инициализирован: output_dir='%s', клиент БД=%s.",
                 self.output_dir,
+                type(db_client).__name__ if db_client is not None else "не передан",
             )
         except Exception as exc:
             logger.exception("Не удалось инициализировать ModBuilder: %s", exc)
@@ -250,7 +263,7 @@ class ModBuilder:
 
             ltx_generator = LtxGenerator()
             xml_generator = XmlGenerator()
-            lua_generator = LuaGenerator()
+            lua_generator = LuaGenerator(db_client=self.db_client)
             logger.debug(
                 "Генераторы LTX, XML и Lua инициализированы для проекта '%s'.",
                 slug,
