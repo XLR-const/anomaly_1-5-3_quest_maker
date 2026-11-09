@@ -460,27 +460,19 @@ class LuaGenerator:
             [
                 "}",
                 "",
-                "-- Принудительно регистрирует диалоги мода в памяти профилей NPC.",
+                "-- Безопасная регистрация диалогов мода через dialog_manager Anomaly.",
                 "function inject_mymod_dialogs()",
-                "    if not character_community then",
-                "        return",
-                "    end",
-                "",
-                "    if not character_community.get_character_profile then",
+                "    if not dialog_manager or not dialog_manager.start_dialogs then",
                 "        return",
                 "    end",
                 "",
                 "    for _, injection in ipairs(MYMOD_DIALOG_INJECTIONS) do",
                 "        local npc_id = injection.npc_id",
                 "        local dialog_id = injection.dialog_id",
-                (
-                    "        local profile = "
-                    "character_community.get_character_profile(npc_id)"
-                ),
-                "",
-                "        if profile then",
-                "            profile:add_actor_dialog(dialog_id)",
+                "        if not dialog_manager.start_dialogs[npc_id] then",
+                "            dialog_manager.start_dialogs[npc_id] = {}",
                 "        end",
+                "        table.insert(dialog_manager.start_dialogs[npc_id], dialog_id)",
                 "    end",
                 "end",
                 "",
@@ -496,6 +488,7 @@ class LuaGenerator:
             len(injections),
         )
         return lines
+
 
     def _collect_dialog_injections(
         self,
