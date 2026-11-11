@@ -22,21 +22,32 @@ from src.logger import get_logger
 logger = get_logger("compiler.encoding")
 
 
-def write_file_cp1251(path: Path, content: str) -> None:
-    """Записывает текст в файл в кодировке Windows-1251 без BOM.
+def write_file_cp1251(
+    path: Path,
+    content: str,
+    *,
+    bom: bool = False,
+) -> None:
+    """Записывает текст в файл в кодировке Windows-1251.
 
-    Перед записью автоматически создаются все отсутствующие родительские
-    каталоги. Кодек ``cp1251`` не добавляет BOM, поэтому итоговый файл
-    начинается непосредственно с содержимого, как того требуют игровые
-    конфиги, Lua-скрипты и XML-таблицы S.T.A.L.K.E.R. Anomaly.
+    Все сгенерированные файлы (``tm_<mod>.ltx``, ``dialogs_<mod>.xml``,
+    ``st_<mod>.xml`` и ``<mod>_quests.script``) пишутся **без BOM**, как
+    требует ``standart_of_auto.md`` (1.3 и 2.1). Патченные копии ванильных
+    конфигов (``system.ltx`` и ``character_desc_<level>.xml``) наследуют
+    исходный BOM, поэтому для них ``bom=True``: без этого движок X-Ray
+    может прочитать первый ключ/тег как часть имени.
 
     Args:
         path (Path):
-            Путь к создаваемому или перезаписываемому файлу.
+            Путь к создаваемому или перезаписываемому файлу. Родительские
+            каталоги создаются автоматически.
         content (str):
-            Текстовое содержимое файла. Кириллица должна быть представлена
-            обычными Unicode-символами; кодирование выполняется внутри
-            функции.
+            Текстовое содержимое файла. Кириллица передаётся обычными
+            Unicode-символами; кодирование выполняется внутри функции.
+        bom (bool):
+            Если ``True``, перед байтами cp1251 записывается BOM
+            ``EF BB BF``. Используется только для патченных ванильных
+            файлов, где BOM уже был.
 
     Returns:
         None: Функция ничего не возвращает.
@@ -49,12 +60,14 @@ def write_file_cp1251(path: Path, content: str) -> None:
             Если в строке есть символы, которые невозможно представить в
             Windows-1251.
         TypeError:
-            Если ``content`` не является строкой.
+            Если ``content`` не является строкой или ``bom`` не является
+            ``bool``.
     """
     logger.debug(
-        "Запись файла '%s' в cp1251 (символов: %d).",
+        "Запись файла '%s' в cp1251 (символов: %d, BOM=%s).",
         path,
         len(content) if isinstance(content, str) else 0,
+        bom,
     )
 
     if not isinstance(content, str):
@@ -64,16 +77,18 @@ def write_file_cp1251(path: Path, content: str) -> None:
         )
         logger.error("Некорректный тип содержимого: %s", error)
         raise error
+    if not isinstance(bom, bool):
+        raise TypeError(
+            "Аргумент bom должен быть bool, "
+            f"а получен {type(bom).__name__}."
+        )
 
     try:
+        payload = content.encode("cp1251", errors="strict")
+        if bom:
+            payload = codecs.BOM_UTF8 + payload
         path.parent.mkdir(parents=True, exist_ok=True)
-        with codecs.open(
-            path,
-            mode="w",
-            encoding="cp1251",
-            errors="strict",
-        ) as stream:
-            stream.write(content)
+        path.write_bytes(payload)
     except (OSError, UnicodeError) as exc:
         logger.exception(
             "Не удалось записать файл '%s' в кодировке cp1251: %s",
@@ -82,7 +97,36 @@ def write_file_cp1251(path: Path, content: str) -> None:
         )
         raise
 
-    logger.info("Файл '%s' успешно сохранён в cp1251 без BOM.", path)
+    logger.info(
+        "Файл '%s' успешно сохранён в cp1251 (BOM=%s).", path, bom
+    )
+
+
+def read_file_cp1251(path: Path) -> tuple[str, bool]:
+    """Читает ванильный конфиг cp1251, отделяя и сохраняя признак BOM.
+
+    Патчер ``system.ltx`` и ``character_desc_<level>.xml`` обязан вернуть
+    файл с тем же BOM, который был в исходнике (``standart_of_auto.md``,
+    1.2 и 1.3). Декодирование выполняется по байтам, без ``utf-8-sig`` и
+    без автоматического удаления BOM кодеком.
+
+    Args:
+        path (Path):
+            Путь к ванильному файлу в ``_unpacked/configs``.
+
+    Returns:
+        tuple[str, bool]:
+            Декодированный текст без BOM и флаг ``has_bom``.
+
+    Raises:
+        OSError: Если файл не удалось прочитать.
+        UnicodeDecodeError: Если байты не являются корректным cp1251.
+    """
+    raw = Path(path).read_bytes()
+    has_bom = raw.startswith(codecs.BOM_UTF8)
+    if has_bom:
+        raw = raw[len(codecs.BOM_UTF8) :]
+    return raw.decode("cp1251"), has_bom
 
 
 def escape_xml_text(text: str) -> str:
@@ -146,4 +190,4 @@ def escape_xml_text(text: str) -> str:
     return escaped
 
 
-__all__ = ["escape_xml_text", "write_file_cp1251"]
+__all__ = ["escape_xml_text", "read_file_cp1251", "write_file_cp1251"]

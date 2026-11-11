@@ -1,45 +1,110 @@
 """Строго типизированные модели сюжетных квестов и диалогов S.T.A.L.K.E.R. Anomaly.
 
-Модуль содержит только предметную модель редактора: условия, действия,
-реплики, диалоги, этапы, квесты и корневой проект мода. Здесь нет логики
-сборки игровых файлов (LTX/XML/Lua) — она вынесена в слой ``src.compiler``.
+Модуль является ``[1] LOAD``-слоем конвейера, описанного в
+``standart_of_auto.md`` (раздел 3). Pydantic-модели:
 
-Полиморфизм условий и действий реализован через дискриминируемые объединения
-Pydantic. Каждый конкретный класс содержит литеральное поле ``type``, которое
-выступает дискриминатором при чтении JSON/YAML:
+* принимают «сырые» строки SQLite (``NULL``/``TEXT``/``INTEGER`` вперемешку)
+  благодаря ``extra="allow"`` и ``coerce_numbers_to_str=True``;
+* сохраняют любые неизвестные колонки БД в ``model_extra`` и не теряют их при
+  сериализации;
+* проверяют структурные инварианты графов реплик и этапов до того, как данные
+  попадут в генераторы ``dialogs_<mod>.xml``, ``tm_<mod>.ltx`` и
+  ``<mod>_quests.script``.
 
-* условия: ``has_info``, ``dont_has_info``, ``has_item``, ``smart_owner``;
-* действия: ``give_info``, ``remove_info``, ``spawn_squad``, ``set_target``,
-  ``give_item``, ``remove_item``, ``give_money``.
-
-Пример создания минимального диалога::
-
-    dialog = Dialog(
-        id="mymod_start_dialog",
-        npc_alias="esc.mayor_zhurov",
-        phrases={
-            0: Phrase(id=0, text_ru="Здравствуй.", text_en="Hello."),
-            1: Phrase(id=1, text_ru="До встречи.", text_en="See you."),
-        },
-    )
-
-Все модели используют ``extra="forbid"``: опечатка в имени поля приводит к
-ошибке валидации, а не к молчаливой потере данных. Для графов фраз и этапов
-дополнительно проверяются ссылочная целостность и непрерывность нумерации.
+Модели намеренно не содержат runtime-идентификаторов отрядов: ``alife``-id
+появляются только в pstor во время игры (см. ``standart_of_auto.md``, 3.3).
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, Self, TypeAlias, Union
+from typing import Annotated, Any, Literal, Self, TypeAlias, Union
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
-#: Общая конфигурация всех моделей модуля.
+# ---------------------------------------------------------------------------
+# Общая конфигурация моделей
+# ---------------------------------------------------------------------------
+
+#: Единая конфигурация всех моделей проекта.
 #:
-#: ``extra="forbid"`` запрещает неизвестные поля, ``validate_assignment=True``
-#: повторно запускает валидаторы при присваивании значений атрибутам.
-_MODEL_CONFIG = ConfigDict(extra="forbid", validate_assignment=True)
+#: * ``extra="allow"`` — колонки SQLite, которых нет в схеме, сохраняются в
+#:   ``model_extra`` и не вызывают ``ValidationError`` (стандарт, 3.3.3).
+#: * ``coerce_numbers_to_str=True`` — числовые server/story id из БД
+#:   превращаются в строки, как того требует движок X-Ray.
+#: * ``populate_by_name=True`` — позволяет создавать модели и по имени поля,
+#:   и по алиасу.
+#: * ``validate_assignment=True`` — изменение поля после создания снова
+#:   запускает валидаторы, поэтому граф диалога/квеста нельзя испортить
+#:   присваиванием.
+_MODEL_CONFIG = ConfigDict(
+    extra="allow",
+    coerce_numbers_to_str=True,
+    populate_by_name=True,
+    validate_assignment=True,
+)
+
+
+def _normalize_optional_id(value: Any) -> Any:
+    """Нормализует необязательный идентификатор перед Pydantic-валидацией.
+
+    В SQLite идентификаторы часто хранятся как ``NULL``, пустая строка или
+    число ``0``. Для игровых ссылок все три значения означают «ссылки нет».
+    Функция приводит их к ``None``; остальные значения оставляет без изменения,
+    чтобы ``coerce_numbers_to_str`` превратил числа в строки.
+
+    Args:
+        value (Any):
+            Сырое значение из JSON, YAML или строки SQLite.
+
+    Returns:
+        Any: ``None`` для ``None``/``""``/``0``, иначе исходное значение.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return None if value == 0 else value
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return value
+
+
+def _require_non_empty_id(value: Any) -> Any:
+    """Проверяет обязательный идентификатор до приведения к строке.
+
+    Args:
+        value (Any):
+            Сырое значение идентификатора.
+
+    Returns:
+        Any: Исходное значение, если оно не пустое.
+
+    Raises:
+        ValueError: Если идентификатор пуст, равен ``None`` или состоит из
+            одних пробелов.
+    """
+    if value is None:
+        raise ValueError("Обязательный идентификатор не может быть None.")
+    if isinstance(value, str) and not value.strip():
+        raise ValueError("Обязательный идентификатор не может быть пустым.")
+    return value
+
+
+#: Необязательный строковый идентификатор с нормализацией ``None``/``""``/``0``.
+OptionalId: TypeAlias = Annotated[str | None, BeforeValidator(_normalize_optional_id)]
+
+#: Обязательный непустой строковый идентификатор.
+RequiredId: TypeAlias = Annotated[str, BeforeValidator(_require_non_empty_id)]
 
 
 # ---------------------------------------------------------------------------
@@ -48,117 +113,61 @@ _MODEL_CONFIG = ConfigDict(extra="forbid", validate_assignment=True)
 
 
 class BaseCondition(BaseModel):
-    """Базовый класс условия доступности диалога или отдельной реплики.
+    """Базовое условие диалога или реплики.
 
-    Класс не предназначен для прямого создания: в модели используются его
-    наследники, объединённые в дискриминируемый псевдоним :data:`Condition`.
-    Поле :attr:`type` является строковым дискриминатором и должно совпадать
-    с литеральным значением конкретного наследника.
-
-    Attributes:
-        type (str):
-            Идентификатор типа условия. В конкретных наследниках сужается до
-            ``Literal``, например ``"has_info"`` или ``"has_item"``.
+    Условия транслируются генераторами в теги ``<has_info>``,
+    ``<dont_has_info>`` и Lua-проверки внутри ``dialogs_<mod>.xml`` /
+    ``<mod>_quests.script`` (``standart_of_auto.md``, 2.1 и 2.3).
     """
 
     model_config = _MODEL_CONFIG
 
-    type: str = Field(
-        description=(
-            "Строковый дискриминатор типа условия. Определяется конкретным "
-            "наследником BaseCondition."
-        )
-    )
+    type: str = Field(description="Строковый дискриминатор типа условия.")
 
 
 class HasInfo(BaseCondition):
-    """Условие: у актора есть указанный информационный портфель.
+    """Условие «у игрока есть инфопоршень».
 
-    Attributes:
-        type (Literal["has_info"]):
-            Дискриминатор условия, всегда ``"has_info"``.
-        info (str):
-            Идентификатор информации (info portion), наличие которой
-            проверяется у актора.
+    Генерирует ``<has_info>`` в XML и ``has_alife_info(...)`` в Lua.
     """
 
-    type: Literal["has_info"] = Field(
-        default="has_info",
-        description="Дискриминатор условия: наличие информации у актора.",
-    )
-    info: str = Field(
-        description="Идентификатор информации, наличие которой проверяется.",
-    )
+    type: Literal["has_info"] = Field(default="has_info")
+    info: RequiredId = Field(description="Идентификатор информации.")
 
 
 class DontHasInfo(BaseCondition):
-    """Условие: у актора отсутствует указанный информационный портфель.
+    """Условие «у игрока нет инфопоршня».
 
-    Attributes:
-        type (Literal["dont_has_info"]):
-            Дискриминатор условия, всегда ``"dont_has_info"``.
-        info (str):
-            Идентификатор информации, отсутствие которой проверяется.
+    Генерирует ``<dont_has_info>`` в XML и ``not has_alife_info(...)`` в Lua.
     """
 
-    type: Literal["dont_has_info"] = Field(
-        default="dont_has_info",
-        description="Дискриминатор условия: отсутствие информации у актора.",
-    )
-    info: str = Field(
-        description="Идентификатор информации, отсутствие которой проверяется.",
-    )
+    type: Literal["dont_has_info"] = Field(default="dont_has_info")
+    info: RequiredId = Field(description="Идентификатор информации.")
 
 
 class HasItem(BaseCondition):
-    """Условие: в инвентаре актора есть указанный предмет.
+    """Условие «в инвентаре игрока есть предмет».
 
-    Attributes:
-        type (Literal["has_item"]):
-            Дискриминатор условия, всегда ``"has_item"``.
-        item_alias (str):
-            Алиас предмета из игровой базы данных, например
-            ``"weapon.vssk_vykhlop"``.
+    В XML не имеет отдельного тега, поэтому выносится в Lua-предусловие
+    ``dialogs.<dialog_id>_phrase_<id>_precondition``.
     """
 
-    type: Literal["has_item"] = Field(
-        default="has_item",
-        description="Дискриминатор условия: наличие предмета у актора.",
-    )
-    item_alias: str = Field(
-        description="Алиас предмета, наличие которого проверяется.",
-    )
+    type: Literal["has_item"] = Field(default="has_item")
+    item_alias: str = Field(description="Секция/алиас предмета.")
 
 
 class SmartOwner(BaseCondition):
-    """Условие: смарт-террейн принадлежит указанной фракции.
+    """Условие «смарт-террейн принадлежит указанной фракции».
 
-    Attributes:
-        type (Literal["smart_owner"]):
-            Дискриминатор условия, всегда ``"smart_owner"``.
-        smart_alias (str):
-            Алиас смарт-террейна из игровой базы данных.
-        faction (str):
-            Техническое имя фракции, которая должна владеть смартом,
-            например ``"army"`` или ``"stalker"``.
+    Используется в Warfare-квестах; транслируется в Lua-проверку через
+    ``SIMBOARD.smarts_by_names`` и ``smart.owning_faction``.
     """
 
-    type: Literal["smart_owner"] = Field(
-        default="smart_owner",
-        description="Дискриминатор условия: принадлежность смарта фракции.",
-    )
-    smart_alias: str = Field(
-        description="Алиас проверяемого смарт-террейна.",
-    )
-    faction: str = Field(
-        description="Техническое имя фракции-владельца смарта.",
-    )
+    type: Literal["smart_owner"] = Field(default="smart_owner")
+    smart_alias: str = Field(description="Алиас смарт-террейна.")
+    faction: str = Field(description="Техническое имя фракции-владельца.")
 
 
-#: Дискриминируемое объединение всех поддерживаемых условий.
-#:
-#: Pydantic выбирает конкретный класс по значению поля ``type``. Именно этот
-#: псевдоним следует использовать в полях ``preconditions``.
 Condition: TypeAlias = Annotated[
     Union[HasInfo, DontHasInfo, HasItem, SmartOwner],
     Field(discriminator="type"),
@@ -171,178 +180,95 @@ Condition: TypeAlias = Annotated[
 
 
 class BaseAction(BaseModel):
-    """Базовый класс действия, выполняемого игрой при событии квеста.
+    """Базовое действие квеста, этапа или реплики.
 
-    Класс не предназначен для прямого создания: в модели используются его
-    наследники, объединённые в дискриминируемый псевдоним :data:`Action`.
-    Поле :attr:`type` является строковым дискриминатором и должно совпадать
-    с литеральным значением конкретного наследника.
-
-    Attributes:
-        type (str):
-            Идентификатор типа действия. В конкретных наследниках сужается до
-            ``Literal``, например ``"give_info"`` или ``"give_money"``.
+    Действия транслируются в эффекты ``xr_effects.<quest_id>_*`` и
+    ``dialogs.<dialog_id>_*`` внутри ``<mod>_quests.script``, а также в
+    декларативные теги ``<give_info>`` / ``<action>`` файла диалогов.
     """
 
     model_config = _MODEL_CONFIG
 
-    type: str = Field(
-        description=(
-            "Строковый дискриминатор типа действия. Определяется конкретным "
-            "наследником BaseAction."
-        )
-    )
+    type: str = Field(description="Строковый дискриминатор типа действия.")
 
 
 class GiveInfo(BaseAction):
-    """Действие: выдать актору информационный портфель.
+    """Выдать игроку инфопоршень (``<give_info>`` или Lua-вызов)."""
 
-    Attributes:
-        type (Literal["give_info"]):
-            Дискриминатор действия, всегда ``"give_info"``.
-        info (str):
-            Идентификатор выдаваемой информации.
-    """
-
-    type: Literal["give_info"] = Field(
-        default="give_info",
-        description="Дискриминатор действия: выдача информации.",
-    )
-    info: str = Field(
-        description="Идентификатор выдаваемой информации.",
-    )
+    type: Literal["give_info"] = Field(default="give_info")
+    info: RequiredId = Field(description="Идентификатор выдаваемой информации.")
 
 
 class RemoveInfo(BaseAction):
-    """Действие: забрать у актора информационный портфель.
+    """Снять с игрока инфопоршень."""
 
-    Attributes:
-        type (Literal["remove_info"]):
-            Дискриминатор действия, всегда ``"remove_info"``.
-        info (str):
-            Идентификатор удаляемой информации.
-    """
-
-    type: Literal["remove_info"] = Field(
-        default="remove_info",
-        description="Дискриминатор действия: удаление информации.",
-    )
-    info: str = Field(
-        description="Идентификатор удаляемой информации.",
-    )
+    type: Literal["remove_info"] = Field(default="remove_info")
+    info: RequiredId = Field(description="Идентификатор удаляемой информации.")
 
 
 class SpawnSquad(BaseAction):
-    """Действие: заспавнить отряд в указанном смарт-террейне.
+    """Заспавнить отряд на смарт-террейне.
 
-    Attributes:
-        type (Literal["spawn_squad"]):
-            Дискриминатор действия, всегда ``"spawn_squad"``.
-        squad_alias (str):
-            Алиас шаблона отряда из игровой базы данных.
-        smart_alias (str):
-            Алиас смарт-террейна, в котором должен появиться отряд.
+    В Lua использует ``SIMBOARD:create_squad`` и ``sim_squad_warfare.set_target``
+    с последующей заморозкой через ``stay_time`` (``standart_of_auto.md``, 2.2).
     """
 
-    type: Literal["spawn_squad"] = Field(
-        default="spawn_squad",
-        description="Дискриминатор действия: спавн отряда.",
-    )
-    squad_alias: str = Field(
-        description="Алиас шаблона спавнимого отряда.",
-    )
-    smart_alias: str = Field(
-        description="Алиас смарт-террейна для спавна отряда.",
-    )
+    type: Literal["spawn_squad"] = Field(default="spawn_squad")
+    squad_alias: str = Field(description="Секция шаблона отряда.")
+    smart_alias: str = Field(description="Алиас смарт-террейна.")
 
 
 class SetTarget(BaseAction):
-    """Действие: назначить отряду цель в виде смарт-террейна.
+    """Назначить отряду цель-смарт (Warfare)."""
 
-    Attributes:
-        type (Literal["set_target"]):
-            Дискриминатор действия, всегда ``"set_target"``.
-        squad_alias (str):
-            Алиас отряда, которому назначается цель.
-        smart_alias (str):
-            Алиас смарт-террейна, выступающего целью.
-    """
-
-    type: Literal["set_target"] = Field(
-        default="set_target",
-        description="Дискриминатор действия: назначение цели отряду.",
-    )
-    squad_alias: str = Field(
-        description="Алиас отряда, которому назначается цель.",
-    )
-    smart_alias: str = Field(
-        description="Алиас смарт-террейна-цели.",
-    )
+    type: Literal["set_target"] = Field(default="set_target")
+    squad_alias: str = Field(description="Секция/алиас отряда.")
+    smart_alias: str = Field(description="Алиас смарта-цели.")
 
 
 class GiveItem(BaseAction):
-    """Действие: выдать актору предмет.
+    """Выдать предмет игроку через ``alife_create_item``."""
 
-    Attributes:
-        type (Literal["give_item"]):
-            Дискриминатор действия, всегда ``"give_item"``.
-        item_alias (str):
-            Алиас выдаваемого предмета из игровой базы данных.
-    """
-
-    type: Literal["give_item"] = Field(
-        default="give_item",
-        description="Дискриминатор действия: выдача предмета.",
-    )
-    item_alias: str = Field(
-        description="Алиас выдаваемого предмета.",
-    )
+    type: Literal["give_item"] = Field(default="give_item")
+    item_alias: str = Field(description="Секция выдаваемого предмета.")
+    count: int = Field(default=1, ge=1, description="Количество предметов.")
 
 
 class RemoveItem(BaseAction):
-    """Действие: забрать у актора предмет.
+    """Изъять предмет у игрока."""
 
-    Attributes:
-        type (Literal["remove_item"]):
-            Дискриминатор действия, всегда ``"remove_item"``.
-        item_alias (str):
-            Алиас изымаемого предмета из игровой базы данных.
-    """
-
-    type: Literal["remove_item"] = Field(
-        default="remove_item",
-        description="Дискриминатор действия: изъятие предмета.",
-    )
-    item_alias: str = Field(
-        description="Алиас изымаемого предмета.",
-    )
+    type: Literal["remove_item"] = Field(default="remove_item")
+    item_alias: str = Field(description="Секция изымаемого предмета.")
+    count: int = Field(default=1, ge=1, description="Количество предметов.")
 
 
 class GiveMoney(BaseAction):
-    """Действие: изменить количество денег у актора.
+    """Выдать игроку деньги (``db.actor:give_money``)."""
 
-    Attributes:
-        type (Literal["give_money"]):
-            Дискриминатор действия, всегда ``"give_money"``.
-        amount (int):
-            Сумма в игровой валюте. Неотрицательное целое число; для списания
-            денег используйте отдельное действие в будущих расширениях.
+    type: Literal["give_money"] = Field(default="give_money")
+    amount: int = Field(ge=0, description="Сумма в игровой валюте.")
+
+
+class GiveTask(BaseAction):
+    """Выдать игроку задачу из ``task_manager``.
+
+    В XML превращается в ``<action>dialogs.<task_id>_accept</action>``.
     """
 
-    type: Literal["give_money"] = Field(
-        default="give_money",
-        description="Дискриминатор действия: выдача денег.",
-    )
-    amount: int = Field(
-        ge=0,
-        description="Неотрицательная сумма в игровой валюте.",
-    )
+    type: Literal["give_task"] = Field(default="give_task")
+    task_id: RequiredId = Field(description="ID задачи (``Quest.id``).")
 
 
-#: Дискриминируемое объединение всех поддерживаемых действий.
-#:
-#: Pydantic выбирает конкретный класс по значению поля ``type``. Именно этот
-#: псевдоним следует использовать в полях ``actions`` и ``*_actions``.
+class CompleteTask(BaseAction):
+    """Завершить задачу через ``task_manager``.
+
+    В XML превращается в ``<action>dialogs.<task_id>_turn_in</action>``.
+    """
+
+    type: Literal["complete_task"] = Field(default="complete_task")
+    task_id: RequiredId = Field(description="ID задачи (``Quest.id``).")
+
+
 Action: TypeAlias = Annotated[
     Union[
         GiveInfo,
@@ -352,6 +278,8 @@ Action: TypeAlias = Annotated[
         GiveItem,
         RemoveItem,
         GiveMoney,
+        GiveTask,
+        CompleteTask,
     ],
     Field(discriminator="type"),
 ]
@@ -363,158 +291,163 @@ Action: TypeAlias = Annotated[
 
 
 class Phrase(BaseModel):
-    """Одна реплика в дереве диалога.
+    """Одна реплика внутри дерева диалога.
 
-    Реплика с ``id=0`` всегда является стартовой фразой актора. Остальные
-    реплики могут ссылаться друг на друга через :attr:`next_phrases`;
-    ссылочная целостность проверяется на уровне :class:`Dialog`.
-
-    Attributes:
-        id (int):
-            Уникальный идентификатор реплики внутри диалога. Должен быть
-            неотрицательным; значение ``0`` зарезервировано за стартовой
-            фразой актора.
-        text_ru (str):
-            Русский текст реплики для файла ``st_mymod.xml``.
-        text_en (str):
-            Английский текст реплики. Обязателен, поскольку игра может быть
-            запущена с ``language=eng``.
-        next_phrases (list[int]):
-            Идентификаторы реплик, к которым можно перейти после этой фразы.
-        preconditions (list[Condition]):
-            Условия доступности данной реплики. Пустой список означает, что
-            реплика доступна всегда.
-        actions (list[Action]):
-            Эффекты, выполняемые при выборе данной реплики.
+    Реплики попадают в ``dialogs_<mod>.xml`` как ``<phrase id="N">`` с
+    ``<text>``, ``<next>``, ``<precondition>`` и ``<action>``. Тексты
+    выносятся в ``text/rus|eng/st_<mod>.xml`` под id
+    ``<dialog_id>_phrase_<id>_text``.
     """
 
     model_config = _MODEL_CONFIG
 
-    id: int = Field(
-        ge=0,
-        description=(
-            "Уникальный id реплики внутри диалога; 0 — стартовая фраза актора."
-        ),
-    )
-    text_ru: str = Field(
-        description="Текст реплики на русском языке.",
-    )
-    text_en: str = Field(
-        description="Текст реплики на английском языке.",
-    )
+    id: int = Field(ge=0, description="Целочисленный id реплики внутри диалога.")
+    text_ru: str = Field(default="", description="Русский текст реплики.")
+    text_en: str = Field(default="", description="Английский текст реплики.")
     next_phrases: list[int] = Field(
         default_factory=list,
-        description="Идентификаторы доступных следующих реплик.",
+        description="Список id следующих реплик (теги <next>).",
     )
     preconditions: list[Condition] = Field(
         default_factory=list,
-        description="Условия доступности реплики.",
+        description="Условия показа реплики.",
     )
     actions: list[Action] = Field(
         default_factory=list,
-        description="Действия, выполняемые при выборе реплики.",
+        description="Действия при выборе реплики.",
     )
 
 
 class Dialog(BaseModel):
     """Диалог NPC-квестодателя с деревом реплик.
 
-    Модель проверяет два инварианта графа:
-
-    1. в :attr:`phrases` присутствует стартовая реплика с ключом и ``id``,
-       равными ``0``;
-    2. каждый идентификатор из ``next_phrases`` ссылается на существующую
-       реплику этого же диалога.
-
-    Дополнительно ключ словаря ``phrases`` должен совпадать с полем
-    ``Phrase.id``, чтобы сериализация не создавала двух разных представлений
-    одной и той же реплики.
-
-    Attributes:
-        id (str):
-            Уникальная секция диалога, например ``"mymod_start_dialog"``.
-        npc_alias (str):
-            Алиас NPC-квестодателя из игровой базы данных, к которому
-            привязывается диалог.
-        preconditions (list[Condition]):
-            Условия доступности всего диалога.
-        phrases (dict[int, Phrase]):
-            Карта дерева реплик: ключ — идентификатор реплики, значение —
-            сама реплика.
-
-    Raises:
-        pydantic.ValidationError:
-            Если граф реплик нарушает перечисленные инварианты.
+    Объект генерирует блок ``<dialog id="...">`` в
+    ``gamedata/configs/gameplay/dialogs_<mod>.xml`` и функции
+    ``dialogs.<dialog_id>_*`` в ``gamedata/scripts/<mod>_quests.script``.
+    Идентификатор ``dialog_id`` всегда синхронизирован с ``id`` и именно он
+    попадает в ``<actor_dialog>`` при патче ``character_desc_<level>.xml``.
     """
 
     model_config = _MODEL_CONFIG
 
-    id: str = Field(
-        description="Уникальная секция диалога в конфигурации игры.",
+    id: RequiredId = Field(description="ID диалога (значение <actor_dialog>).")
+    dialog_id: OptionalId = Field(
+        default=None,
+        description="Дублирующий ID диалога; синхронизируется с id.",
     )
-    npc_alias: str = Field(
-        description="Алиас NPC-квестодателя, к которому крепится диалог.",
+    npc_alias: str = Field(default="", description="Человекочитаемый алиас NPC.")
+    npc_id: OptionalId = Field(
+        default=None,
+        description="Игровой ID профиля NPC (specific_character id).",
+    )
+    npc_location: str | None = Field(
+        default=None,
+        description=(
+            "Имя локации NPC (escape, zaton, jupiter, ...). Используется "
+            "патчером для выбора character_desc_<level>.xml."
+        ),
+    )
+    task_id: OptionalId = Field(
+        default=None,
+        description="ID связанного квеста (Quest.id) для ролей take/turn-in.",
+    )
+    role: str | None = Field(
+        default=None,
+        description=(
+            "Роль диалога в сценарии: take, take_assault, take_solo, turnin, "
+            "branch. Влияет только на порядок вставки <actor_dialog>."
+        ),
     )
     preconditions: list[Condition] = Field(
         default_factory=list,
         description="Условия доступности всего диалога.",
     )
     phrases: dict[int, Phrase] = Field(
-        description="Карта реплик диалога, индексированная по Phrase.id.",
+        default_factory=dict,
+        description="Карта реплик: ключ обязан совпадать с Phrase.id.",
     )
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _validate_id(cls, value: Any) -> Any:
+        """Проверяет, что id диалога не пуст.
+
+        Args:
+            value (Any): Сырое значение идентификатора.
+
+        Returns:
+            Any: Исходное значение для дальнейшей валидации.
+        """
+        return _require_non_empty_id(value)
+
+    @field_validator("npc_location", mode="before")
+    @classmethod
+    def _normalize_location(cls, value: Any) -> Any:
+        """Приводит пустую локацию диалога к ``None``.
+
+        Args:
+            value (Any): Сырое значение локации.
+
+        Returns:
+            Any: Очищенная строка или ``None``.
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
+
+    @model_validator(mode="after")
+    def _sync_dialog_id(self) -> Self:
+        """Синхронизирует ``dialog_id`` с каноническим ``id``.
+
+        ``validate_assignment=True`` может повторно вызывать валидатор после
+        присваивания, поэтому запись выполняется через ``object.__setattr__``,
+        чтобы не запустить бесконечную рекурсию.
+
+        Returns:
+            Self: Этот же диалог с заполненным ``dialog_id``.
+        """
+        object.__setattr__(self, "dialog_id", self.id)
+        return self
 
     @model_validator(mode="after")
     def _validate_phrase_graph(self) -> Self:
-        """Проверяет ссылочную целостность дерева реплик диалога.
+        """Проверяет связность дерева реплик.
 
-        Логика проверки:
-
-        1. Словарь :attr:`phrases` не должен быть пустым.
-        2. В нём обязателен ключ ``0`` — стартовая фраза актора.
-        3. Ключ каждой записи должен совпадать с ``Phrase.id``.
-        4. Каждый элемент ``next_phrases`` должен присутствовать среди ключей
-           :attr:`phrases`.
-
-        Возвращаемое значение позволяет Pydantic использовать валидатор в
-        цепочке ``mode="after"`` без изменения модели.
+        Требования ``standart_of_auto.md`` (2.1): стартовая реплика ``id=0``
+        обязательна, ключ карты совпадает с ``Phrase.id``, а каждый
+        ``<next>`` ссылается на существующую реплику.
 
         Returns:
-            Dialog: Тот же проверенный экземпляр диалога.
+            Self: Валидный диалог.
 
         Raises:
-            ValueError:
-                Если отсутствует стартовая фраза, ключ не совпадает с
-                ``Phrase.id`` или найдена ссылка на несуществующую реплику.
+            ValueError: Если граф реплик нарушен.
         """
         if not self.phrases:
             raise ValueError(
                 f"Диалог '{self.id}' не содержит ни одной фразы; "
                 "требуется стартовая фраза с id=0."
             )
-
         if 0 not in self.phrases:
             raise ValueError(
-                f"Диалог '{self.id}' должен содержать стартовую фразу "
-                "с ключом id=0."
+                f"Диалог '{self.id}' должен содержать стартовую фразу с ключом id=0."
             )
-
         phrase_ids = set(self.phrases)
-
         for phrase_key, phrase in self.phrases.items():
             if phrase_key != phrase.id:
                 raise ValueError(
                     f"Диалог '{self.id}': ключ фразы {phrase_key} не совпадает "
                     f"с Phrase.id={phrase.id}."
                 )
-
             for target_id in phrase.next_phrases:
                 if target_id not in phrase_ids:
                     raise ValueError(
                         f"Диалог '{self.id}', фраза id={phrase.id}: "
-                        f"next_phrases ссылается на несуществующую фразу "
-                        f"id={target_id}."
+                        f"next_phrases ссылается на несуществующую фразу id={target_id}."
                     )
-
         return self
 
 
@@ -523,166 +456,218 @@ class Dialog(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class Stage(BaseModel):
-    """Один этап (подзадача) квеста.
+class WarfareCapture(BaseModel):
+    """Warfare-сценарий этапа: захватить смарт, уничтожив вражеский отряд.
 
-    Attributes:
-        id (int):
-            Номер этапа. В составе :class:`Quest` этапы нумеруются подряд
-            начиная с ``0``.
-        title_ru (str):
-            Заголовок подзадачи в КПК на русском языке.
-        title_en (str):
-            Заголовок подзадачи в КПК на английском языке.
-        descr_ru (str):
-            Описание подзадачи в КПК на русском языке.
-        descr_en (str):
-            Описание подзадачи в КПК на английском языке.
-        target_alias (str):
-            Алиас смарта, NPC или отряда, на который вешается маркер цели.
-        on_start_actions (list[Action]):
-            Действия, выполняемые при переходе на этот этап.
+    Данные попадают в статическую таблицу ``QUESTS`` Lua-скрипта и
+    используются хелперами ``spawn_stage_for`` / ``stage_cleared``.
     """
 
     model_config = _MODEL_CONFIG
 
-    id: int = Field(
+    smart_alias: str = Field(
+        description="Алиас смарт-террейна, который нужно захватить."
+    )
+    enemy_squad_alias: str = Field(
+        description="Секция вражеского отряда, который нужно уничтожить."
+    )
+    ally_squad_alias: str | None = Field(
+        default=None,
+        description="Секция союзного отряда, который спавнится на помощь.",
+    )
+    ally_count: int = Field(
+        default=0,
         ge=0,
-        description="Номер этапа квеста, начиная с 0.",
+        description="Сколько союзных отрядов заспавнить (0 — без союзников).",
     )
-    title_ru: str = Field(
-        description="Заголовок подзадачи в КПК на русском языке.",
-    )
-    title_en: str = Field(
-        description="Заголовок подзадачи в КПК на английском языке.",
-    )
-    descr_ru: str = Field(
-        description="Описание подзадачи в КПК на русском языке.",
-    )
-    descr_en: str = Field(
-        description="Описание подзадачи в КПК на английском языке.",
-    )
+
+
+class Stage(BaseModel):
+    """Один этап квеста.
+
+    Этапы нумеруются подряд с нуля; каждый этап даёт описание
+    ``<quest_id>_stage_<id>_descr`` в ``st_<mod>.xml`` и цель для
+    ``target_functor`` в ``tm_<mod>.ltx``.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    id: int = Field(ge=0, description="Номер этапа (0..N-1).")
+    title_ru: str = Field(default="", description="Русский заголовок этапа.")
+    title_en: str = Field(default="", description="Английский заголовок этапа.")
+    descr_ru: str = Field(default="", description="Русское описание этапа.")
+    descr_en: str = Field(default="", description="Английское описание этапа.")
     target_alias: str = Field(
-        description="Алиас смарта, NPC или отряда для маркера цели.",
+        default="",
+        description="Алиас смарта/NPC/предмета для маркера цели.",
     )
     on_start_actions: list[Action] = Field(
         default_factory=list,
-        description="Действия при переходе на этап.",
+        description="Действия, выполняемые при входе в этап.",
+    )
+    warfare_capture: WarfareCapture | None = Field(
+        default=None,
+        description=(
+            "Если задано — Lua-генератор создаст логику захвата смарта: "
+            "спавн, заморозку и проверку зачистки."
+        ),
     )
 
 
 class Quest(BaseModel):
-    """Сюжетный квест с линейной нумерацией этапов.
+    """Сюжетный квест, транслируемый в LTX и Lua.
 
-    Модель проверяет, что ключи :attr:`stages` образуют непрерывную
-    последовательность ``0, 1, 2, ...`` без пропусков, а ключ каждого этапа
-    совпадает с ``Stage.id``.
-
-    Attributes:
-        id (str):
-            Уникальная LTX-секция квеста, например ``"mymod_av_quest"``.
-        title_ru (str):
-            Название квеста на русском языке.
-        title_en (str):
-            Название квеста на английском языке.
-        descr_ru (str):
-            Описание квеста на русском языке.
-        descr_en (str):
-            Описание квеста на английском языке.
-        is_storyline (bool):
-            Признак сюжетного квеста. По умолчанию ``True``.
-        stages (dict[int, Stage]):
-            Карта этапов квеста, индексированная по ``Stage.id``.
-        on_init_actions (list[Action]):
-            Эффекты при выдаче квеста.
-        on_complete_actions (list[Action]):
-            Награды и эффекты при успешном завершении квеста.
-        on_fail_actions (list[Action]):
-            Эффекты при провале квеста.
-
-    Raises:
-        pydantic.ValidationError:
-            Если этапы пусты, пронумерованы с пропусками или ключ этапа не
-            совпадает с ``Stage.id``.
+    Объект генерирует секцию ``[<quest_id>]`` в
+    ``gamedata/configs/misc/task/tm_<mod>.ltx`` и набор плоских функций
+    ``<quest_id>_target``, ``<quest_id>_descr``, ``<quest_id>_status``,
+    ``<quest_id>_start``, ``<quest_id>_reward``, ``<quest_id>_cleanup`` в
+    ``gamedata/scripts/<mod>_quests.script``.
     """
 
     model_config = _MODEL_CONFIG
 
-    id: str = Field(
-        description="Уникальная LTX-секция квеста.",
+    id: RequiredId = Field(description="ID секции LTX и ключ task_functor.")
+    giver_npc_id: OptionalId = Field(
+        default=None,
+        description="Игровой/стори-ID NPC-квестодателя (устаревшее имя npc_id).",
     )
-    title_ru: str = Field(
-        description="Название квеста на русском языке.",
+    npc_id: OptionalId = Field(
+        default=None,
+        description="Игровой ID NPC-квестодателя для task_giver_alive.",
     )
-    title_en: str = Field(
-        description="Название квеста на английском языке.",
+    npc_location: str | None = Field(
+        default=None,
+        description=(
+            "Локация квестодателя (escape, zaton, ...). Используется "
+            "патчером character_desc_<level>.xml."
+        ),
     )
-    descr_ru: str = Field(
-        description="Описание квеста на русском языке.",
+    dialog_id: OptionalId = Field(
+        default=None,
+        description="ID основного диалога выдачи квеста.",
     )
-    descr_en: str = Field(
-        description="Описание квеста на английском языке.",
+    dialog_ids: list[str] = Field(
+        default_factory=list,
+        description="ID связанных диалогов (выдача/сдача).",
     )
-    is_storyline: bool = Field(
-        default=True,
-        description="Признак сюжетного квеста.",
-    )
+    title_ru: str = Field(default="", description="Русское название квеста.")
+    title_en: str = Field(default="", description="Английское название квеста.")
+    descr_ru: str = Field(default="", description="Русское описание квеста.")
+    descr_en: str = Field(default="", description="Английское описание квеста.")
+    is_storyline: bool = Field(default=True, description="Признак сюжетности.")
+    icon: str | None = Field(default=None, description="Иконка PDA (ui_inGame2_...).")
+    prior: int | None = Field(default=None, ge=0, description="Приоритет в PDA.")
     stages: dict[int, Stage] = Field(
-        description="Карта этапов квеста, индексированная по Stage.id.",
+        default_factory=dict,
+        description="Карта этапов: ключ обязан совпадать с Stage.id.",
     )
     on_init_actions: list[Action] = Field(
         default_factory=list,
-        description="Действия при выдаче квеста.",
+        description="Действия эффекта <quest_id>_start.",
     )
     on_complete_actions: list[Action] = Field(
         default_factory=list,
-        description="Действия при успешном завершении квеста.",
+        description="Действия эффекта <quest_id>_reward.",
     )
     on_fail_actions: list[Action] = Field(
         default_factory=list,
-        description="Действия при провале квеста.",
+        description="Действия эффекта <quest_id>_cleanup.",
     )
+    transfer_conditions: dict[int, dict[str, list[Condition]]] = Field(
+        default_factory=dict,
+        description=(
+            "Правила перехода этапов: {stage: {'complete': [...], "
+            "'fail': [...]}}. Транслируются в status_functor."
+        ),
+    )
+
+    reward_money: int | None = Field(default=None, ge=0)
+    reward_item_alias: str | None = Field(default=None)
+    reward_item_count: int = Field(default=1, ge=1)
+    complete_info: str | None = Field(
+        default=None,
+        description="Инфопоршень, выдаваемый при завершении квеста.",
+    )
+    taken_info: str | None = Field(
+        default=None,
+        description="Инфопоршень, выдаваемый при выдаче квеста.",
+    )
+    return_to_giver_stage: int | None = Field(
+        default=None,
+        description="Этап, на котором игрок должен вернуться к квестодателю.",
+    )
+    return_distance: float = Field(
+        default=40.0,
+        ge=0,
+        description="Радиус «подошёл к квестодателю» в метрах.",
+    )
+    available_info: str | None = Field(default=None)
+    done_info: str | None = Field(default=None)
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _validate_id(cls, value: Any) -> Any:
+        """Проверяет, что id квеста не пуст.
+
+        Args:
+            value (Any): Сырое значение идентификатора.
+
+        Returns:
+            Any: Исходное значение для дальнейшей валидации.
+        """
+        return _require_non_empty_id(value)
+
+    @field_validator("npc_location", mode="before")
+    @classmethod
+    def _normalize_location(cls, value: Any) -> Any:
+        """Приводит пустую локацию к ``None``.
+
+        Args:
+            value (Any): Сырое значение локации.
+
+        Returns:
+            Any: Очищенная строка или ``None``.
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
     @model_validator(mode="after")
     def _validate_stage_sequence(self) -> Self:
-        """Проверяет непрерывность и согласованность этапов квеста.
-
-        Ключи :attr:`stages` должны образовывать множество
-        ``{0, 1, ..., len(stages) - 1}``. Пустая карта этапов запрещена,
-        поскольку квест обязан иметь хотя бы одну подзадачу. Дополнительно
-        ключ каждой записи сравнивается с ``Stage.id``.
+        """Проверяет непрерывную нумерацию этапов с нуля.
 
         Returns:
-            Quest: Тот же проверенный экземпляр квеста.
+            Self: Валидный квест.
 
         Raises:
-            ValueError:
-                Если карта этапов пуста, содержит пропуски/отрицательные
-                номера или ключ этапа не совпадает с ``Stage.id``.
+            ValueError: Если этапы пусты или пронумерованы с пропусками.
         """
         if not self.stages:
             raise ValueError(
-                f"Квест '{self.id}' должен содержать хотя бы один этап "
-                "(этап с id=0)."
+                f"Квест '{self.id}' должен содержать хотя бы один этап (этап с id=0)."
             )
-
         actual_keys = sorted(self.stages)
         expected_keys = list(range(len(self.stages)))
-
         if actual_keys != expected_keys:
             raise ValueError(
-                f"Этапы квеста '{self.id}' должны быть пронумерованы подряд "
-                f"с 0. Ожидались ключи {expected_keys}, получены "
-                f"{actual_keys}."
+                f"Этапы квеста '{self.id}' должны быть пронумерованы подряд с 0. "
+                f"Ожидались ключи {expected_keys}, получены {actual_keys}."
             )
-
         for stage_key, stage in self.stages.items():
             if stage_key != stage.id:
                 raise ValueError(
                     f"Квест '{self.id}': ключ этапа {stage_key} не совпадает "
                     f"с Stage.id={stage.id}."
                 )
-
+            if self.return_to_giver_stage is not None:
+                if self.return_to_giver_stage not in self.stages:
+                    raise ValueError(
+                        f"Квест '{self.id}': return_to_giver_stage="
+                        f"{self.return_to_giver_stage} отсутствует в stages."
+                    )
         return self
 
 
@@ -692,98 +677,92 @@ class Quest(BaseModel):
 
 
 class ModProject(BaseModel):
-    """Корневая модель проекта модификации.
+    """Корневой проект мода: имя, зависимости, квесты и диалоги.
 
-    Объединяет все квесты и диалоги мода и умеет сериализоваться в JSON и
-    YAML. Формат обоих представлений полностью обратим: дискриминаторы
-    ``type`` у условий и действий сохраняются, поэтому проект можно прочитать
-    обратно без потери полиморфных данных.
-
-    Attributes:
-        name (str):
-            Название модификации.
-        required_mods (list[str]):
-            Заглушка под будущие зависимости модов. Сюда записываются имена
-            файлов дополнительных баз данных, например
-            ``["bas_db.sqlite"]``, необходимых для валидации кастомных
-            предметов.
-        quests (dict[str, Quest]):
-            Карта квестов проекта, индексированная по ``Quest.id``.
-        dialogs (dict[str, Dialog]):
-            Карта диалогов проекта, индексированная по ``Dialog.id``.
+    Это ``[1] LOAD``-контейнер конвейера. Генераторы получают из него данные
+    для ``tm_<mod>.ltx``, ``dialogs_<mod>.xml``, ``st_<mod>.xml`` и
+    ``<mod>_quests.script``, а патчер — список NPC для
+    ``character_desc_<level>.xml``.
     """
 
     model_config = _MODEL_CONFIG
 
-    name: str = Field(
-        description="Название модификации.",
-    )
+    name: str = Field(description="Человекочитаемое имя проекта.")
     required_mods: list[str] = Field(
         default_factory=list,
-        description=(
-            "Заглушка под будущие зависимости модов. Сюда записываются имена "
-            "файлов доп. баз данных, например ['bas_db.sqlite'], необходимых "
-            "для валидации кастомных предметов"
-        ),
+        description="Список обязательных модов/баз.",
     )
     quests: dict[str, Quest] = Field(
         default_factory=dict,
-        description="Карта квестов проекта, индексированная по Quest.id.",
+        description="Карта квестов: ключ обязан совпадать с Quest.id.",
     )
     dialogs: dict[str, Dialog] = Field(
         default_factory=dict,
-        description="Карта диалогов проекта, индексированная по Dialog.id.",
+        description="Карта диалогов: ключ может отличаться от Dialog.id.",
     )
 
-    def to_json(self) -> str:
-        """Сериализует проект в JSON-строку.
+    @model_validator(mode="after")
+    def _validate_cross_references(self) -> Self:
+        """Проверяет сквозные связи quest ↔ dialog ↔ task.
 
-        Используется ``model_dump_json`` Pydantic, поэтому:
-
-        * строки сохраняются в UTF-8 без экранирования кириллицы;
-        * полиморфные условия и действия включают поле-дискриминатор ``type``;
-        * числовые ключи словарей ``phrases`` и ``stages`` становятся
-          строковыми ключами JSON, как того требует стандарт.
+        Проверяются только явно заданные ссылки, чтобы «сырая» строка SQLite
+        без части колонок не роняла конвейер.
 
         Returns:
-            str: Отформатированная JSON-строка с отступом в два пробела.
+            Self: Проект с корректными ссылками.
+
+        Raises:
+            ValueError: Если квест ссылается на отсутствующий диалог или
+                диалог ссылается на отсутствующий квест.
+        """
+        for quest_key, quest in self.quests.items():
+            if quest_key != quest.id:
+                raise ValueError(
+                    f"Ключ карты квестов '{quest_key}' не совпадает "
+                    f"с Quest.id='{quest.id}'."
+                )
+            referenced = list(quest.dialog_ids)
+            if quest.dialog_id:
+                referenced.append(quest.dialog_id)
+            for dialog_id in referenced:
+                if dialog_id not in self.dialogs:
+                    raise ValueError(
+                        f"Квест '{quest.id}' ссылается на отсутствующий "
+                        f"диалог '{dialog_id}'."
+                    )
+        for dialog in self.dialogs.values():
+            if dialog.task_id and dialog.task_id not in self.quests:
+                raise ValueError(
+                    f"Диалог '{dialog.id}' ссылается на отсутствующий "
+                    f"квест '{dialog.task_id}'."
+                )
+        return self
+
+    def to_json(self) -> str:
+        """Сериализует проект в JSON, сохраняя ``model_extra``.
+
+        Returns:
+            str: JSON-представление проекта с отступом в два пробела.
         """
         return self.model_dump_json(indent=2)
 
     @classmethod
     def from_json(cls, json_str: str) -> "ModProject":
-        """Восстанавливает проект из JSON-строки.
-
-        Pydantic автоматически:
-
-        * преобразует строковые ключи ``phrases``/``stages`` обратно в ``int``;
-        * выбирает конкретные классы условий и действий по полю ``type``;
-        * запускает все валидаторы графов реплик и этапов.
+        """Восстанавливает проект из JSON.
 
         Args:
-            json_str (str):
-                JSON-документ, созданный методом :meth:`to_json` или вручную.
+            json_str (str): JSON-строка, созданная :meth:`to_json`.
 
         Returns:
-            ModProject: Полностью проверенный экземпляр проекта.
-
-        Raises:
-            pydantic.ValidationError:
-                Если JSON синтаксически корректен, но нарушает схему модели
-                или инварианты графов.
+            ModProject: Валидный проект мода.
         """
         return cls.model_validate_json(json_str)
 
     def to_yaml(self) -> str:
-        """Сериализует проект в YAML-строку.
-
-        Для безопасности используется :func:`yaml.safe_dump`. Ключи этапов и
-        реплик остаются целыми числами (режим ``model_dump(mode="python")``),
-        поэтому итоговый YAML удобно читать и редактировать вручную.
-        Порядок полей и ключей сохраняется таким же, как в модели.
+        """Сериализует проект в YAML.
 
         Returns:
-            str: YAML-документ в Unicode с отступом в два пробела.
+            str: YAML-представление с сохранением Unicode.
         """
         data = self.model_dump(mode="python")
         return yaml.safe_dump(
@@ -796,26 +775,13 @@ class ModProject(BaseModel):
 
     @classmethod
     def from_yaml(cls, yaml_str: str) -> "ModProject":
-        """Восстанавливает проект из YAML-строки.
-
-        Сначала :func:`yaml.safe_load` разбирает документ в Python-словарь,
-        затем Pydantic валидирует его по схеме :class:`ModProject`. Если YAML
-        использует строковые ключи для этапов или реплик, они автоматически
-        приводятся к ``int``.
+        """Восстанавливает проект из YAML.
 
         Args:
-            yaml_str (str):
-                YAML-документ, созданный методом :meth:`to_yaml` или вручную.
+            yaml_str (str): YAML-строка, созданная :meth:`to_yaml`.
 
         Returns:
-            ModProject: Полностью проверенный экземпляр проекта.
-
-        Raises:
-            yaml.YAMLError:
-                Если документ не является корректным YAML.
-            pydantic.ValidationError:
-                Если структура данных не соответствует модели или нарушает
-                инварианты графов.
+            ModProject: Валидный проект мода.
         """
         data = yaml.safe_load(yaml_str)
         return cls.model_validate(data)
@@ -825,21 +791,26 @@ __all__ = [
     "Action",
     "BaseAction",
     "BaseCondition",
+    "CompleteTask",
     "Condition",
     "Dialog",
     "DontHasInfo",
     "GiveInfo",
     "GiveItem",
     "GiveMoney",
+    "GiveTask",
     "HasInfo",
     "HasItem",
     "ModProject",
+    "OptionalId",
     "Phrase",
     "Quest",
     "RemoveInfo",
     "RemoveItem",
+    "RequiredId",
     "SetTarget",
     "SmartOwner",
     "SpawnSquad",
     "Stage",
+    "WarfareCapture",
 ]

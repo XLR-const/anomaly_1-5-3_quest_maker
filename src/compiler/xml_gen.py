@@ -1,18 +1,14 @@
-"""Генератор XML-диалогов и мультиязычных строковых таблиц мода.
+"""Генератор XML-графа диалогов и таблиц локализации мода.
 
-Модуль формирует два вида игровых XML-документов S.T.A.L.K.E.R. Anomaly:
+Модуль реализует шаги ``[4] RENDER`` для двух видов файлов
+(``standart_of_auto.md``, 1.1 и 2.1):
 
-* строковые таблицы ``text/rus/st_mymod.xml`` и ``text/eng/st_mymod.xml``
-  с текстами квестов, этапов и реплик;
-* файл ``configs/gameplay/dialogs_mymod.xml`` с деревьями диалогов NPC.
+* ``gamedata/configs/gameplay/dialogs_<mod>.xml`` — весь граф диалогов;
+* ``gamedata/configs/text/rus|eng/st_<mod>.xml`` — строки реплик и квестов.
 
-Генератор не пишет файлы на диск: он возвращает готовые Unicode-строки,
-а сохранение в Windows-1251 без BOM выполняет
-:func:`src.compiler.encoding.write_file_cp1251`. Такое разделение позволяет
-тестировать структуру XML без обращения к файловой системе.
-
-Каждый квест, этап, диалог и реплика обрабатываются изолированно. Ошибка в
-одном элементе журналируется и не прерывает генерацию остальных данных.
+Генератор намеренно не создаёт ``character_desc_*.xml``: привязка диалогов к
+NPC выполняется текстовым патчером :class:`src.compiler.builder.ModBuilder`,
+который копирует ванильный файл локации и вставляет ``<actor_dialog>``.
 """
 
 from __future__ import annotations
@@ -20,848 +16,365 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from src.compiler.encoding import escape_xml_text
+from src.core.models import (
+    CompleteTask,
+    DontHasInfo,
+    GiveInfo,
+    GiveTask,
+    HasInfo,
+)
 from src.logger import get_logger
 
 if TYPE_CHECKING:
-    from src.core.models import Dialog, ModProject
+    from src.core.models import Dialog, ModProject, Phrase
 
 logger = get_logger("compiler.xml_gen")
 
-#: Обязательная XML-декларация игровых файлов Anomaly.
+#: XML-декларация, обязательная для всех игровых XML Anomaly (cp1251, без BOM).
 XML_DECLARATION = '<?xml version="1.0" encoding="windows-1251"?>'
-#: Корневой тег мультиязычной строковой таблицы.
+#: Корневой тег таблицы строк ``st_<mod>.xml``.
 STRING_TABLE_TAG = "string_table"
-#: Корневой тег файла диалогов.
+#: Корневой тег файла диалогов ``dialogs_<mod>.xml``.
 GAME_DIALOGS_TAG = "game_dialogs"
-#: Поддерживаемые языки строковых таблиц.
+#: Поддерживаемые языковые каталоги ``configs/text/<lang>``.
 STRING_LANGUAGES = ("rus", "eng")
 
-#: Запись строковой таблицы: ``(идентификатор, русский текст, английский)``.
+#: Одна запись таблицы строк: ``(id, русский текст, английский текст)``.
 StringEntry = tuple[str, str, str]
 
 
 class XmlGenerator:
-    """Собирает XML-файлы строк и диалогов из моделей проекта мода.
+    """Собирает ``dialogs_<mod>.xml`` и ``st_<mod>.xml`` из моделей проекта.
 
-    Генератор рассчитан на модели :class:`~src.core.models.ModProject`,
-    :class:`~src.core.models.Quest` и :class:`~src.core.models.Dialog`.
-    Идентификаторы строк формируются по тем же правилам, что использует
-    :class:`~src.compiler.ltx_gen.LtxGenerator`, поэтому LTX-секции и XML-тексты
-    согласованы между собой.
+    Класс не знает имени мода: имена файлов подставляет
+    :class:`src.compiler.builder.ModBuilder`. Все идентификаторы диалогов
+    берутся из модели (``Dialog.dialog_id`` или ``Dialog.id``), а не из ключа
+    словаря, чтобы XML и ``<actor_dialog>`` всегда совпадали.
     """
 
+    # ------------------------------------------------------------------
+    # Таблицы строк
+    # ------------------------------------------------------------------
+
     def generate_string_tables(self, project: "ModProject") -> dict[str, str]:
-        """Формирует русскую и английскую строковые таблицы проекта.
+        """Генерирует русскую и английскую таблицы строк.
 
-        Из проекта извлекаются все тексты квестов, их этапов и реплик
-        диалогов. Для каждого элемента создаётся запись ``<string id="...">``
-        с вложенным тегом ``<text>``. Русский документ содержит только
-        ``*_ru``-поля, английский — только ``*_en``-поля.
-
-        Args:
-            project (ModProject):
-                Корневая модель проекта с картами ``quests`` и ``dialogs``.
-
-        Returns:
-            dict[str, str]: Словарь из двух готовых XML-документов с ключами
-            ``"rus"`` и ``"eng"``.
-
-        Raises:
-            TypeError:
-                Если ``project`` не содержит словарных карт ``quests`` и
-                ``dialogs``.
-        """
-        logger.debug("Начата генерация строковых таблиц проекта.")
-
-        try:
-            quests = getattr(project, "quests", None)
-            dialogs = getattr(project, "dialogs", None)
-
-            if not isinstance(quests, dict) or not isinstance(dialogs, dict):
-                raise TypeError(
-                    "Проект должен содержать словарные карты quests и dialogs, "
-                    f"а получены {type(quests).__name__} и "
-                    f"{type(dialogs).__name__}."
-                )
-
-            entries = self._collect_string_entries(project)
-        except TypeError as exc:
-            logger.error("Некорректный проект для генерации строк: %s", exc)
-            raise
-        except Exception as exc:
-            logger.exception(
-                "Не удалось извлечь строки проекта; будут созданы пустые "
-                "таблицы: %s",
-                exc,
-            )
-            entries = []
-
-        result: dict[str, str] = {}
-
-        for language in STRING_LANGUAGES:
-            try:
-                result[language] = self._build_string_table(entries, language)
-            except Exception as exc:
-                logger.exception(
-                    "Не удалось сформировать строковую таблицу '%s': %s",
-                    language,
-                    exc,
-                )
-                result[language] = (
-                    f"{XML_DECLARATION}\n<{STRING_TABLE_TAG}>\n"
-                    f"</{STRING_TABLE_TAG}>"
-                )
-
-        logger.info(
-            "Строковые таблицы сформированы: записей — %d, языков — %d.",
-            len(entries),
-            len(result),
-        )
-        return result
-
-    def generate_dialogs_xml(self, dialogs: dict[str, "Dialog"]) -> str:
-        """Формирует содержимое файла ``dialogs_mymod.xml``.
-
-        Каждый диалог оборачивается в тег ``<dialog id="...">``, а его фразы —
-        в ``<phrase id="...">``. Внутри фразы указываются ссылка на строку,
-        переходы, предусловие и действие в пространстве ``mymod_quests``.
-
-        Ошибка в отдельном диалоге журналируется через
-        :meth:`logging.Logger.error`, после чего диалог пропускается, а
-        остальные элементы продолжают собираться.
-
-        Args:
-            dialogs (dict[str, Dialog]):
-                Карта диалогов проекта, индексированная по ``Dialog.id``.
-
-        Returns:
-            str: Полный XML-документ с корневым тегом ``<game_dialogs>``.
-
-        Raises:
-            TypeError:
-                Если ``dialogs`` не является словарём.
-        """
-        logger.debug("Начата генерация dialogs_mymod.xml.")
-
-        try:
-            if not isinstance(dialogs, dict):
-                raise TypeError(
-                    "Аргумент dialogs должен быть словарём карты диалогов, "
-                    f"а получен {type(dialogs).__name__}."
-                )
-        except TypeError as exc:
-            logger.error("Некорректная карта диалогов: %s", exc)
-            raise
-
-        blocks: list[str] = []
-        skipped = 0
-
-        for dialog_id, dialog in dialogs.items():
-            try:
-                blocks.append(self._build_dialog(dialog_id, dialog))
-            except Exception as exc:
-                skipped += 1
-                logger.error(
-                    "Диалог '%s' пропущен из-за ошибки данных: %s",
-                    dialog_id,
-                    exc,
-                    exc_info=True,
-                )
-                continue
-
-            logger.debug("Диалог '%s' добавлен в XML.", dialog_id)
-
-        lines = [XML_DECLARATION, f"<{GAME_DIALOGS_TAG}>"]
-        lines.extend(blocks)
-        lines.append(f"</{GAME_DIALOGS_TAG}>")
-        content = "\n".join(lines)
-
-        logger.info(
-            "Сформирован dialogs_mymod.xml: диалогов — %d, пропущено — %d.",
-            len(blocks),
-            skipped,
-        )
-        return content
-
-    def _collect_string_entries(self, project: "ModProject") -> list[StringEntry]:
-        """Извлекает двуязычные строки из всех квестов и диалогов проекта.
-
-        Ошибка в одном квесте, этапе, диалоге или реплике не прерывает обход:
-        проблемный элемент пропускается и журналируется.
+        Результат записывается генератором в
+        ``gamedata/configs/text/rus/st_<mod>.xml`` и
+        ``gamedata/configs/text/eng/st_<mod>.xml``.
 
         Args:
             project (ModProject):
-                Проверяемый проект мода.
+                Проект с квестами и диалогами.
 
         Returns:
-            list[StringEntry]: Список троек ``(id, text_ru, text_en)`` в
-            порядке квестов, этапов и диалогов проекта.
-
-        Raises:
-            TypeError:
-                Если карты ``quests`` или ``dialogs`` не являются словарями.
+            dict[str, str]:
+                Словарь ``{"rus": xml, "eng": xml}`` с готовыми XML-строками.
         """
-        logger.debug("Извлечение строк квестов и диалогов проекта.")
+        entries = self._collect_string_entries(project)
+        return {
+            lang: self._build_string_table(entries, lang)
+            for lang in STRING_LANGUAGES
+        }
 
-        try:
-            quests = getattr(project, "quests", None)
-            dialogs = getattr(project, "dialogs", None)
-
-            if not isinstance(quests, dict) or not isinstance(dialogs, dict):
-                raise TypeError(
-                    "Карты quests и dialogs проекта должны быть словарями."
-                )
-
-            entries: list[StringEntry] = []
-
-            for quest_id, quest in quests.items():
-                try:
-                    entries.extend(self._collect_quest_strings(quest_id, quest))
-                except Exception as exc:
-                    logger.error(
-                        "Квест '%s' пропущен при сборе строк: %s",
-                        quest_id,
-                        exc,
-                        exc_info=True,
-                    )
-
-            for dialog_id, dialog in dialogs.items():
-                try:
-                    entries.extend(self._collect_dialog_strings(dialog_id, dialog))
-                except Exception as exc:
-                    logger.error(
-                        "Диалог '%s' пропущен при сборе строк: %s",
-                        dialog_id,
-                        exc,
-                        exc_info=True,
-                    )
-
-            logger.debug("Извлечено строковых записей: %d.", len(entries))
-            return entries
-        except Exception as exc:
-            logger.exception("Не удалось собрать строковые записи: %s", exc)
-            raise
-
-    def _collect_quest_strings(
-        self,
-        quest_id: Any,
-        quest: Any,
+    def _collect_string_entries(
+        self, project: "ModProject"
     ) -> list[StringEntry]:
-        """Собирает строки названия и описания квеста вместе с этапами.
+        """Собирает все строковые записи проекта в порядке генерации.
 
         Args:
-            quest_id (Any):
-                Ключ карты квестов; должен совпадать с ``Quest.id``.
-            quest (Any):
-                Модель квеста или повреждённый объект с ожидаемыми полями.
+            project (ModProject):
+                Проект мода.
 
         Returns:
-            list[StringEntry]: Строки ``{quest_id}_title``, ``{quest_id}_descr``
-            и строки всех корректных этапов.
-
-        Raises:
-            ValueError:
-                Если идентификатор квеста некорректен или не совпадает с
-                ``Quest.id``.
-            TypeError:
-                Если обязательные текстовые поля отсутствуют или имеют
-                неверный тип.
+            list[StringEntry]:
+                Список ``(id, текст_ru, текст_en)`` без дубликатов id.
         """
-        try:
-            self._validate_identifier(quest_id, "квеста")
+        entries: list[StringEntry] = []
+        seen: set[str] = set()
 
-            actual_id = getattr(quest, "id", None)
-            if actual_id != quest_id:
-                raise ValueError(
-                    f"Ключ карты '{quest_id}' не совпадает с Quest.id="
-                    f"'{actual_id}'."
+        def add(entry_id: str, ru: str, en: str) -> None:
+            """Добавляет запись, если такого id ещё нет.
+
+            Args:
+                entry_id (str): Идентификатор строки.
+                ru (str): Русский текст.
+                en (str): Английский текст.
+            """
+            if entry_id in seen:
+                logger.warning("Дублирующийся id строки пропущен: '%s'.", entry_id)
+                return
+            seen.add(entry_id)
+            entries.append((entry_id, ru or "", en or ""))
+
+        for quest_id, quest in (project.quests or {}).items():
+            add(f"{quest_id}_title", quest.title_ru, quest.title_en)
+            add(f"{quest_id}_descr", quest.descr_ru, quest.descr_en)
+            for stage_id, stage in sorted(quest.stages.items()):
+                prefix = f"{quest_id}_stage_{stage_id}"
+                add(f"{prefix}_title", stage.title_ru, stage.title_en)
+                add(f"{prefix}_descr", stage.descr_ru, stage.descr_en)
+                add(f"{prefix}_msg", stage.title_ru, stage.title_en)
+
+        for dialog in (project.dialogs or {}).values():
+            dialog_id = self._dialog_output_id(dialog)
+            for phrase_id, phrase in sorted(dialog.phrases.items()):
+                add(
+                    f"{dialog_id}_phrase_{phrase_id}_text",
+                    phrase.text_ru,
+                    phrase.text_en,
                 )
-
-            title_ru = getattr(quest, "title_ru", None)
-            title_en = getattr(quest, "title_en", None)
-            descr_ru = getattr(quest, "descr_ru", None)
-            descr_en = getattr(quest, "descr_en", None)
-
-            if not all(
-                isinstance(value, str)
-                for value in (title_ru, title_en, descr_ru, descr_en)
-            ):
-                raise TypeError(
-                    f"Квест '{quest_id}' содержит нестроковые title/descr."
-                )
-
-            entries: list[StringEntry] = [
-                (f"{quest_id}_title", title_ru, title_en),
-                (f"{quest_id}_descr", descr_ru, descr_en),
-            ]
-
-            stages = getattr(quest, "stages", None)
-            if not isinstance(stages, dict):
-                raise TypeError(
-                    f"Квест '{quest_id}' содержит нестроковую карту stages."
-                )
-
-            try:
-                ordered_stages = sorted(stages.items())
-            except TypeError as exc:
-                raise TypeError(
-                    f"Ключи этапов квеста '{quest_id}' не поддаются сортировке."
-                ) from exc
-
-            for stage_id, stage in ordered_stages:
-                try:
-                    entries.extend(
-                        self._collect_stage_strings(quest_id, stage_id, stage)
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Этап '%s' квеста '%s' пропущен при сборе строк: %s",
-                        stage_id,
-                        quest_id,
-                        exc,
-                        exc_info=True,
-                    )
-
-            logger.debug(
-                "Квест '%s': собрано строк — %d.",
-                quest_id,
-                len(entries),
-            )
-            return entries
-        except Exception as exc:
-            logger.exception(
-                "Не удалось собрать строки квеста '%s': %s",
-                quest_id,
-                exc,
-            )
-            raise
-
-    def _collect_stage_strings(
-        self,
-        quest_id: str,
-        stage_id: Any,
-        stage: Any,
-    ) -> list[StringEntry]:
-        """Собирает строки названия и описания одного этапа квеста.
-
-        Args:
-            quest_id (str):
-                Идентификатор родительского квеста.
-            stage_id (Any):
-                Ключ карты этапов; должен совпадать с ``Stage.id``.
-            stage (Any):
-                Модель этапа или повреждённый объект с ожидаемыми полями.
-
-        Returns:
-            list[StringEntry]: Две строки этапа — title и descr.
-
-        Raises:
-            ValueError:
-                Если номер этапа некорректен или не совпадает с ``Stage.id``.
-            TypeError:
-                Если текстовые поля этапа отсутствуют или не являются
-                строками.
-        """
-        try:
-            if not isinstance(stage_id, int) or isinstance(stage_id, bool):
-                raise ValueError(
-                    f"Номер этапа квеста '{quest_id}' должен быть целым числом, "
-                    f"а получен {type(stage_id).__name__}."
-                )
-
-            if stage_id < 0:
-                raise ValueError(
-                    f"Номер этапа квеста '{quest_id}' не может быть "
-                    f"отрицательным: {stage_id}."
-                )
-
-            actual_id = getattr(stage, "id", None)
-            if actual_id != stage_id:
-                raise ValueError(
-                    f"Ключ этапа {stage_id} квеста '{quest_id}' не совпадает "
-                    f"с Stage.id='{actual_id}'."
-                )
-
-            title_ru = getattr(stage, "title_ru", None)
-            title_en = getattr(stage, "title_en", None)
-            descr_ru = getattr(stage, "descr_ru", None)
-            descr_en = getattr(stage, "descr_en", None)
-
-            if not all(
-                isinstance(value, str)
-                for value in (title_ru, title_en, descr_ru, descr_en)
-            ):
-                raise TypeError(
-                    f"Этап '{stage_id}' квеста '{quest_id}' содержит "
-                    "нестроковые title/descr."
-                )
-
-            prefix = f"{quest_id}_stage_{stage_id}"
-            logger.debug(
-                "Этап '%s' квеста '%s' подготовлен к экспорту.",
-                stage_id,
-                quest_id,
-            )
-            return [
-                (f"{prefix}_title", title_ru, title_en),
-                (f"{prefix}_descr", descr_ru, descr_en),
-            ]
-        except Exception as exc:
-            logger.error(
-                "Ошибка данных этапа '%s' квеста '%s': %s",
-                stage_id,
-                quest_id,
-                exc,
-            )
-            raise
-
-    def _collect_dialog_strings(
-        self,
-        dialog_id: Any,
-        dialog: Any,
-    ) -> list[StringEntry]:
-        """Собирает строки всех реплик одного диалога.
-
-        Args:
-            dialog_id (Any):
-                Ключ карты диалогов; должен совпадать с ``Dialog.id``.
-            dialog (Any):
-                Модель диалога или повреждённый объект с ожидаемыми полями.
-
-        Returns:
-            list[StringEntry]: Строки ``{dialog_id}_phrase_{id}_text`` для
-            каждой корректной реплики.
-
-        Raises:
-            ValueError:
-                Если идентификатор диалога некорректен или не совпадает с
-                ``Dialog.id``.
-            TypeError:
-                Если карта фраз отсутствует или имеет неверный тип.
-        """
-        try:
-            self._validate_identifier(dialog_id, "диалога")
-
-            actual_id = getattr(dialog, "id", None)
-            if actual_id != dialog_id:
-                raise ValueError(
-                    f"Ключ карты '{dialog_id}' не совпадает с Dialog.id="
-                    f"'{actual_id}'."
-                )
-
-            phrases = getattr(dialog, "phrases", None)
-            if not isinstance(phrases, dict):
-                raise TypeError(
-                    f"Диалог '{dialog_id}' содержит нестроковую карту phrases."
-                )
-
-            try:
-                ordered_phrases = sorted(phrases.items())
-            except TypeError as exc:
-                raise TypeError(
-                    f"Ключи фраз диалога '{dialog_id}' не поддаются "
-                    "сортировке."
-                ) from exc
-
-            entries: list[StringEntry] = []
-
-            for phrase_id, phrase in ordered_phrases:
-                try:
-                    text_ru = getattr(phrase, "text_ru", None)
-                    text_en = getattr(phrase, "text_en", None)
-
-                    if not isinstance(text_ru, str) or not isinstance(
-                        text_en, str
-                    ):
-                        raise TypeError(
-                            f"Фраза '{phrase_id}' диалога '{dialog_id}' "
-                            "содержит нестроковый текст."
-                        )
-
-                    self._validate_phrase_identity(dialog_id, phrase_id, phrase)
-                    entries.append(
-                        (
-                            f"{dialog_id}_phrase_{phrase_id}_text",
-                            text_ru,
-                            text_en,
-                        )
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Фраза '%s' диалога '%s' пропущена при сборе строк: %s",
-                        phrase_id,
-                        dialog_id,
-                        exc,
-                        exc_info=True,
-                    )
-
-            logger.debug(
-                "Диалог '%s': собрано строк — %d.",
-                dialog_id,
-                len(entries),
-            )
-            return entries
-        except Exception as exc:
-            logger.exception(
-                "Не удалось собрать строки диалога '%s': %s",
-                dialog_id,
-                exc,
-            )
-            raise
+        return entries
 
     def _build_string_table(
-        self,
-        entries: list[StringEntry],
-        language: str,
+        self, entries: list[StringEntry], language: str
     ) -> str:
-        """Формирует один XML-документ строковой таблицы для языка.
+        """Формирует один XML-документ ``st_<mod>.xml``.
 
         Args:
             entries (list[StringEntry]):
-                Двуязычные записи, подготовленные сборщиком строк.
+                Записи ``(id, ru, en)``.
             language (str):
-                Язык документа: ``"rus"`` или ``"eng"``.
+                ``"rus"`` или ``"eng"``.
 
         Returns:
-            str: XML-документ с декларацией Windows-1251 и корневым тегом
-            ``<string_table>``.
+            str: XML-документ таблицы строк.
 
         Raises:
-            ValueError:
-                Если язык не поддерживается или идентификатор записи
-                некорректен.
-            TypeError:
-                Если запись имеет неверный формат или текст не является
-                строкой.
+            ValueError: Если язык не входит в :data:`STRING_LANGUAGES`.
         """
-        logger.debug(
-            "Формирование строковой таблицы '%s' (записей: %d).",
-            language,
-            len(entries),
-        )
+        if language not in STRING_LANGUAGES:
+            raise ValueError(f"Неподдерживаемый язык: {language}")
+        lines = [XML_DECLARATION, f"<{STRING_TABLE_TAG}>", ""]
+        for entry_id, ru, en in entries:
+            text = ru if language == "rus" else en
+            lines.append(f'\t<string id="{entry_id}">')
+            lines.append(f"\t\t<text>{escape_xml_text(text)}</text>")
+            lines.append("\t</string>")
+        lines.append("")
+        lines.append(f"</{STRING_TABLE_TAG}>")
+        return "\n".join(lines)
 
-        try:
-            if language not in STRING_LANGUAGES:
-                raise ValueError(
-                    f"Неподдерживаемый язык строковой таблицы: '{language}'."
-                )
+    # ------------------------------------------------------------------
+    # dialogs_<mod>.xml
+    # ------------------------------------------------------------------
 
-            lines = [XML_DECLARATION, f"<{STRING_TABLE_TAG}>"]
+    def generate_dialogs_xml(self, dialogs: dict[str, "Dialog"]) -> str:
+        """Формирует файл ``gamedata/configs/gameplay/dialogs_<mod>.xml``.
 
-            for entry in entries:
-                if not isinstance(entry, tuple) or len(entry) != 3:
-                    raise TypeError(
-                        "Запись строковой таблицы должна быть тройкой "
-                        f"(id, text_ru, text_en), а получена {entry!r}."
-                    )
-
-                entry_id, text_ru, text_en = entry
-                self._validate_identifier(entry_id, "строковой записи")
-
-                text = text_ru if language == "rus" else text_en
-                if not isinstance(text, str):
-                    raise TypeError(
-                        f"Текст записи '{entry_id}' должен быть строкой, "
-                        f"а получен {type(text).__name__}."
-                    )
-
-                lines.append(f'<string id="{entry_id}">')
-                lines.append(f"<text>{escape_xml_text(text)}</text>")
-                lines.append("</string>")
-
-            lines.append(f"</{STRING_TABLE_TAG}>")
-            content = "\n".join(lines)
-
-            logger.debug(
-                "Строковая таблица '%s' сформирована: символов — %d.",
-                language,
-                len(content),
-            )
-            return content
-        except Exception as exc:
-            logger.exception(
-                "Не удалось сформировать строковую таблицу '%s': %s",
-                language,
-                exc,
-            )
-            raise
-
-    def _build_dialog(self, dialog_id: Any, dialog: Any) -> str:
-        """Собирает XML-блок одного диалога.
+        Каждый диалог оборачивается в ``<dialog id="...">`` с обязательным
+        ``<phrase_list>``; повреждённый диалог логируется и пропускается, не
+        ломая остальные (стандарт, 2.1 и 4.VERIFY).
 
         Args:
-            dialog_id (Any):
-                Ключ карты диалогов; должен совпадать с ``Dialog.id``.
-            dialog (Any):
-                Модель диалога или повреждённый объект с ожидаемыми полями.
+            dialogs (dict[str, Dialog]):
+                Карта диалогов проекта.
 
         Returns:
-            str: Блок ``<dialog>`` без XML-декларации и корневого тега.
+            str: Полный XML-документ ``<game_dialogs>``.
 
         Raises:
-            ValueError:
-                Если идентификатор диалога некорректен или не совпадает с
-                ``Dialog.id``.
-            TypeError:
-                Если карта фраз отсутствует, пуста или имеет неверный тип.
+            TypeError: Если ``dialogs`` не является словарём.
         """
-        try:
-            self._validate_identifier(dialog_id, "диалога")
+        if not isinstance(dialogs, dict):
+            raise TypeError(
+                "dialogs должен быть dict, а получен "
+                f"{type(dialogs).__name__}."
+            )
 
-            actual_id = getattr(dialog, "id", None)
-            if actual_id != dialog_id:
-                raise ValueError(
-                    f"Ключ карты '{dialog_id}' не совпадает с Dialog.id="
-                    f"'{actual_id}'."
-                )
-
-            phrases = getattr(dialog, "phrases", None)
-            if not isinstance(phrases, dict) or not phrases:
-                raise TypeError(
-                    f"Диалог '{dialog_id}' должен содержать непустую карту "
-                    "phrases."
-                )
-
+        blocks: list[str] = []
+        for key, dialog in dialogs.items():
             try:
-                ordered_phrases = sorted(phrases.items())
-            except TypeError as exc:
-                raise TypeError(
-                    f"Ключи фраз диалога '{dialog_id}' не поддаются "
-                    "сортировке."
-                ) from exc
-
-            lines = [f'<dialog id="{dialog_id}">']
-
-            for phrase_id, phrase in ordered_phrases:
-                lines.append(
-                    self._build_phrase(dialog_id, phrase_id, phrase)
+                blocks.append(self._build_dialog(str(key), dialog))
+            except Exception as exc:  # noqa: BLE001 - изоляция одного диалога
+                logger.error(
+                    "Диалог '%s' пропущен: %s", key, exc, exc_info=True
                 )
 
-            lines.append("</dialog>")
-            block = "\n".join(lines)
+        lines = [XML_DECLARATION, f"<{GAME_DIALOGS_TAG}>", ""]
+        for block in blocks:
+            lines.append(block)
+            lines.append("")
+        lines.append(f"</{GAME_DIALOGS_TAG}>")
+        return "\n".join(lines)
 
-            logger.debug(
-                "Диалог '%s' собран: фраз — %d.",
-                dialog_id,
-                len(ordered_phrases),
+    @staticmethod
+    def _dialog_output_id(dialog: "Dialog") -> str:
+        """Возвращает канонический id диалога для XML и ``<actor_dialog>``.
+
+        Args:
+            dialog (Dialog): Модель диалога.
+
+        Returns:
+            str: ``dialog.dialog_id``, если он задан, иначе ``dialog.id``.
+
+        Raises:
+            ValueError: Если у диалога нет ни того, ни другого идентификатора.
+        """
+        dialog_id = getattr(dialog, "dialog_id", None) or getattr(
+            dialog, "id", None
+        )
+        if not isinstance(dialog_id, str) or not dialog_id.strip():
+            raise ValueError(f"Некорректный ID диалога: {dialog_id!r}")
+        return dialog_id.strip()
+
+    def _build_dialog(self, dialog_key: str, dialog: "Dialog") -> str:
+        """Собирает один блок ``<dialog>``.
+
+        Args:
+            dialog_key (str): Ключ карты диалогов (для сообщений об ошибках).
+            dialog (Dialog): Модель диалога.
+
+        Returns:
+            str: XML-блок диалога.
+
+        Raises:
+            TypeError: Если у диалога нет непустой карты фраз.
+            ValueError: Если ключ фразы не совпадает с ``Phrase.id``.
+        """
+        dialog_id = self._dialog_output_id(dialog)
+
+        phrases = getattr(dialog, "phrases", None)
+        if not isinstance(phrases, dict) or not phrases:
+            raise TypeError(f"Диалог '{dialog_id}' без phrases.")
+
+        lines = [f'\t<dialog id="{dialog_id}">']
+
+        # Уровень диалога: инфопоршни и одно Lua-условие на все прочие типы.
+        info_tags, needs_condition = self._split_dialog_conditions(dialog)
+        if needs_condition:
+            lines.append(
+                f"\t\t<precondition>dialogs.{dialog_id}_can_take</precondition>"
             )
-            return block
-        except Exception as exc:
-            logger.error(
-                "Не удалось собрать диалог '%s': %s",
-                dialog_id,
-                exc,
-                exc_info=True,
+        for tag, value in info_tags:
+            lines.append(f"\t\t<{tag}>{escape_xml_text(value)}</{tag}>")
+
+        lines.append("\t\t<phrase_list>")
+        for phrase_id in sorted(phrases):
+            phrase = phrases[phrase_id]
+            lines.append(
+                self._build_phrase(dialog_id, phrase_id, phrase)
             )
-            raise
+        lines.append("\t\t</phrase_list>")
+        lines.append("\t</dialog>")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _split_dialog_conditions(
+        dialog: "Dialog",
+    ) -> tuple[list[tuple[str, str]], bool]:
+        """Делит условия диалога на прямые info-теги и Lua-условие.
+
+        ``HasInfo``/``DontHasInfo`` имеют штатные XML-теги (стандарт, 2.1,
+        п. 5). Остальные типы условий не представимы тегами и выносятся в
+        функцию ``dialogs.<dialog_id>_can_take``.
+
+        Args:
+            dialog (Dialog): Модель диалога.
+
+        Returns:
+            tuple[list[tuple[str, str]], bool]:
+                Список ``(tag, value)`` и признак необходимости Lua-условия.
+        """
+        tags: list[tuple[str, str]] = []
+        needs_condition = False
+        for condition in getattr(dialog, "preconditions", []) or []:
+            if isinstance(condition, HasInfo):
+                tags.append(("has_info", condition.info))
+            elif isinstance(condition, DontHasInfo):
+                tags.append(("dont_has_info", condition.info))
+            else:
+                needs_condition = True
+        return tags, needs_condition
 
     def _build_phrase(
-        self,
-        dialog_id: str,
-        phrase_id: Any,
-        phrase: Any,
+        self, dialog_id: str, phrase_id: Any, phrase: "Phrase"
     ) -> str:
-        """Собирает XML-блок одной фразы диалога.
+        """Собирает один блок ``<phrase>``.
+
+        Порядок тегов соответствует ``standart_of_auto.md`` (2.1, п. 6):
+        ``<text>`` → ``<next>`` → ``<precondition>`` → info-теги →
+        ``<give_info>`` → ``<action>``.
 
         Args:
-            dialog_id (str):
-                Идентификатор родительского диалога.
-            phrase_id (Any):
-                Ключ карты фраз; должен совпадать с ``Phrase.id``.
-            phrase (Any):
-                Модель реплики или повреждённый объект с ожидаемыми полями.
+            dialog_id (str): Канонический id диалога.
+            phrase_id (Any): Ключ фразы в карте диалога.
+            phrase (Phrase): Модель реплики.
 
         Returns:
-            str: Блок ``<phrase>`` со ссылкой на текст, переходами,
-            предусловием и действием.
+            str: XML-блок реплики.
 
         Raises:
-            ValueError:
-                Если номер фразы или номер перехода некорректен.
-            TypeError:
-                Если ``next_phrases``, ``preconditions`` или ``actions``
-                отсутствуют либо имеют неверный тип.
+            ValueError: Если id реплики не целый или не совпадает с ключом.
         """
-        try:
-            self._validate_phrase_identity(dialog_id, phrase_id, phrase)
-
-            next_phrases = getattr(phrase, "next_phrases", None)
-            preconditions = getattr(phrase, "preconditions", None)
-            actions = getattr(phrase, "actions", None)
-
-            if not isinstance(next_phrases, list):
-                raise TypeError(
-                    f"Фраза '{phrase_id}' диалога '{dialog_id}' содержит "
-                    "нестроковый список next_phrases."
-                )
-
-            if not isinstance(preconditions, list):
-                raise TypeError(
-                    f"Фраза '{phrase_id}' диалога '{dialog_id}' содержит "
-                    "нестроковый список preconditions."
-                )
-
-            if not isinstance(actions, list):
-                raise TypeError(
-                    f"Фраза '{phrase_id}' диалога '{dialog_id}' содержит "
-                    "нестроковый список actions."
-                )
-
-            prefix = f"mymod_quests.{dialog_id}_phrase_{phrase_id}"
-            lines = [
-                f'<phrase id="{phrase_id}">',
-                f"<text>{dialog_id}_phrase_{phrase_id}_text</text>",
-            ]
-
-            for next_id in next_phrases:
-                if not isinstance(next_id, int) or isinstance(next_id, bool):
-                    raise ValueError(
-                        f"Переход фразы '{phrase_id}' диалога '{dialog_id}' "
-                        f"должен быть целым числом, а получен "
-                        f"{type(next_id).__name__}."
-                    )
-
-                if next_id < 0:
-                    raise ValueError(
-                        f"Переход фразы '{phrase_id}' диалога '{dialog_id}' "
-                        f"не может быть отрицательным: {next_id}."
-                    )
-
-                lines.append(f'<next id="{next_id}"/>')
-
-            if preconditions:
-                lines.append(f"<precondition>{prefix}_precondition</precondition>")
-
-            if actions:
-                lines.append(f"<action>{prefix}_action</action>")
-
-            lines.append("</phrase>")
-            logger.debug(
-                "Фраза '%s' диалога '%s' собрана: переходов — %d.",
-                phrase_id,
-                dialog_id,
-                len(next_phrases),
+        if not isinstance(phrase_id, int) or isinstance(phrase_id, bool):
+            raise ValueError(
+                f"Фраза диалога '{dialog_id}' имеет не-int id."
             )
-            return "\n".join(lines)
-        except Exception as exc:
-            logger.error(
-                "Не удалось собрать фразу '%s' диалога '%s': %s",
-                phrase_id,
-                dialog_id,
-                exc,
-                exc_info=True,
+        if getattr(phrase, "id", None) != phrase_id:
+            raise ValueError(
+                f"Ключ фразы {phrase_id} != Phrase.id="
+                f"{getattr(phrase, 'id', None)}."
             )
-            raise
 
-    def _validate_phrase_identity(
-        self,
-        dialog_id: str,
-        phrase_id: Any,
-        phrase: Any,
-    ) -> None:
-        """Проверяет корректность номера фразы и его совпадение с моделью.
+        prefix = f"{dialog_id}_phrase_{phrase_id}"
+        next_phrases = list(getattr(phrase, "next_phrases", []))
+        preconditions = list(getattr(phrase, "preconditions", []))
+        actions = list(getattr(phrase, "actions", []))
 
-        Args:
-            dialog_id (str):
-                Идентификатор родительского диалога для сообщений об ошибках.
-            phrase_id (Any):
-                Ключ карты фраз.
-            phrase (Any):
-                Модель реплики или повреждённый объект.
+        lines = [f'\t\t\t<phrase id="{phrase_id}">']
+        lines.append(f"\t\t\t\t<text>{prefix}_text</text>")
 
-        Returns:
-            None: Функция ничего не возвращает.
-
-        Raises:
-            ValueError:
-                Если номер фразы не является неотрицательным целым или не
-                совпадает с ``Phrase.id``.
-        """
-        try:
-            if not isinstance(phrase_id, int) or isinstance(phrase_id, bool):
+        for next_id in next_phrases:
+            if not isinstance(next_id, int) or isinstance(next_id, bool):
                 raise ValueError(
-                    f"Номер фразы диалога '{dialog_id}' должен быть целым "
-                    f"числом, а получен {type(phrase_id).__name__}."
+                    f"<next> фразы {phrase_id} должен быть int."
                 )
+            lines.append(f"\t\t\t\t<next>{next_id}</next>")
 
-            if phrase_id < 0:
-                raise ValueError(
-                    f"Номер фразы диалога '{dialog_id}' не может быть "
-                    f"отрицательным: {phrase_id}."
-                )
-
-            actual_id = getattr(phrase, "id", None)
-            if actual_id != phrase_id:
-                raise ValueError(
-                    f"Ключ фразы {phrase_id} диалога '{dialog_id}' не "
-                    f"совпадает с Phrase.id='{actual_id}'."
-                )
-
-            logger.debug(
-                "Фраза '%s' диалога '%s' прошла проверку идентификатора.",
-                phrase_id,
-                dialog_id,
+        info_tags: list[tuple[str, str]] = []
+        needs_condition = False
+        for condition in preconditions:
+            if isinstance(condition, HasInfo):
+                info_tags.append(("has_info", condition.info))
+            elif isinstance(condition, DontHasInfo):
+                info_tags.append(("dont_has_info", condition.info))
+            else:
+                needs_condition = True
+        if needs_condition:
+            lines.append(
+                f"\t\t\t\t<precondition>dialogs.{prefix}_precondition"
+                "</precondition>"
             )
-        except Exception as exc:
-            logger.error(
-                "Ошибка идентификатора фразы '%s' диалога '%s': %s",
-                phrase_id,
-                dialog_id,
-                exc,
+        for tag, value in info_tags:
+            lines.append(
+                f"\t\t\t\t<{tag}>{escape_xml_text(value)}</{tag}>"
             )
-            raise
 
-    def _validate_identifier(self, value: Any, entity: str) -> str:
-        """Проверяет пригодность идентификатора для XML-разметки.
+        give_info: list[str] = []
+        actions_xml: list[str] = []
+        needs_action = False
+        for action in actions:
+            if isinstance(action, GiveInfo):
+                give_info.append(action.info)
+            elif isinstance(action, GiveTask):
+                actions_xml.append(f"dialogs.{dialog_id}_accept")
+            elif isinstance(action, CompleteTask):
+                actions_xml.append(f"dialogs.{dialog_id}_turn_in")
+            else:
+                needs_action = True
 
-        Идентификаторы попадают в атрибуты ``id`` и в имена строковых тегов,
-        поэтому они не должны быть пустыми, содержать пробельные символы или
-        символы, ломающие XML.
-
-        Args:
-            value (Any):
-                Проверяемое значение идентификатора.
-            entity (str):
-                Человекочитаемое название сущности для сообщения об ошибке.
-
-        Returns:
-            str: Исходный идентификатор, если проверка прошла успешно.
-
-        Raises:
-            ValueError:
-                Если значение пустое, не является строкой, содержит пробелы
-                или запрещённые символы ``<>"'&``.
-        """
-        try:
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(
-                    f"Идентификатор {entity} должен быть непустой строкой, "
-                    f"а получен {value!r}."
-                )
-
-            if any(character.isspace() for character in value):
-                raise ValueError(
-                    f"Идентификатор {entity} '{value}' не должен содержать "
-                    "пробельных символов."
-                )
-
-            forbidden = set('<>"\'&')
-            if any(character in forbidden for character in value):
-                raise ValueError(
-                    f"Идентификатор {entity} '{value}' содержит символы, "
-                    "недопустимые в XML."
-                )
-
-            logger.debug("Идентификатор %s '%s' корректен.", entity, value)
-            return value
-        except Exception as exc:
-            logger.error(
-                "Некорректный идентификатор %s '%s': %s",
-                entity,
-                value,
-                exc,
+        for info_id in give_info:
+            lines.append(
+                f"\t\t\t\t<give_info>{escape_xml_text(info_id)}</give_info>"
             )
-            raise
+        if needs_action:
+            actions_xml.append(f"dialogs.{prefix}_action")
+        for action_name in actions_xml:
+            lines.append(f"\t\t\t\t<action>{action_name}</action>")
+
+        lines.append("\t\t\t</phrase>")
+        return "\n".join(lines)
 
 
 __all__ = ["XmlGenerator"]

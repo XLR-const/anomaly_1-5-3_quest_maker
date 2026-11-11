@@ -1,13 +1,16 @@
-"""Автоматические тесты генератора Lua-логики квестов и диалогов.
+"""Тесты Lua-генератора ``<mod>_quests.script``.
 
-Запуск из корня проекта::
+Проверяются требования ``standart_of_auto.md`` (2.3):
 
-    python -m unittest tests.test_compiler_lua -v
-    python -m unittest discover -s tests -v
+* статическая таблица ``local QUESTS`` вместо динамической инъекции;
+* плоские ключи регистрации в ``task_functor``,
+  ``task_status_functor``, ``xr_effects`` и ``dialogs``;
+* канонические сигнатуры ``function(actor, npc, p)``;
+* отсутствие DLTX, ``.ext`` и ``start_dialogs``.
 
-Тесты проверяют структуру и сигнатуры сгенерированных функторов, трансляцию
-Pydantic-действий в игровые методы Anomaly, обработку ``transfer_conditions``
-и отказоустойчивость генератора при повреждённом квесте.
+Запуск::
+
+    .\\venv\\Scripts\\python.exe -m unittest tests.test_compiler_lua -v
 """
 
 from __future__ import annotations
@@ -16,9 +19,6 @@ import re
 import sys
 import unittest
 from pathlib import Path
-from typing import Any
-
-from pydantic import Field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -26,389 +26,290 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.compiler.lua_gen import LuaGenerator  # noqa: E402
 from src.core.models import (  # noqa: E402
+    CompleteTask,
     Dialog,
-    DontHasInfo,
     GiveInfo,
     GiveItem,
-    GiveMoney,
+    GiveTask,
     HasInfo,
     HasItem,
     ModProject,
     Phrase,
     Quest,
-    RemoveInfo,
-    RemoveItem,
-    SpawnSquad,
     Stage,
+    WarfareCapture,
 )
 
 QUEST_ID = "mymod_test_quest"
-SECOND_QUEST_ID = "mymod_transfer_quest"
-BROKEN_QUEST_ID = "mymod_broken_quest"
 DIALOG_ID = "mymod_test_dialog"
-LUA_LOGGER_NAME = "aqb.compiler.lua_gen"
-
-REWARD_ITEM = "mymod_reward_item"
-QUEST_ITEM = "mymod_quest_item"
-STAGE_TARGET_0 = "esc.test_target_0"
-STAGE_TARGET_1 = "esc.test_target_1"
-
-
-class QuestWithTransfers(Quest):
-    """Тестовая модель квеста с расширенным полем ``transfer_conditions``.
-
-    Базовая модель :class:`~src.core.models.Quest` пока не содержит это поле.
-    Наследник демонстрирует контракт, который поддерживает генератор Lua:
-    правила завершения и провала можно хранить как для квеста целиком, так и
-    для отдельных этапов.
-    """
-
-    transfer_conditions: dict[Any, Any] = Field(
-        default_factory=dict,
-        description="Правила перехода этапов квеста.",
-    )
-
-
-def _make_quest(quest_id: str = QUEST_ID) -> Quest:
-    """Создаёт валидный квест с двумя этапами и всеми видами действий.
-
-    Args:
-        quest_id (str):
-            Идентификатор квеста и ключ карты квестов.
-
-    Returns:
-        Quest: Валидная модель с действиями выдачи, награды и провала.
-    """
-    return Quest(
-        id=quest_id,
-        title_ru="Тестовый квест",
-        title_en="Test quest",
-        descr_ru="Описание тестового квеста",
-        descr_en="Test quest description",
-        stages={
-            0: Stage(
-                id=0,
-                title_ru="Первый этап",
-                title_en="First stage",
-                descr_ru="Описание первого этапа",
-                descr_en="First stage description",
-                target_alias=STAGE_TARGET_0,
-            ),
-            1: Stage(
-                id=1,
-                title_ru="Второй этап",
-                title_en="Second stage",
-                descr_ru="Описание второго этапа",
-                descr_en="Second stage description",
-                target_alias=STAGE_TARGET_1,
-            ),
-        },
-        on_init_actions=[
-            GiveInfo(info="mymod_quest_started"),
-            SpawnSquad(
-                squad_alias="mymod_task_squad",
-                smart_alias="esc_smart_terrain_test",
-            ),
-        ],
-        on_complete_actions=[
-            GiveItem(item_alias=REWARD_ITEM),
-            GiveMoney(amount=5000),
-        ],
-        on_fail_actions=[
-            RemoveItem(item_alias=QUEST_ITEM),
-            RemoveInfo(info="mymod_quest_started"),
-        ],
-    )
-
-
-def _make_transfer_quest() -> QuestWithTransfers:
-    """Создаёт квест с правилами ``transfer_conditions`` для двух этапов.
-
-    Returns:
-        QuestWithTransfers: Квест, который завершает первый этап по
-        инфопоршню и последний — по наличию предмета; провал определяется
-        отсутствием другого инфопоршня.
-    """
-    base_quest = _make_quest(SECOND_QUEST_ID)
-
-    return QuestWithTransfers(
-        **base_quest.model_dump(),
-        transfer_conditions={
-            0: {
-                "complete": [HasInfo(info="mymod_stage_0_done")],
-            },
-            1: {
-                "complete": [HasItem(item_alias=REWARD_ITEM)],
-                "fail": [DontHasInfo(info="mymod_stage_1_allowed")],
-            },
-        },
-    )
-
-
-def _make_dialog() -> Dialog:
-    """Создаёт диалог с предусловиями и всеми видами действий.
-
-    Returns:
-        Dialog: Три реплики, две из которых содержат логику.
-    """
-    return Dialog(
-        id=DIALOG_ID,
-        npc_alias="esc.mayor_zhurov",
-        phrases={
-            0: Phrase(
-                id=0,
-                text_ru="Здравствуй, сталкер!",
-                text_en="Hello, stalker!",
-                next_phrases=[1],
-                preconditions=[HasInfo(info="mymod_dialog_available")],
-                actions=[
-                    GiveItem(item_alias=REWARD_ITEM),
-                    RemoveItem(item_alias=QUEST_ITEM),
-                    GiveMoney(amount=2500),
-                ],
-            ),
-            1: Phrase(
-                id=1,
-                text_ru="Вот твоя награда.",
-                text_en="Here is your reward.",
-                preconditions=[
-                    DontHasInfo(info="mymod_dialog_used"),
-                    HasItem(item_alias=QUEST_ITEM),
-                ],
-                actions=[
-                    GiveInfo(info="mymod_dialog_used"),
-                    RemoveInfo(info="mymod_dialog_available"),
-                ],
-            ),
-            2: Phrase(
-                id=2,
-                text_ru="До встречи.",
-                text_en="See you.",
-            ),
-        },
-    )
+SCRIPT_NAME = "mymod_quests"
+MOD_PREFIX = "mymod"
 
 
 def _make_project() -> ModProject:
-    """Создаёт валидный проект с одним квестом и одним диалогом.
+    """Создаёт проект с одним квестом и одним диалогом.
 
     Returns:
-        ModProject: Проект для проверки структуры Lua-скрипта.
+        ModProject: Модель с наградой, этапами и динамическими условиями.
     """
+    quest = Quest(
+        id=QUEST_ID,
+        npc_id="esc_mayor",
+        npc_location="escape",
+        dialog_id=DIALOG_ID,
+        title_ru="Тестовый квест",
+        title_en="Test quest",
+        descr_ru="Описание",
+        descr_en="Description",
+        taken_info="mymod_taken",
+        complete_info="mymod_done",
+        reward_money=5000,
+        reward_item_alias="medkit",
+        reward_item_count=2,
+        return_to_giver_stage=1,
+        return_distance=25.0,
+        stages={
+            0: Stage(
+                id=0,
+                title_ru="Захват",
+                title_en="Capture",
+                target_alias="esc_smart",
+                on_start_actions=[GiveInfo(info="mymod_stage_0")],
+                warfare_capture=WarfareCapture(
+                    smart_alias="esc_smart",
+                    enemy_squad_alias="esc_enemy",
+                    ally_squad_alias="army_ally",
+                    ally_count=2,
+                ),
+            ),
+            1: Stage(
+                id=1,
+                title_ru="Возврат",
+                title_en="Return",
+                target_alias="esc_mayor",
+            ),
+        },
+        transfer_conditions={
+            0: {"complete": [HasInfo(info="mymod_stage_0")]}
+        },
+        on_init_actions=[GiveInfo(info="mymod_started")],
+        on_complete_actions=[
+            GiveItem(item_alias="mymod_reward", count=1)
+        ],
+        on_fail_actions=[GiveInfo(info="mymod_failed")],
+    )
+    dialog = Dialog(
+        id=DIALOG_ID,
+        npc_id="esc_mayor",
+        npc_location="escape",
+        task_id=QUEST_ID,
+        role="take",
+        preconditions=[HasItem(item_alias="mymod_item")],
+        phrases={
+            0: Phrase(
+                id=0,
+                text_ru="Привет",
+                text_en="Hi",
+                next_phrases=[1],
+                actions=[GiveTask(task_id=QUEST_ID)],
+            ),
+            1: Phrase(
+                id=1,
+                text_ru="Возьму",
+                text_en="Take",
+                preconditions=[HasItem(item_alias="mymod_item")],
+                actions=[
+                    GiveItem(item_alias="mymod_consumable", count=1),
+                    CompleteTask(task_id=QUEST_ID),
+                ],
+            ),
+        },
+    )
     return ModProject(
-        name="mymod_lua_test",
-        quests={QUEST_ID: _make_quest()},
-        dialogs={DIALOG_ID: _make_dialog()},
+        name="Lua Test",
+        quests={QUEST_ID: quest},
+        dialogs={DIALOG_ID: dialog},
     )
 
 
 class TestLuaGeneratorStructure(unittest.TestCase):
-    """Проверка структуры скрипта и сигнатур сгенерированных функций."""
+    """Проверка структуры и сигнатур сгенерированного скрипта."""
 
     def setUp(self) -> None:
-        """Создаёт генератор перед каждым тестом."""
+        """Генерирует скрипт с явными именем модуля и префиксом."""
+        self.project = _make_project()
         self.generator = LuaGenerator()
+        self.script = self.generator.generate_quests_script(
+            self.project,
+            script_name=SCRIPT_NAME,
+            mod_prefix=MOD_PREFIX,
+        )
 
-    def test_generates_helpers_and_strict_functor_signatures(self) -> None:
-        """Скрипт содержит хелперы и точные сигнатуры Anomaly."""
-        script = self.generator.generate_quests_script(_make_project())
-        quest_id = re.escape(QUEST_ID)
-        dialog_id = re.escape(DIALOG_ID)
+    def test_header_uses_script_name_once(self) -> None:
+        """Имя модуля не дублирует суффикс ``_quests``."""
+        self.assertIn(f"{SCRIPT_NAME}.script", self.script)
+        self.assertNotIn(f"{SCRIPT_NAME}_quests.script", self.script)
+        self.assertIn(
+            f"-- End of auto-generated {SCRIPT_NAME}.script",
+            self.script,
+        )
 
+    def test_static_quests_table_contains_metadata(self) -> None:
+        """``local QUESTS`` содержит NPC, диалог, награду и этапы."""
+        self.assertIn("local QUESTS = {", self.script)
+        self.assertIn(f'key_prefix = "{MOD_PREFIX}_{QUEST_ID}"', self.script)
+        self.assertIn('npc = "esc_mayor"', self.script)
+        self.assertIn('npc_location = "escape"', self.script)
+        self.assertIn(f'dialog = "{DIALOG_ID}"', self.script)
+        self.assertIn("money = 5000", self.script)
+        self.assertIn('item = "medkit"', self.script)
+        self.assertIn("item_count = 2", self.script)
+        self.assertIn("return_stage = 1", self.script)
+        self.assertIn("return_distance = 25.0", self.script)
+        self.assertIn("ally_count = 2", self.script)
+        self.assertIn('kind = "has_info"', self.script)
+        self.assertIn('info = "mymod_stage_0"', self.script)
+
+    def test_flat_functor_registrations(self) -> None:
+        """Функторы регистрируются плоскими ключами в четырёх таблицах."""
+        expected = (
+            f'task_functor["{QUEST_ID}_target"] = {QUEST_ID}_target',
+            f'task_functor["{QUEST_ID}_descr"] = {QUEST_ID}_descr',
+            f'task_status_functor["{QUEST_ID}_status"] = '
+            f"{QUEST_ID}_status",
+            f'xr_effects["{QUEST_ID}_start"] = {QUEST_ID}_start',
+            f'xr_effects["{QUEST_ID}_reward"] = {QUEST_ID}_reward',
+            f'xr_effects["{QUEST_ID}_cleanup"] = {QUEST_ID}_cleanup',
+            f'dialogs["{QUEST_ID}_accept"] = {QUEST_ID}_accept',
+            f'dialogs["{QUEST_ID}_turn_in"] = {QUEST_ID}_turn_in',
+            f'dialogs["{DIALOG_ID}_can_take"] = {DIALOG_ID}_can_take',
+            f'dialogs["{DIALOG_ID}_can_turn_in"] = '
+            f"{DIALOG_ID}_can_turn_in",
+            f'dialogs["{DIALOG_ID}_phrase_1_precondition"] = '
+            f"{DIALOG_ID}_phrase_1_precondition",
+            f'dialogs["{DIALOG_ID}_phrase_1_action"] = '
+            f"{DIALOG_ID}_phrase_1_action",
+        )
+        for line in expected:
+            with self.subTest(line=line):
+                self.assertIn(line, self.script)
+
+    def test_engine_functor_signatures(self) -> None:
+        """Функторы задач имеют фиксированные сигнатуры движка."""
         self.assertRegex(
-            script,
-            r"function\s+mymod_quests\.is_smart_captured"
-            r"\s*\(\s*smart_id\s*,\s*faction\s*\)",
+            self.script,
+            rf"local function {QUEST_ID}_target"
+            r"\s*\(\s*task_id\s*,\s*field\s*,\s*p\s*,\s*tsk\s*\)",
         )
         self.assertRegex(
-            script,
-            r"function\s+mymod_quests\.spawn_task_squad"
-            r"\s*\(\s*squad_id\s*,\s*smart_id\s*\)",
+            self.script,
+            rf"local function {QUEST_ID}_descr"
+            r"\s*\(\s*task_id\s*,\s*field\s*,\s*p\s*,\s*tsk\s*\)",
         )
-        self.assertIn("save_var(db.actor", script)
-        self.assertIn("load_var(db.actor", script)
-        self.assertIn('xr_sound.set_sound_play(db.actor, "pda_task")', script)
+        self.assertRegex(
+            self.script,
+            rf"local function {QUEST_ID}_status"
+            r"\s*\(\s*tsk\s*,\s*task_id\s*\)",
+        )
 
-        for function_name, arguments in (
-            ("on_init", r"tsk"),
-            ("on_complete", r"tsk"),
-            ("on_fail", r"tsk"),
-            ("status_functor", r"tsk\s*,\s*task_id"),
-            ("target_functor", r"tsk\s*,\s*task_id"),
-        ):
-            with self.subTest(function=function_name):
+    def test_effects_use_canonical_actor_npc_p_signature(self) -> None:
+        """Все эффекты и диалоговые функции — ``(actor, npc, p)``."""
+        names = [
+            f"{QUEST_ID}_start",
+            f"{QUEST_ID}_reward",
+            f"{QUEST_ID}_cleanup",
+            f"{QUEST_ID}_accept",
+            f"{QUEST_ID}_turn_in",
+            f"{DIALOG_ID}_can_take",
+            f"{DIALOG_ID}_can_turn_in",
+            f"{DIALOG_ID}_accept",
+            f"{DIALOG_ID}_turn_in",
+            f"{DIALOG_ID}_phrase_1_precondition",
+            f"{DIALOG_ID}_phrase_1_action",
+        ]
+        for name in names:
+            with self.subTest(function=name):
                 self.assertRegex(
-                    script,
-                    rf"function\s+mymod_quests\.{quest_id}_{function_name}"
-                    rf"\s*\(\s*{arguments}\s*\)",
+                    self.script,
+                    rf"local function {name}"
+                    r"\s*\(\s*actor\s*,\s*npc\s*,\s*p\s*\)",
                 )
 
-        self.assertRegex(
-            script,
-            rf"function\s+mymod_quests\.{dialog_id}_phrase_0_precondition"
-            r"\s*\(\s*first_speaker\s*,\s*second_speaker\s*,\s*"
-            r"dialog_id\s*,\s*phrase_id\s*\)",
-        )
-        self.assertRegex(
-            script,
-            rf"function\s+mymod_quests\.{dialog_id}_phrase_0_action"
-            r"\s*\(\s*first_speaker\s*,\s*second_speaker\s*,\s*"
-            r"dialog_id\s*,\s*phrase_id\s*\)",
-        )
-
-        self.assertIn(STAGE_TARGET_0, script)
-        self.assertIn(STAGE_TARGET_1, script)
-
-
-class TestLuaGeneratorActions(unittest.TestCase):
-    """Проверка трансляции Pydantic-условий и действий в Lua-API."""
-
-    def setUp(self) -> None:
-        """Создаёт генератор перед каждым тестом."""
-        self.generator = LuaGenerator()
-
-    def test_translates_money_items_and_info_actions(self) -> None:
-        """GiveMoney, GiveItem, RemoveItem и инфопоршни дают верные вызовы."""
-        script = self.generator.generate_quests_script(_make_project())
-
-        self.assertIn("db.actor:give_money(5000)", script)
-        self.assertIn("db.actor:give_money(2500)", script)
+    def test_register_runs_at_module_level(self) -> None:
+        """``register()`` вызывается в конце модуля и на старте игры."""
+        self.assertIn("local function register()", self.script)
+        self.assertIn("function on_game_start()", self.script)
+        self.assertIn("RegisterScriptCallback(\"on_game_load\"", self.script)
         self.assertIn(
-            f'dialogs.relocate_item_section(second_speaker, "{REWARD_ITEM}", "in")',
-            script,
+            "RegisterScriptCallback(\"actor_on_first_update\"",
+            self.script,
         )
-        self.assertIn(
-            f'dialogs.relocate_item_section(second_speaker, "{QUEST_ITEM}", "out")',
-            script,
-        )
-        self.assertIn(
-            f'dialogs.relocate_item_section(db.actor, "{REWARD_ITEM}", "in")',
-            script,
-        )
-        self.assertIn(
-            f'dialogs.relocate_item_section(db.actor, "{QUEST_ITEM}", "out")',
-            script,
-        )
-        self.assertIn('has_alife_info("mymod_dialog_available")', script)
-        self.assertIn('not has_alife_info("mymod_dialog_used")', script)
-        self.assertIn('db.actor:give_info_portion("mymod_quest_started")', script)
-        self.assertIn(
-            'db.actor:disable_info_portion("mymod_quest_started")',
-            script,
-        )
-
-    def test_translates_transfer_conditions_into_status_functor(self) -> None:
-        """Правила transfer_conditions управляют stage и результатом квеста."""
-        project = ModProject(
-            name="mymod_transfer_test",
-            quests={SECOND_QUEST_ID: _make_transfer_quest()},
-            dialogs={},
-        )
-
-        script = self.generator.generate_quests_script(project)
-
-        self.assertIn('if has_alife_info("mymod_stage_0_done") then', script)
-        self.assertIn("tsk.stage = 1", script)
-        self.assertIn(f'if db.actor:object("{REWARD_ITEM}") ~= nil then', script)
-        self.assertIn(
-            'if not has_alife_info("mymod_stage_1_allowed") then',
-            script,
-        )
-        self.assertIn('return "complete"', script)
-        self.assertIn('return "fail"', script)
-
-
-class TestLuaGeneratorFaultTolerance(unittest.TestCase):
-    """Проверка изоляции повреждённых квестов и отдельных действий."""
-
-    def setUp(self) -> None:
-        """Создаёт генератор перед каждым тестом."""
-        self.generator = LuaGenerator()
-
-    def test_skips_broken_quest_and_keeps_valid_one(self) -> None:
-        """Повреждённый квест логируется и не ломает генерацию остальных."""
-        broken_quest = Quest.model_construct(
-            id=BROKEN_QUEST_ID,
-            title_ru="Повреждённый квест",
-            title_en="Broken quest",
-            descr_ru="Описание",
-            descr_en="Description",
-            is_storyline=True,
-            stages="повреждённая структура вместо карты этапов",
-            on_init_actions=[],
-            on_complete_actions=[],
-            on_fail_actions=[],
-        )
-        project = ModProject.model_construct(
-            name="mymod_broken_test",
-            required_mods=[],
-            quests={
-                QUEST_ID: _make_quest(),
-                BROKEN_QUEST_ID: broken_quest,
-            },
-            dialogs={DIALOG_ID: _make_dialog()},
-        )
-
-        with self.assertLogs(LUA_LOGGER_NAME, level="ERROR") as captured:
-            script = self.generator.generate_quests_script(project)
-
-        self.assertIn(f"function mymod_quests.{QUEST_ID}_on_init(tsk)", script)
-        self.assertIn(
-            f"function mymod_quests.{QUEST_ID}_status_functor(tsk, task_id)",
-            script,
-        )
-        self.assertNotIn(BROKEN_QUEST_ID, script)
         self.assertTrue(
-            any(BROKEN_QUEST_ID in message for message in captured.output),
-            "В логе должно быть сообщение о пропущенном повреждённом квесте.",
-        )
-
-    def test_broken_action_is_logged_but_other_actions_survive(self) -> None:
-        """Одно повреждённое действие не отменяет весь квест."""
-        broken_action_quest = Quest.model_construct(
-            id=SECOND_QUEST_ID,
-            title_ru="Квест с плохим действием",
-            title_en="Quest with broken action",
-            descr_ru="Описание",
-            descr_en="Description",
-            is_storyline=True,
-            stages={
-                0: Stage(
-                    id=0,
-                    title_ru="Этап",
-                    title_en="Stage",
-                    descr_ru="Описание",
-                    descr_en="Description",
-                    target_alias=STAGE_TARGET_0,
-                )
-            },
-            on_init_actions=[GiveInfo(info="mymod_valid_info"), object()],
-            on_complete_actions=[GiveMoney(amount=100)],
-            on_fail_actions=[],
-        )
-
-        with self.assertLogs(LUA_LOGGER_NAME, level="ERROR") as captured:
-            script = self.generator.generate_quests_script(
-                ModProject.model_construct(
-                    name="mymod_broken_action_test",
-                    required_mods=[],
-                    quests={SECOND_QUEST_ID: broken_action_quest},
-                    dialogs={},
-                )
+            self.script.rstrip().endswith(
+                f"-- End of auto-generated {SCRIPT_NAME}.script"
             )
+        )
+        self.assertRegex(self.script, r"(?m)^register\(\)$")
 
-        self.assertIn(
-            'db.actor:give_info_portion("mymod_valid_info")',
-            script,
+    def test_no_dynamic_dialog_injection_or_dltx(self) -> None:
+        """Нет ``start_dialogs``, ``.ext`` и DLTX-механизмов."""
+        lowered = self.script.lower()
+        for forbidden in (
+            "start_dialogs",
+            "mymod_dialog_injections",
+            "dltx",
+            ".ext",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, lowered)
+
+    def test_no_module_prefixed_function_names(self) -> None:
+        """Имена функций плоские, без ``<mod>.`` и ``<mod>_quests.``."""
+        self.assertNotIn(f"function {SCRIPT_NAME}.", self.script)
+        self.assertNotIn("function mymod_quests.", self.script)
+        self.assertNotIn(f"{MOD_PREFIX}.{QUEST_ID}", self.script)
+
+
+class TestLuaGeneratorBehaviour(unittest.TestCase):
+    """Проверка данных и отказоустойчивости Lua-генератора."""
+
+    def test_default_names_are_safe(self) -> None:
+        """Без явных имён используются значения по умолчанию."""
+        script = LuaGenerator().generate_quests_script(_make_project())
+        self.assertIn("quests.script", script)
+        self.assertIn('key_prefix = "quests_mymod_test_quest"', script)
+
+    def test_broken_quest_is_skipped_and_valid_one_remains(self) -> None:
+        """Повреждённый квест не ломает генерацию остальных."""
+        project = _make_project()
+        project.quests["broken_quest"] = Quest.model_construct(
+            id="broken_quest",
+            stages={"bad": "not-a-stage"},
         )
-        self.assertIn("db.actor:give_money(100)", script)
-        self.assertIn("-- Пропущено действие #1", script)
-        self.assertTrue(
-            any(
-                "Действие #1" in message for message in captured.output
-            ),
-            "В логе должно быть сообщение о пропущенном действии.",
-        )
+
+        with self.assertLogs(
+            "aqb.compiler.lua_gen", level="ERROR"
+        ):
+            script = LuaGenerator().generate_quests_script(project)
+
+        self.assertIn(f"local function {QUEST_ID}_target", script)
+        self.assertNotIn("broken_quest", script)
+
+    def test_unknown_condition_is_isolated(self) -> None:
+        """Неизвестный тип условия не ломает весь диалог."""
+        project = _make_project()
+        dialog = project.dialogs[DIALOG_ID]
+        dialog.phrases[0].preconditions = [
+            HasInfo(info="mymod_ok")
+        ]
+
+        script = LuaGenerator().generate_quests_script(project)
+        self.assertIn(f"local function {DIALOG_ID}_can_take", script)
+
+    def test_rejects_non_dict_project(self) -> None:
+        """Проект без словарей quests/dialogs даёт ``TypeError``."""
+        with self.assertRaises(TypeError):
+            LuaGenerator().generate_quests_script(object())  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

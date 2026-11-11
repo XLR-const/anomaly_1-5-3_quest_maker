@@ -449,5 +449,98 @@ class TestModProjectSerialization(unittest.TestCase):
         )
 
 
+class TestStalkerMetadataFields(unittest.TestCase):
+    """Проверка новых полей привязки NPC/диалога и ``extra='allow'``."""
+
+    def test_quest_metadata_is_coerced_and_normalized(self) -> None:
+        """Числовые ID становятся строками, пустые — ``None``."""
+        quest = Quest.model_validate(
+            {
+                "id": 42,
+                "npc_id": 7,
+                "giver_npc_id": 0,
+                "npc_location": "  escape  ",
+                "dialog_id": 100,
+                "title_ru": "Тест",
+                "title_en": "Test",
+                "stages": {"0": {"id": 0}},
+            }
+        )
+
+        self.assertEqual(quest.id, "42")
+        self.assertEqual(quest.npc_id, "7")
+        self.assertIsNone(quest.giver_npc_id)
+        self.assertEqual(quest.npc_location, "escape")
+        self.assertEqual(quest.dialog_id, "100")
+        self.assertEqual(quest.stages[0].id, 0)
+
+    def test_dialog_metadata_and_id_sync(self) -> None:
+        """``Dialog.dialog_id`` синхронизируется с ``id``."""
+        dialog = Dialog.model_validate(
+            {
+                "id": 55,
+                "npc_id": 0,
+                "npc_location": "zaton",
+                "task_id": 42,
+                "role": "turnin",
+                "phrases": {"0": {"id": 0, "text_ru": "Да"}},
+            }
+        )
+
+        self.assertEqual(dialog.id, "55")
+        self.assertEqual(dialog.dialog_id, "55")
+        self.assertIsNone(dialog.npc_id)
+        self.assertEqual(dialog.npc_location, "zaton")
+        self.assertEqual(dialog.task_id, "42")
+        self.assertEqual(dialog.role, "turnin")
+
+    def test_unknown_sqlite_columns_survive_roundtrip(self) -> None:
+        """Неизвестные колонки остаются в ``model_extra``."""
+        quest = Quest.model_validate(
+            {
+                "id": "q",
+                "sqlite_rowid": 17,
+                "legacy_note": "keep me",
+                "stages": {"0": {"id": 0}},
+            }
+        )
+
+        self.assertEqual(quest.model_extra["sqlite_rowid"], 17)
+        self.assertEqual(quest.model_extra["legacy_note"], "keep me")
+
+        restored = Quest.model_validate_json(quest.model_dump_json())
+        self.assertEqual(restored.model_extra["sqlite_rowid"], 17)
+        self.assertEqual(
+            restored.model_extra["legacy_note"], "keep me"
+        )
+
+    def test_transfer_conditions_are_typed(self) -> None:
+        """Правила перехода этапов разбираются в типизированные условия."""
+        quest = Quest.model_validate(
+            {
+                "id": "q",
+                "stages": {"0": {"id": 0}},
+                "transfer_conditions": {
+                    "0": {
+                        "complete": [
+                            {"type": "has_info", "info": "done"}
+                        ],
+                        "fail": [
+                            {
+                                "type": "dont_has_info",
+                                "info": "alive",
+                            }
+                        ],
+                    }
+                },
+            }
+        )
+
+        rule = quest.transfer_conditions[0]
+        self.assertIsInstance(rule["complete"][0], HasInfo)
+        self.assertIsInstance(rule["fail"][0], DontHasInfo)
+        self.assertEqual(rule["complete"][0].info, "done")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

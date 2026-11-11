@@ -1,13 +1,18 @@
-"""Генератор конфигурации задач мода ``configs\\misc\\task\\tm_mymod.ltx``.
+"""Генератор файла задач ``gamedata/configs/misc/task/tm_<slug>.ltx``.
 
-Модуль преобразует карту :class:`~src.core.models.Quest` в LTX-секции,
-которые подхватываются штатным менеджером задач Anomaly через
-``#include "tm_*.ltx"``. Генератор отвечает только за статическую структуру
-секций; тексты, Lua-функторы и диалоги формируются другими модулями
-компилятора.
+Модуль реализует ``[4] RENDER`` для LTX-слоя и следует
+``standart_of_auto.md`` (2.2):
 
-Каждая секция собирается независимо: логическая ошибка в одном квесте
-журналируется и не прерывает сборку остальных секций.
+* имена функторов — **плоские** (``<task_id>_target``, ``_descr``,
+  ``_status``), без префикса Lua-модуля;
+* эффекты в ``on_init`` / ``on_complete`` / ``on_fail`` / ``on_cancel``
+  записываются только в форме ``%=<task_id>_start()%`` (скобки вызова
+  обязательны);
+* ``reward_money`` / ``reward_item`` в LTX не попадают — награда выдаётся
+  из Lua-эффекта ``<task_id>_reward``;
+* каждый сгенерированный функтор имеет одноимённый ключ в
+  ``task_functor``/``task_status_functor``/``xr_effects``
+  (регистрацию создаёт :class:`src.compiler.lua_gen.LuaGenerator`).
 """
 
 from __future__ import annotations
@@ -25,39 +30,35 @@ logger = get_logger("compiler.ltx_gen")
 class LtxGenerator:
     """Собирает LTX-секции задач мода из карты квестов.
 
-    Имена секций и строковых идентификаторов берутся из ``Quest.id``. Для
-    квеста ``mymod_quest_id`` генерируются ссылки ``mymod_quest_id_title`` и
-    ``mymod_quest_id_descr``, а также имена функций в пространстве
-    ``mymod_quests``.
-
-    Attributes:
-        DEFAULT_ICON (str):
-            Иконка задачи по умолчанию, используемая во всех секциях.
+    Один :class:`~src.core.models.Quest` превращается в одну секцию
+    ``[<quest_id>]``. Файл целиком подхватывается ванильным
+    ``task_manager.ltx`` через ``#include "tm_*.ltx"``, поэтому сам
+    ``task_manager.ltx`` не патчится.
     """
 
+    #: Иконка PDA по умолчанию, если ``Quest.icon`` не задан.
     DEFAULT_ICON: str = "ui_inGame2_Put_v_pripyat"
+    #: Приоритет задачи в PDA по умолчанию.
+    DEFAULT_PRIOR: int = 60
 
     def generate_tasks_ltx(self, quests: dict[str, "Quest"]) -> str:
-        """Формирует единое содержимое файла ``tm_mymod.ltx``.
+        """Генерирует полный текст ``tm_<slug>.ltx``.
 
-        Секции разделяются одной пустой строкой, что соответствует
-        читаемому оформлению штатных ``tm_*.ltx``. Ошибка в данных отдельного
-        квеста перехватывается, журналируется через :meth:`logging.Logger.error`
-        и не препятствует генерации остальных секций.
+        Каждый квест обрабатывается изолированно: ошибка данных одного
+        квеста логируется, а остальные секции всё равно попадают в файл.
 
         Args:
             quests (dict[str, Quest]):
-                Карта квестов проекта, индексированная по ``Quest.id``.
+                Карта квестов проекта. Ключ обязан совпадать с ``Quest.id``.
 
         Returns:
-            str: Готовый текст LTX-файла. Если не удалось собрать ни одной
-            секции, возвращается пустая строка.
+            str: Секции LTX, разделённые пустой строкой, с завершающим
+            переводом строки. Если секций нет — пустая строка.
 
         Raises:
-            TypeError:
-                Если ``quests`` не является словарём.
+            TypeError: Если ``quests`` не является словарём.
         """
-        logger.debug("Начата генерация tm_mymod.ltx.")
+        logger.debug("Начата генерация tm_<slug>.ltx.")
 
         if not isinstance(quests, dict):
             error = TypeError(
@@ -73,7 +74,7 @@ class LtxGenerator:
         for quest_id, quest in quests.items():
             try:
                 section = self._build_quest_section(quest_id, quest)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - изоляция одного квеста
                 skipped += 1
                 logger.error(
                     "Квест '%s' пропущен из-за ошибки данных: %s",
@@ -82,13 +83,12 @@ class LtxGenerator:
                     exc_info=True,
                 )
                 continue
-
             sections.append(section)
             logger.debug("Секция квеста '%s' добавлена в LTX.", quest_id)
 
         if not sections:
             logger.warning(
-                "tm_mymod.ltx не содержит ни одной секции "
+                "tm_<slug>.ltx не содержит ни одной секции "
                 "(всего квестов: %d, пропущено: %d).",
                 len(quests),
                 skipped,
@@ -97,115 +97,128 @@ class LtxGenerator:
 
         content = "\n\n".join(sections) + "\n"
         logger.info(
-            "Сформирован tm_mymod.ltx: секций — %d, пропущено — %d.",
+            "Сформирован tm_<slug>.ltx: секций=%d, пропущено=%d.",
             len(sections),
             skipped,
         )
         return content
 
     def _build_quest_section(self, quest_id: str, quest: "Quest") -> str:
-        """Собирает LTX-секцию одного квеста по спецификации задачи.
+        """Собирает одну секцию ``[<quest_id>]``.
+
+        Формат повторяет эталон ``standart_of_auto.md`` (2.2): плоские
+        функторы, ``descr_functor``, ``dont_send_update_news = true`` и
+        эффекты с обязательными скобками вызова.
 
         Args:
-            quest_id (str):
-                Идентификатор секции, он же ключ карты квестов.
-            quest (Quest):
-                Проверяемая модель квеста.
+            quest_id (str): ID квеста (ключ карты и имя секции).
+            quest (Quest): Модель квеста.
 
         Returns:
-            str: Текст одной секции без завершающей пустой строки.
+            str: Текст секции без завершающего перевода строки.
 
         Raises:
-            ValueError:
-                Если идентификатор секции пуст, содержит недопустимые
-                символы или не совпадает с ``Quest.id``.
-            TypeError:
-                Если ``quest`` не содержит ожидаемых полей модели.
+            ValueError: Если ключ карты не совпадает с ``Quest.id``.
+            TypeError: Если обязательные поля модели имеют неверный тип.
         """
         self._validate_quest(quest_id, quest)
 
         storyline = "true" if quest.is_storyline else "false"
+        icon = quest.icon or self.DEFAULT_ICON
+        prior = (
+            quest.prior
+            if quest.prior is not None
+            else self.DEFAULT_PRIOR
+        )
+        stage_complete = len(quest.stages)
+        giver_npc_id = quest.npc_id or quest.giver_npc_id
 
         lines = [
             f"[{quest_id}]",
-            f"icon = {self.DEFAULT_ICON}",
-            f"storyline = {storyline}",
+            f"icon                  = {icon}",
+            f"prior                 = {prior}",
+            f"storyline             = {storyline}",
+            f"title                 = {quest_id}_title",
+            f"descr                 = {quest_id}_descr",
+            f"descr_functor         = {quest_id}_descr",
+            f"target_functor        = {quest_id}_target",
+            f"status_functor        = {quest_id}_status",
+            f"stage_complete        = {stage_complete}",
+            "dont_send_update_news = true",
             "",
-            f"title = {quest_id}_title",
-            f"descr = {quest_id}_descr",
-            "",
-            f"on_init = %=mymod_quests.{quest_id}_on_init%",
-            f"on_complete = %=mymod_quests.{quest_id}_on_complete%",
-            f"on_fail = %=mymod_quests.{quest_id}_on_fail%",
-            "",
-            f"status_functor = mymod_quests.{quest_id}_status_functor",
-            f"target_functor = mymod_quests.{quest_id}_target_functor",
+            f"on_init               = %={quest_id}_start()%",
+            f"on_complete           = %={quest_id}_reward()%",
+            f"on_fail               = %={quest_id}_cleanup()%",
+            f"on_cancel             = %={quest_id}_cleanup()%",
         ]
 
+        if isinstance(giver_npc_id, str) and giver_npc_id.strip():
+            lines.extend(
+                [
+                    "",
+                    f"condlist_0            = "
+                    f"{{!task_giver_alive({quest_id})}} fail",
+                ]
+            )
+
         logger.debug(
-            "Секция '%s' сформирована: строк — %d, storyline — %s.",
+            "Секция '%s' сформирована: строк=%d, storyline=%s, этапов=%d.",
             quest_id,
             len(lines),
             storyline,
+            stage_complete,
         )
         return "\n".join(lines)
 
     def _validate_quest(self, quest_id: object, quest: object) -> None:
-        """Проверяет пригодность квеста для генерации LTX-секции.
-
-        Проверки нужны для изоляции повреждённых данных: Pydantic-модель
-        обычно уже валидна, но карта квестов может быть собрана вручную или
-        загружена из внешнего источника.
+        """Проверяет данные квеста перед сериализацией в LTX.
 
         Args:
-            quest_id (object):
-                Предполагаемый идентификатор секции.
-            quest (object):
-                Предполагаемая модель квеста.
+            quest_id (object): Ключ карты квестов.
+            quest (object): Модель квеста (может быть произвольным объектом).
 
         Returns:
             None: Функция ничего не возвращает.
 
         Raises:
-            ValueError:
-                Если идентификатор пуст, содержит пробельные символы,
-                символы ``[]=`` или не совпадает с ``Quest.id``.
-            TypeError:
-                Если у объекта отсутствует строковый ``id`` или булев
-                признак ``is_storyline``.
+            ValueError: Если ID пуст/содержит пробелы или недопустимые для
+                LTX-секции символы, либо не совпадает с ``Quest.id``.
+            TypeError: Если обязательные поля отсутствуют или имеют
+                неверный тип.
         """
         if not isinstance(quest_id, str) or not quest_id.strip():
-            raise ValueError("Идентификатор секции квеста должен быть непустой строкой.")
-
+            raise ValueError(
+                "Идентификатор секции квеста должен быть непустой строкой."
+            )
         if any(character.isspace() for character in quest_id):
             raise ValueError(
                 f"Идентификатор квеста '{quest_id}' не должен содержать пробелов."
             )
-
         forbidden = set("[]=\r\n")
         if any(character in forbidden for character in quest_id):
             raise ValueError(
                 f"Идентификатор квеста '{quest_id}' содержит недопустимые "
                 "для LTX-секции символы."
             )
-
         actual_id = getattr(quest, "id", None)
         if not isinstance(actual_id, str) or not actual_id:
             raise TypeError(
                 f"Квест '{quest_id}' не содержит строкового поля id."
             )
-
         if actual_id != quest_id:
             raise ValueError(
                 f"Ключ карты '{quest_id}' не совпадает с Quest.id='{actual_id}'."
             )
-
         is_storyline = getattr(quest, "is_storyline", None)
         if not isinstance(is_storyline, bool):
             raise TypeError(
                 f"Квест '{quest_id}' не содержит булева поля is_storyline."
             )
-
+        stages = getattr(quest, "stages", None)
+        if not isinstance(stages, dict) or not stages:
+            raise TypeError(
+                f"Квест '{quest_id}' не содержит непустой карты stages."
+            )
         logger.debug("Данные квеста '%s' прошли проверку.", quest_id)
 
 

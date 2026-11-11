@@ -55,6 +55,7 @@ QUEST_2_START_INFO = "mymod_atp_quest_started"
 QUEST_2_SOLO_INFO = "mymod_atp_quest_solo"
 
 #: Ключевые игровые алиасы сценария.
+ZHUROV_ID = "esc_3_16_military_trader"
 ZHUROV_ALIAS = "esc.mayor_zhurov"
 ROOKIE_VILLAGE_ALIAS = "esc.derevnya_novichkov"
 ELEVATOR_ALIAS = "esc.elevator"
@@ -82,14 +83,17 @@ def create_demo_project() -> ModProject:
             этапов, диалогов или реплик.
 
     Notes:
-        Модели запрещают неизвестные поля (``extra="forbid"``), поэтому все
-        действия и условия создаются конкретными классами из
-        :mod:`src.core.models`, а не словарями.
+        Модели сохраняют неизвестные колонки SQLite (``extra="allow"``),
+        поэтому все действия и условия всё равно создаются конкретными
+        классами из :mod:`src.core.models`, а не словарями.
     """
     logger.info("Создание демо-проекта '%s'.", PROJECT_NAME)
 
     quest_1 = Quest(
         id=QUEST_1_ID,
+        npc_id=ZHUROV_ID,
+        giver_npc_id=ZHUROV_ID,
+        npc_location="escape",
         title_ru="Война на Кордоне: кампания за Военных",
         title_en="Cordon Warfare: Army Campaign",
         descr_ru=(
@@ -159,6 +163,10 @@ def create_demo_project() -> ModProject:
 
     quest_2 = Quest(
         id=QUEST_2_ID,
+        npc_id=ZHUROV_ID,
+        giver_npc_id=ZHUROV_ID,
+        npc_location="escape",
+        dialog_id=DIALOG_ID,
         title_ru="Зачистка АТП",
         title_en="Clear the ATP",
         descr_ru=(
@@ -207,6 +215,10 @@ def create_demo_project() -> ModProject:
     start_dialog = Dialog(
         id=DIALOG_ID,
         npc_alias=ZHUROV_ALIAS,
+        npc_id=ZHUROV_ID,
+        npc_location="escape",
+        task_id=QUEST_2_ID,
+        role="take",
         preconditions=[HasInfo(info=QUEST_1_DONE_INFO)],
         phrases={
             0: Phrase(

@@ -1,36 +1,31 @@
-"""Генератор Lua 5.1 скрипта логики квестов для S.T.A.L.K.E.R. Anomaly.
+"""Генератор Lua 5.1-скрипта квестов ``gamedata/scripts/<mod>_quests.script``.
 
-Модуль собирает единый текст ``scripts\\mymod_quests.script`` из моделей
-:class:`~src.core.models.ModProject`. В сгенерированном скрипте находятся:
+Модуль реализует ``[4] RENDER`` для Lua-слоя и строго следует
+``standart_of_auto.md`` (2.2 и 2.3):
 
-* безопасная обвязка ``save_var``/``load_var`` для служебных флагов;
-* хелперы Warfare: проверка захвата смарта и спавн квестового отряда;
-* квестовые функторы ``on_init``, ``on_complete``, ``on_fail``,
-  ``status_functor`` и ``target_functor``;
-* XML-функторы предусловий и действий реплик диалогов.
-
-Генератор не пишет файлы на диск: он возвращает готовую Unicode-строку.
-Сохранение в Windows-1251 без BOM выполняет отдельный слой компилятора.
-
-Каждый квест и каждый диалог обрабатываются изолированно. Если один элемент
-повреждён, ошибка журналируется через ``logger.error``, а остальные элементы
-продолжают собираться. Имена функций соответствуют ожиданиям
-:class:`~src.compiler.ltx_gen.LtxGenerator` и
-:class:`~src.compiler.xml_gen.XmlGenerator` (префикс ``mymod_quests.``).
+* все данные квестов лежат в статической таблице ``local QUESTS``;
+* игровые функции объявляются ``local`` и регистрируются **плоскими**
+  ключами в ``task_functor``, ``task_status_functor``, ``xr_effects`` и
+  ``dialogs``;
+* функции-условия и эффекты имеют каноническую сигнатуру
+  ``function(actor, npc, p)``;
+* ``register()`` вызывается на ``on_game_start``, ``on_game_load`` и
+  ``actor_on_first_update``, чтобы восстановиться после загрузки сейва;
+* никакого ``start_dialogs``/динамической инъекции диалогов нет — диалоги
+  привязываются декларативно в ``character_desc_<level>.xml``.
 """
 
 from __future__ import annotations
 
-import re
-from collections.abc import Iterable, Mapping, Sequence
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 from src.core.models import (
+    CompleteTask,
     DontHasInfo,
     GiveInfo,
     GiveItem,
     GiveMoney,
+    GiveTask,
     HasInfo,
     HasItem,
     RemoveInfo,
@@ -42,2337 +37,1307 @@ from src.core.models import (
 from src.logger import get_logger
 
 if TYPE_CHECKING:
-    from src.core.models import BaseAction, BaseCondition, ModProject
-    from src.db.repository import GameDatabase
+    from src.core.models import Condition, Dialog, ModProject, Quest, Stage
 
 logger = get_logger("compiler.lua_gen")
 
-#: База ассетов проекта, используемая генератором как запасной источник
-#: соответствий ``npc_alias -> игровой id``, если клиент БД не передан явно.
-_DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "anomaly_db.sqlite"
+#: Имя таблицы-модуля, которое печатается в логах и комментарии шапки.
+DEFAULT_SCRIPT_NAME = "quests"
+#: Звук выдачи/обновления задачи (PDA).
+DEFAULT_PDA_SOUND = "pda_task"
+#: Троттлинг status_functor в миллисекундах (эталон — 3000).
+DEFAULT_STATUS_THROTTLE_MS = 3000
+#: Радиус «игрок подошёл к квестодателю» в метрах (эталон — 40).
+DEFAULT_RETURN_DISTANCE = 40.0
+#: Запасная иконка PDA, если в модели не задана своя.
+DEFAULT_ICON = "ui_inGame2_Put_v_pripyat"
+#: Запасной приоритет задачи в PDA.
+DEFAULT_PRIOR = 60
+#: Типы Lua-таблиц, в которые регистрируются плоские функции.
+ENGINE_TABLES = ("task_functor", "task_status_functor", "xr_effects", "dialogs")
+#: Зарезервированные слова Lua 5.1, которые нельзя использовать как ключи
+#: таблицы без скобок.
+_LUA_RESERVED = frozenset(
+    {
+        "and",
+        "break",
+        "do",
+        "else",
+        "elseif",
+        "end",
+        "false",
+        "for",
+        "function",
+        "if",
+        "in",
+        "local",
+        "nil",
+        "not",
+        "or",
+        "repeat",
+        "return",
+        "then",
+        "true",
+        "until",
+        "while",
+    }
+)
 
-#: Имя глобальной таблицы, которую образует файл ``mymod_quests.script``.
-SCRIPT_TABLE = "mymod_quests"
-#: Звук КПК, воспроизводимый при выдаче новой задачи.
-PDA_SOUND = "pda_task"
-#: Префикс ключей ``save_var`` для флагов уже проигранных звуков.
-PDA_FLAG_PREFIX = "mymod_quests_pda"
-#: Допустимый идентификатор Lua-функции и таблицы.
-_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-#: Явно поддерживаемые результаты правил ``transfer_conditions``.
-_TRANSFER_RESULTS = ("complete", "fail")
+
+_HELPERS_TEMPLATE = r"""
+-- ============================================================================
+-- Generic helpers (shared by every generated quest)
+-- ============================================================================
+
+local STATUS_THROTTLE_MS = __STATUS_THROTTLE__
+local RETURN_DISTANCE = __RETURN_DISTANCE__
+local PDA_SOUND = "__PDA_SOUND__"
+local registered = false
+
+-- Safe pstor read; returns def when the actor is not available yet.
+local function vget(key, def)
+	if not db.actor then return def end
+	return load_var(db.actor, key, def)
+end
+
+-- Safe pstor write; ignores calls before the actor exists.
+local function vset(key, val)
+	if not db.actor then return end
+	save_var(db.actor, key, val)
+end
+
+-- Returns true only when Warfare mode is active.
+local function is_warfare()
+	return (IsWarfare and IsWarfare()) or false
+end
+
+-- Resolves a SIMBOARD smart-terrain by its technical name.
+local function get_smart(name)
+	if not name or name == "" then return nil end
+	if not (SIMBOARD and SIMBOARD.smarts_by_names) then return nil end
+	return SIMBOARD.smarts_by_names[name]
+end
+
+-- Resolves a stage target: smart name, numeric server id or story id.
+local function resolve_target(target)
+	if target == nil or target == "" then return nil end
+	local smart = get_smart(target)
+	if smart then return smart.id end
+	local numeric_id = tonumber(target)
+	if numeric_id then
+		local obj = alife_object(numeric_id)
+		return obj and obj.id or nil
+	end
+	local ok, story_obj = pcall(function() return alife():story_object(target) end)
+	return (ok and story_obj and story_obj.id) or nil
+end
+
+-- Stable pstor key; never equals task_id (task_manager clears that key).
+local function stage_key(q, stage, suffix)
+	return q.key_prefix .. "_v_" .. tostring(stage) .. "_" .. suffix
+end
+
+-- True when the squad still has at least one NPC.
+local function squad_alive(id)
+	if not id or id == 0 then return false end
+	local squad = alife_object(id)
+	if not squad then return false end
+	local ok, count = pcall(function() return squad:npc_count() end)
+	return ok and (count or 0) > 0
+end
+
+-- Plays the PDA task sound once.
+local function sound_task()
+	if not (db.actor and xr_sound and xr_sound.set_sound_play) then return end
+	pcall(xr_sound.set_sound_play, db.actor:id(), PDA_SOUND)
+end
+
+-- Shows a PDA tip by string id.
+local function pda_tip(text_id)
+	if not text_id or text_id == "" then return end
+	if not (db.actor and news_manager and news_manager.send_tip) then return end
+	pcall(news_manager.send_tip, db.actor, text_id, nil, "default", 5000)
+end
+
+-- Announces a stage exactly once and survives save/load.
+local function announce(said_key, stage, text_id)
+	if vget(said_key, 0) >= stage then return end
+	vset(said_key, stage)
+	sound_task()
+	pda_tip(text_id)
+end
+
+-- Keeps a quest squad out of the offline combat simulation.
+local function mark_task_squad(squad)
+	if not (squad and sim_offline_combat and sim_offline_combat.task_squads) then
+		return
+	end
+	sim_offline_combat.task_squads[squad.id] = true
+end
+
+-- Releases a squad id after the quest is finished or failed.
+local function unmark_task_squad(id)
+	if id and id ~= 0 and sim_offline_combat and sim_offline_combat.task_squads then
+		sim_offline_combat.task_squads[id] = nil
+	end
+end
+
+-- Releases every squad remembered for a quest.
+local function unmark_quest_squads(q)
+	if not q then return end
+	for stage, data in pairs(q.stages) do
+		unmark_task_squad(vget(stage_key(q, stage, "enemy"), 0))
+		local allies = (data.capture and data.capture.ally_count) or 0
+		for i = 1, allies do
+			unmark_task_squad(vget(stage_key(q, stage, "ally" .. i), 0))
+		end
+	end
+end
+
+-- Spawns a squad and pins it to a target smart (Warfare-safe).
+local function spawn_task_squad(base_name, section, target_name)
+	local base = get_smart(base_name)
+	local target = get_smart(target_name) or base
+	if not (base and target and SIMBOARD and SIMBOARD.create_squad) then
+		printe("[__SCRIPT_NAME__] ! cannot spawn [%s] at [%s]",
+			tostring(section), tostring(base_name))
+		return nil
+	end
+
+	local ok, squad = pcall(function()
+		return SIMBOARD:create_squad(base, section)
+	end)
+	if not ok or not squad then
+		printe("[__SCRIPT_NAME__] ! spawn failed [%s]", tostring(section))
+		return nil
+	end
+
+	mark_task_squad(squad)
+	squad.stay_time = nil
+	if sim_squad_warfare and sim_squad_warfare.set_target then
+		pcall(sim_squad_warfare.set_target, squad, target.id)
+	end
+	if not squad.stay_time then
+		squad.stay_time = game.get_game_time()
+	end
+	pcall(function() squad.force_online = true end)
+	printf("[__SCRIPT_NAME__] squad [%s] id=%s -> [%s]",
+		tostring(section), tostring(squad.id), tostring(target_name))
+	return squad
+end
+
+-- Freezes a squad that has reached its destination.
+local function freeze_squad(id)
+	if not id or id == 0 then return end
+	local squad = alife_object(id)
+	if not squad then return end
+	squad.stay_time = game.get_game_time()
+	pcall(function() squad.force_online = true end)
+	mark_task_squad(squad)
+end
+
+-- Spawns every squad configured for one stage (idempotent).
+local function spawn_stage_for(q, stage, data)
+	if not (data and data.capture) then return end
+	local spawn_key = stage_key(q, stage, "spawn")
+	if vget(spawn_key, 0) == 1 then return end
+
+	local capture = data.capture
+	local smart = get_smart(capture.smart)
+	if not smart then return end
+	vset(spawn_key, 1)
+
+	local enemy = spawn_task_squad(capture.smart, capture.enemy, capture.smart)
+	if enemy then vset(stage_key(q, stage, "enemy"), enemy.id) end
+
+	for i = 1, (capture.ally_count or 0) do
+		local ally = spawn_task_squad(capture.smart, capture.ally, capture.smart)
+		if ally then vset(stage_key(q, stage, "ally" .. i), ally.id) end
+	end
+end
+
+-- Freezes all squads of the current stage.
+local function freeze_stage_for(q, stage, data)
+	if not (data and data.capture) then return end
+	freeze_squad(vget(stage_key(q, stage, "enemy"), 0))
+	for i = 1, (data.capture.ally_count or 0) do
+		freeze_squad(vget(stage_key(q, stage, "ally" .. i), 0))
+	end
+end
+
+-- A stage with capture data is cleared when its hostile squad is dead and
+-- the point is owned by the army or has no defenders left.
+local function stage_cleared(q, stage, data)
+	if not (data and data.capture) then return false end
+	local smart = get_smart(data.capture.smart)
+	if not smart then return false end
+
+	local enemy_id = vget(stage_key(q, stage, "enemy"), 0)
+	if enemy_id == 0 then return false end
+	if squad_alive(enemy_id) then return false end
+
+	if smart.owning_faction == "army" then return true end
+	if smart.defense_count ~= nil and smart.defense_count <= 0 then return true end
+	return false
+end
+
+-- Returns true when the smart is owned by the requested faction.
+local function is_smart_owned(smart_name, faction)
+	local smart = get_smart(smart_name)
+	if not smart then return false end
+	return smart.owning_faction == faction
+end
+
+-- Gives items to the actor one by one.
+local function give_item(section, count)
+	if not (db.actor and section and section ~= "") then return end
+	count = tonumber(count) or 1
+	for _ = 1, count do
+		local ok, se_item = pcall(function()
+			return alife_create_item(section, db.actor)
+		end)
+		if not (ok and se_item) then
+			printe("[__SCRIPT_NAME__] ! cannot give item [%s]", tostring(section))
+			return
+		end
+	end
+end
+
+-- Removes items from the actor (through the speaker when possible).
+local function take_item(section, count, npc)
+	if not (db.actor and section and section ~= "") then return end
+	if not db.actor:object(section) then return end
+	count = tonumber(count) or 1
+
+	if npc and dialogs and dialogs.relocate_item_section then
+		local ok = pcall(dialogs.relocate_item_section, npc, section, "out", count)
+		if ok and not db.actor:object(section) then return end
+	end
+	if itms_manager and itms_manager.relocate_item_from_actor then
+		pcall(itms_manager.relocate_item_from_actor, db.actor, nil, section, count)
+	end
+end
+
+-- Gives a task from task_manager exactly once.
+local function give_task(task_id, npc)
+	local tm = task_manager and task_manager.get_task_manager()
+	if not tm then
+		printe("[__SCRIPT_NAME__] ! task_manager is nil")
+		return
+	end
+	if tm.task_info[task_id] then return end
+
+	local giver_id = nil
+	if npc then giver_id = npc:id() end
+	if not giver_id then
+		local quest = QUESTS[task_id]
+		if quest and quest.npc ~= "" then
+			giver_id = resolve_target(quest.npc)
+		end
+	end
+	if not giver_id then giver_id = 0 end
+	tm:give_task(task_id, giver_id)
+end
+
+-- Completes a task through task_manager.
+local function complete_task(task_id)
+	local tm = task_manager and task_manager.get_task_manager()
+	if tm and tm.task_info[task_id] then
+		tm:set_task_completed(task_id)
+	end
+end
+
+-- True when the player is close enough to the quest giver.
+local function reached_giver(q, tsk)
+	if not (q and db.actor) then return false end
+	local giver = nil
+	if tsk and tsk.task_giver_id then
+		giver = alife_object(tsk.task_giver_id)
+	end
+	if not giver and q.npc ~= "" then
+		local ok, story_obj = pcall(function() return alife():story_object(q.npc) end)
+		giver = ok and story_obj or nil
+	end
+	if not (giver and giver.position) then return false end
+	local ok, distance = pcall(function()
+		return db.actor:position():distance_to(giver.position)
+	end)
+	return ok and distance and distance < (q.return_distance or RETURN_DISTANCE)
+end
+
+-- Evaluates one serialized condition spec.
+local function eval_condition(spec, actor)
+	if not spec then return true end
+	local kind = spec.kind
+	if kind == "has_info" then
+		return has_alife_info(spec.info)
+	elseif kind == "dont_has_info" then
+		return not has_alife_info(spec.info)
+	elseif kind == "has_item" then
+		local obj = actor or db.actor
+		return (obj and obj:object(spec.item)) ~= nil
+	elseif kind == "smart_owner" then
+		return is_smart_owned(spec.smart, spec.faction)
+	end
+	return true
+end
+
+-- Evaluates a list of condition specs (AND).
+local function eval_conditions(list, actor)
+	if not list then return true end
+	for _, spec in ipairs(list) do
+		if not eval_condition(spec, actor) then return false end
+	end
+	return true
+end
+
+-- Executes a list of serialized action specs in order.
+local function run_actions(actions, actor, npc)
+	if not actions then return end
+	for _, spec in ipairs(actions) do
+		local kind = spec.kind
+		if kind == "give_info" then
+			if db.actor then db.actor:give_info_portion(spec.info) end
+		elseif kind == "remove_info" then
+			if db.actor then db.actor:disable_info_portion(spec.info) end
+		elseif kind == "give_money" then
+			if db.actor then db.actor:give_money(spec.amount) end
+		elseif kind == "give_item" then
+			give_item(spec.item, spec.count)
+		elseif kind == "remove_item" then
+			take_item(spec.item, spec.count, npc)
+		elseif kind == "spawn_squad" or kind == "set_target" then
+			spawn_task_squad(spec.smart, spec.squad, spec.smart)
+		elseif kind == "give_task" then
+			give_task(spec.task, npc)
+		elseif kind == "complete_task" then
+			complete_task(spec.task)
+		end
+	end
+end
+"""
 
 
 class LuaGenerator:
-    """Собирает Lua-скрипт логики квестов и диалогов проекта.
+    """Собирает единый Lua-модуль квестов и диалогов проекта.
 
-    Класс рассчитан на модели :class:`~src.core.models.ModProject`,
-    :class:`~src.core.models.Quest`, :class:`~src.core.models.Stage`,
-    :class:`~src.core.models.Dialog` и :class:`~src.core.models.Phrase`.
-
-    Дополнительно поддерживается необязательное поле
-    ``transfer_conditions`` у квеста или этапа. Оно не входит в текущую
-    базовую Pydantic-модель, но может быть добавлено наследником модели или
-    загружено из расширенной схемы. Поддерживаемые формы:
-
-    * ``{0: {"complete": [...], "fail": [...]}, 1: [...]}`` — правила для
-      конкретных этапов; список без словаря означает условия завершения
-      этапа;
-    * ``{"complete": [...], "fail": [...]}`` — правила всего квеста;
-    * список условий — условие завершения последнего этапа.
-
-    Условия — обычные Pydantic-объекты из :mod:`src.core.models`.
+    Класс реализует только ``[4] RENDER``: он не пишет файлы и не патчит
+    конфиги. Имя файла ``<mod>_quests.script`` и префикс pstor-ключей передаёт
+    :class:`src.compiler.builder.ModBuilder`.
     """
+
+    def __init__(self, db_client: Any | None = None) -> None:
+        """Сохраняет необязательный клиент базы для будущих проверок ассетов.
+
+        Args:
+            db_client (Any | None):
+                Клиент SQLite-базы. Генератор сейчас не обращается к нему, но
+                сохраняет совместимость с :class:`src.core.validator`.
+        """
+        self.db_client = db_client
 
     # ------------------------------------------------------------------
     # Публичная точка входа
     # ------------------------------------------------------------------
 
-    def __init__(self, db_client: "GameDatabase | None" = None) -> None:
-        """Инициализирует генератор и запоминает клиент базы ассетов.
-
-        Args:
-            db_client (GameDatabase | None):
-                Необязательный клиент SQLite-базы Anomaly. Через него
-                генератор разрешает ``Dialog.npc_alias`` в реальный игровой
-                идентификатор NPC для автоматической инжекции диалогов.
-                Если клиент не передан, при генерации будет предпринята
-                попытка открыть базу проекта по стандартному пути.
-
-        Returns:
-            None: Конструктор ничего не возвращает.
-        """
-        self.db_client = db_client
-        logger.debug(
-            "LuaGenerator инициализирован: клиент БД=%s.",
-            type(db_client).__name__ if db_client is not None else "не передан",
-        )
-
     def generate_quests_script(
         self,
         project: "ModProject",
-        db_client: "GameDatabase | None" = None,
+        *,
+        script_name: str | None = None,
+        mod_prefix: str | None = None,
     ) -> str:
-        """Формирует единый Lua-скрипт ``mymod_quests.script``.
-
-        Метод собирает шапку с хелперами, функцией автоматической инжекции
-        диалогов и глобальным ``on_game_start()``, затем блоки всех квестов и
-        всех диалогов проекта. Ошибка в одном квесте или диалоге
-        перехватывается, журналируется и не мешает генерации остальных
-        сущностей.
+        """Генерирует полный текст ``gamedata/scripts/<mod>_quests.script``.
 
         Args:
             project (ModProject):
-                Корневая модель проекта с картами ``quests`` и ``dialogs``.
-            db_client (GameDatabase | None):
-                Необязательный клиент базы, переопределяющий клиент,
-                сохранённый в конструкторе. Используется для разрешения
-                ``npc_alias`` при генерации инжекции диалогов.
+                Проект с квестами и диалогами.
+            script_name (str | None):
+                Имя модуля для логов и шапки. По умолчанию ``"quests"``.
+            mod_prefix (str | None):
+                Префикс pstor-ключей. По умолчанию ``"quests"``.
 
         Returns:
-            str: Готовый текст Lua 5.1 скрипта. Даже для пустого проекта
-            возвращается корректная шапка со служебными хелперами.
+            str: Готовый Lua 5.1-скрипт.
 
         Raises:
-            TypeError:
-                Если проект не содержит словарных карт ``quests`` и
-                ``dialogs``.
+            TypeError: Если ``project.quests`` или ``project.dialogs`` не
+                являются словарями.
         """
-        logger.debug("Начата генерация mymod_quests.script.")
+        quests = getattr(project, "quests", None)
+        dialogs = getattr(project, "dialogs", None)
+        if not isinstance(quests, dict) or not isinstance(dialogs, dict):
+            raise TypeError("Проект должен содержать словари quests и dialogs.")
 
-        try:
-            quests = getattr(project, "quests", None)
-            dialogs = getattr(project, "dialogs", None)
+        module_name = (script_name or DEFAULT_SCRIPT_NAME).strip() or DEFAULT_SCRIPT_NAME
+        prefix = (mod_prefix or "quests").strip() or "quests"
+        quest_ids = sorted(str(key) for key in quests)
 
-            if not isinstance(quests, dict) or not isinstance(dialogs, dict):
-                raise TypeError(
-                    "Проект должен содержать словарные карты quests и "
-                    "dialogs, а получены "
-                    f"{type(quests).__name__} и {type(dialogs).__name__}."
-                )
-        except TypeError as exc:
-            logger.error("Некорректный проект для генерации Lua: %s", exc)
-            raise
-        except Exception as exc:
-            logger.exception(
-                "Не удалось прочитать карты проекта для генерации Lua: %s",
-                exc,
-            )
-            raise
+        quest_data: dict[str, dict[str, Any]] = {}
+        registrations: list[tuple[str, str, str]] = []
+        blocks: list[str] = [self._build_header(module_name)]
 
-        active_db = db_client if db_client is not None else self.db_client
-        blocks: list[str] = [self._build_header(project, active_db)]
-        generated_quests = 0
-        generated_dialogs = 0
-        skipped_quests = 0
-        skipped_dialogs = 0
-
-        for quest_id in sorted(quests, key=lambda value: str(value)):
+        for quest_id in quest_ids:
+            quest = quests[quest_id]
             try:
-                block = self._build_quest(quest_id, quests[quest_id])
-            except Exception as exc:
-                skipped_quests += 1
+                data = self._build_quest_data(quest_id, quest, prefix)
+                quest_data[quest_id] = data
+            except Exception as exc:  # noqa: BLE001 - изоляция одного квеста
                 logger.error(
-                    "Квест '%s' пропущен из-за ошибки данных: %s",
+                    "Квест '%s' пропущен: %s", quest_id, exc, exc_info=True
+                )
+
+        blocks.append(self._build_quests_table(quest_data))
+        blocks.append(self._build_helpers(module_name))
+
+        for quest_id, data in quest_data.items():
+            quest = quests[quest_id]
+            try:
+                code, keys = self._build_quest_functions(quest_id, quest, data)
+                blocks.append(code)
+                registrations.extend(keys)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Квест '%s' пропущен при генерации функций: %s",
                     quest_id,
                     exc,
                     exc_info=True,
                 )
-                continue
 
-            blocks.append(block)
-            generated_quests += 1
-            logger.debug("Квест '%s' добавлен в Lua-скрипт.", quest_id)
-
-        for dialog_id in sorted(dialogs, key=lambda value: str(value)):
+        for dialog_key in sorted(str(key) for key in dialogs):
+            dialog = dialogs[dialog_key]
             try:
-                block = self._build_dialog(dialog_id, dialogs[dialog_id])
-            except Exception as exc:
-                skipped_dialogs += 1
+                dialog_id = self._dialog_output_id(dialog)
+                linked = self._linked_quest_id(dialog_id, dialog, quest_data)
+                code, keys = self._build_dialog_functions(
+                    dialog_id, dialog, linked, quest_data
+                )
+                blocks.append(code)
+                registrations.extend(keys)
+            except Exception as exc:  # noqa: BLE001
                 logger.error(
-                    "Диалог '%s' пропущен из-за ошибки данных: %s",
-                    dialog_id,
+                    "Диалог '%s' пропущен при генерации функций: %s",
+                    dialog_key,
                     exc,
                     exc_info=True,
                 )
-                continue
 
-            if block:
-                blocks.append(block)
-                generated_dialogs += 1
-                logger.debug("Диалог '%s' добавлен в Lua-скрипт.", dialog_id)
-            else:
-                logger.debug(
-                    "Диалог '%s' не содержит фраз с логикой и пропущен.",
-                    dialog_id,
-                )
-
-        blocks.append(self._build_footer())
-
-        content = "\n\n".join(
-            block.rstrip() for block in blocks if block and block.strip()
+        blocks.append(
+            self._build_registration(registrations, module_name)
         )
-        content += "\n"
-
-        logger.info(
-            "Сформирован mymod_quests.script: квестов — %d, диалогов — %d, "
-            "пропущено квестов — %d, пропущено диалогов — %d.",
-            generated_quests,
-            generated_dialogs,
-            skipped_quests,
-            skipped_dialogs,
+        blocks.append(
+            f"-- End of auto-generated {module_name}.script"
         )
-        return content
+        script = "\n\n".join(
+            block.rstrip() for block in blocks if block.strip()
+        ) + "\n"
+        return script.replace("__SCRIPT_NAME__", module_name)
 
     # ------------------------------------------------------------------
-    # Шапка и служебные хелперы
+    # Служебные представления данных
     # ------------------------------------------------------------------
 
-    def _build_header(
-        self,
-        project: Any = None,
-        db_client: "GameDatabase | None" = None,
-    ) -> str:
-        """Собирает шапку скрипта со служебными функциями.
-
-        Шапка содержит безопасные обёртки над штатными ``save_var`` и
-        ``load_var``, resolver целей, проверку захвата смарта, спавн отряда,
-        а также функцию ``inject_mymod_dialogs()`` и глобальный
-        ``on_game_start()``. Именно эти хелперы используют сгенерированные
-        квестовые функторы и механизм подключения диалогов.
+    @staticmethod
+    def _dialog_output_id(dialog: "Dialog") -> str:
+        """Возвращает канонический id диалога для имён Lua-функций.
 
         Args:
-            project (Any):
-                Проект, из карты ``dialogs`` которого собираются пары
-                ``npc_alias -> dialog_id``. Может быть ``None`` при прямом
-                вызове шапки без проекта.
-            db_client (GameDatabase | None):
-                Клиент базы для разрешения NPC-алиасов в игровые id.
+            dialog (Dialog): Модель диалога.
 
         Returns:
-            str: Текст шапки без завершающих пустых строк.
+            str: ``dialog.dialog_id`` или ``dialog.id``.
 
         Raises:
-            Exception:
-                Любая ошибка формирования шапки журналируется и пробрасывается
-                вызывающему коду.
+            ValueError: Если идентификатор пуст или не является корректным
+                Lua-идентификатором.
         """
-        try:
-            lines = [
-                "-- =========================================================",
-                "-- mymod_quests.script",
-                "-- Автоматически сгенерирован компилятором квестов.",
-                "-- Lua 5.1 / S.T.A.L.K.E.R. Anomaly.",
-                "-- Не редактируйте файл вручную: изменения будут потеряны.",
-                "-- =========================================================",
-                "",
-                f"{SCRIPT_TABLE} = {SCRIPT_TABLE} or {{}}",
-                "",
-                f'local PDA_FLAG_PREFIX = "{PDA_FLAG_PREFIX}"',
-                "",
-                "-- Сохраняет служебный флаг в сейв актора.",
-                "local function mymod_save_var(key, value)",
-                "    if not db or not db.actor then",
-                "        return",
-                "    end",
-                "    save_var(db.actor, key, value)",
-                "end",
-                "",
-                "-- Читает служебный флаг из сейва актора.",
-                "local function mymod_load_var(key)",
-                "    if not db or not db.actor then",
-                "        return nil",
-                "    end",
-                "    return load_var(db.actor, key)",
-                "end",
-                "",
-                "-- Разрешает алиас смарта, story_id или числовой id в id объекта.",
-                "local function mymod_resolve_target(target)",
-                '    if target == nil or target == "" then',
-                "        return nil",
-                "    end",
-                "",
-                "    if SIMBOARD and SIMBOARD.smarts_by_names then",
-                "        local smart = SIMBOARD.smarts_by_names[target]",
-                "        if smart then",
-                "            return smart.id",
-                "        end",
-                "    end",
-                "",
-                "    local numeric_id = tonumber(target)",
-                "    if numeric_id then",
-                "        local obj = alife_object(numeric_id)",
-                "        return obj and obj.id or nil",
-                "    end",
-                "",
-                "    local story_obj = alife():story_object(target)",
-                "    return story_obj and story_obj.id or nil",
-                "end",
-                "",
-                "-- Проверяет, захвачен ли смарт указанной фракцией.",
-                "function mymod_quests.is_smart_captured(smart_id, faction)",
-                "    local smart = nil",
-                "",
-                "    if SIMBOARD and SIMBOARD.smarts_by_names then",
-                "        smart = SIMBOARD.smarts_by_names[smart_id]",
-                "    end",
-                "",
-                "    if not smart then",
-                "        local numeric_id = tonumber(smart_id)",
-                "        smart = numeric_id and alife_object(numeric_id) or nil",
-                "    end",
-                "",
-                "    if not smart then",
-                "        return false",
-                "    end",
-                "",
-                "    local squads = smart.squads or {}",
-                "    for _, squad in pairs(squads) do",
-                "        if squad and squad.npc_count and squad:npc_count() > 0 then",
-                "            return false",
-                "        end",
-                "    end",
-                "",
-                "    local owner = smart.owning_faction",
-                "    local defense_count = smart.defense_count or 0",
-                "    return (owner == faction) or (defense_count <= 0)",
-                "end",
-                "",
-                "-- Спавнит квестовый отряд и удерживает его на смарте.",
-                "function mymod_quests.spawn_task_squad(squad_id, smart_id)",
-                "    local smart = nil",
-                "",
-                "    if SIMBOARD and SIMBOARD.smarts_by_names then",
-                "        smart = SIMBOARD.smarts_by_names[smart_id]",
-                "    end",
-                "",
-                "    if not smart then",
-                "        local numeric_id = tonumber(smart_id)",
-                "        smart = numeric_id and alife_object(numeric_id) or nil",
-                "    end",
-                "",
-                "    if not smart then",
-                "        return nil",
-                "    end",
-                "",
-                "    local board = sim_board.get_sim_board()",
-                "    if not board then",
-                "        return nil",
-                "    end",
-                "",
-                "    local squad = board:setup_squad_and_move(squad_id, smart)",
-                "    if not squad then",
-                "        return nil",
-                "    end",
-                "",
-                "    squad.stay_time = nil",
-                "    if sim_squad_warfare and sim_squad_warfare.set_target then",
-                "        sim_squad_warfare.set_target(squad, smart.id)",
-                "    end",
-                "    squad.stay_time = game.get_game_time()",
-                "    squad.force_online = true",
-                "",
-                "    if sim_offline_combat and sim_offline_combat.task_squads then",
-                "        sim_offline_combat.task_squads[squad.id] = true",
-                "    end",
-                "",
-                "    return squad",
-                "end",
-                "",
-                "-- Назначает отряду цель и фиксирует его на смарте.",
-                "function mymod_quests.set_task_target(squad_alias, smart_id)",
-                "    local target = mymod_resolve_target(smart_id)",
-                "    if not target then",
-                "        return",
-                "    end",
-                "",
-                "    local squad = nil",
-                "    if SIMBOARD and SIMBOARD.squads_by_names then",
-                "        squad = SIMBOARD.squads_by_names[squad_alias]",
-                "    end",
-                "",
-                "    if not squad then",
-                "        return",
-                "    end",
-                "",
-                "    squad.stay_time = nil",
-                "    if sim_squad_warfare and sim_squad_warfare.set_target then",
-                "        sim_squad_warfare.set_target(squad, target)",
-                "    end",
-                "    squad.stay_time = game.get_game_time()",
-                "    squad.force_online = true",
-                "end",
-            ]
-            lines.extend(
-                self._build_dialog_injection(project, db_client)
+        dialog_id = getattr(dialog, "dialog_id", None) or getattr(
+            dialog, "id", None
+        )
+        if not isinstance(dialog_id, str) or not dialog_id.strip():
+            raise ValueError(f"Некорректный ID диалога: {dialog_id!r}")
+        dialog_id = dialog_id.strip()
+        if not _is_lua_identifier(dialog_id):
+            raise ValueError(
+                f"ID диалога '{dialog_id}' не является допустимым "
+                "Lua-идентификатором."
             )
+        return dialog_id
 
-            logger.debug("Шапка Lua-скрипта сформирована: строк — %d.", len(lines))
-            return "\n".join(lines)
-        except Exception as exc:
-            logger.exception("Не удалось сформировать шапку Lua-скрипта: %s", exc)
-            raise
+    @staticmethod
+    def _linked_quest_id(
+        dialog_id: str,
+        dialog: "Dialog",
+        quest_data: dict[str, dict[str, Any]],
+    ) -> str | None:
+        """Находит квест, связанный с диалогом.
 
-    def _build_dialog_injection(
-        self,
-        project: Any,
-        db_client: "GameDatabase | None",
-    ) -> list[str]:
-        """Собирает Lua-блок автоматической инжекции диалогов в NPC.
-
-        В блок входит таблица пар ``npc_id -> dialog_id``, глобальная функция
-        ``inject_mymod_dialogs()`` и глобальный ``on_game_start()``, который
-        вызывает её сразу после старта игры. Алиасы NPC разрешаются через
-        :class:`~src.db.repository.GameDatabase` ещё на этапе компиляции,
-        поэтому сгенерированный Lua-скрипт не зависит от SQLite-базы.
+        Сначала используется явное поле ``Dialog.task_id``, затем обратный
+        поиск по ``Quest.dialog_id``/``Quest.dialog_ids``.
 
         Args:
-            project (Any):
-                Проект с картой ``dialogs``. Если проект пуст или передан
-                ``None``, создаётся функция с пустой таблицей инжекций.
-            db_client (GameDatabase | None):
-                Клиент базы для поиска NPC по алиасу. При ``None``
-                предпринимается попытка открыть стандартную базу проекта.
+            dialog_id (str): Канонический id диалога.
+            dialog (Dialog): Модель диалога.
+            quest_data (dict[str, dict[str, Any]]):
+                Уже сериализованные данные квестов.
 
         Returns:
-            list[str]: Строки Lua-блока без завершающего перевода строки.
+            str | None: ID квеста или ``None``, если связь не задана.
         """
-        injections = self._collect_dialog_injections(project, db_client)
+        task_id = getattr(dialog, "task_id", None)
+        if isinstance(task_id, str) and task_id in quest_data:
+            return task_id
+        for quest_id, data in quest_data.items():
+            if data.get("dialog") == dialog_id:
+                return quest_id
+            for linked in data.get("dialog_ids", []):
+                if linked == dialog_id:
+                    return quest_id
+        return None
 
-        lines = [
-            "",
-            "-- Автоматическая инжекция диалогов мода в профили NPC.",
-            "local MYMOD_DIALOG_INJECTIONS = {",
-        ]
+    @staticmethod
+    def _condition_spec(condition: "Condition") -> dict[str, Any]:
+        """Преобразует Pydantic-условие в словарь для Lua.
 
-        for npc_literal, dialog_id in injections:
-            lines.append(
-                "    { npc_id = "
-                f"{npc_literal}, dialog_id = {self._lua_string(dialog_id)} }},"
+        Args:
+            condition (Condition): Условие модели.
+
+        Returns:
+            dict[str, Any]: Словарь ``{"kind": ..., ...}``.
+
+        Raises:
+            TypeError: Если тип условия неизвестен.
+        """
+        if isinstance(condition, HasInfo):
+            return {"kind": "has_info", "info": condition.info}
+        if isinstance(condition, DontHasInfo):
+            return {"kind": "dont_has_info", "info": condition.info}
+        if isinstance(condition, HasItem):
+            return {"kind": "has_item", "item": condition.item_alias}
+        if isinstance(condition, SmartOwner):
+            return {
+                "kind": "smart_owner",
+                "smart": condition.smart_alias,
+                "faction": condition.faction,
+            }
+        raise TypeError(f"Неизвестный тип условия: {type(condition).__name__}")
+
+    @staticmethod
+    def _action_spec(action: Any) -> dict[str, Any]:
+        """Преобразует Pydantic-действие в словарь для Lua.
+
+        Args:
+            action (Any): Действие модели.
+
+        Returns:
+            dict[str, Any]: Словарь ``{"kind": ..., ...}``.
+
+        Raises:
+            TypeError: Если тип действия неизвестен.
+        """
+        if isinstance(action, GiveInfo):
+            return {"kind": "give_info", "info": action.info}
+        if isinstance(action, RemoveInfo):
+            return {"kind": "remove_info", "info": action.info}
+        if isinstance(action, SpawnSquad):
+            return {
+                "kind": "spawn_squad",
+                "squad": action.squad_alias,
+                "smart": action.smart_alias,
+            }
+        if isinstance(action, SetTarget):
+            return {
+                "kind": "set_target",
+                "squad": action.squad_alias,
+                "smart": action.smart_alias,
+            }
+        if isinstance(action, GiveItem):
+            return {
+                "kind": "give_item",
+                "item": action.item_alias,
+                "count": action.count,
+            }
+        if isinstance(action, RemoveItem):
+            return {
+                "kind": "remove_item",
+                "item": action.item_alias,
+                "count": action.count,
+            }
+        if isinstance(action, GiveMoney):
+            return {"kind": "give_money", "amount": action.amount}
+        if isinstance(action, GiveTask):
+            return {"kind": "give_task", "task": action.task_id}
+        if isinstance(action, CompleteTask):
+            return {"kind": "complete_task", "task": action.task_id}
+        raise TypeError(f"Неизвестный тип действия: {type(action).__name__}")
+
+    def _build_quest_data(
+        self, quest_id: str, quest: "Quest", mod_prefix: str
+    ) -> dict[str, Any]:
+        """Сериализует модель квеста в структуру для ``local QUESTS``.
+
+        Args:
+            quest_id (str): ID квеста (ключ карты и секция LTX).
+            quest (Quest): Модель квеста.
+            mod_prefix (str): Префикс pstor-ключей.
+
+        Returns:
+            dict[str, Any]: Данные, пригодные для :meth:`_to_lua`.
+
+        Raises:
+            ValueError: Если ID квеста не является Lua-идентификатором.
+        """
+        if not _is_lua_identifier(quest_id):
+            raise ValueError(
+                f"ID квеста '{quest_id}' не является допустимым "
+                "Lua-идентификатором."
             )
 
-        if not injections:
-            lines.append(
-                "    -- Диалоги не найдены или NPC-алиасы не разрешились."
-            )
+        stages: dict[int, dict[str, Any]] = {}
+        transfer_conditions = getattr(quest, "transfer_conditions", {}) or {}
+        for stage_id, stage in sorted(quest.stages.items()):
+            rules = transfer_conditions.get(stage_id, {}) or {}
+            capture = None
+            if stage.warfare_capture is not None:
+                capture = {
+                    "smart": stage.warfare_capture.smart_alias,
+                    "enemy": stage.warfare_capture.enemy_squad_alias,
+                    "ally": stage.warfare_capture.ally_squad_alias or "",
+                    "ally_count": stage.warfare_capture.ally_count,
+                }
+            stages[stage_id] = {
+                "target": stage.target_alias or "",
+                "descr": f"{quest_id}_stage_{stage_id}_descr",
+                "msg": f"{quest_id}_stage_{stage_id}_msg",
+                "capture": capture,
+                "start_actions": [
+                    self._action_spec(action)
+                    for action in stage.on_start_actions
+                ],
+                "complete": [
+                    self._condition_spec(condition)
+                    for condition in (rules.get("complete") or [])
+                ],
+                "fail": [
+                    self._condition_spec(condition)
+                    for condition in (rules.get("fail") or [])
+                ],
+            }
 
-        lines.extend(
+        return {
+            "id": quest_id,
+            "key_prefix": f"{mod_prefix}_{quest_id}",
+            "npc": quest.npc_id or quest.giver_npc_id or "",
+            "npc_location": quest.npc_location or "",
+            "dialog": quest.dialog_id or "",
+            "dialog_ids": list(quest.dialog_ids),
+            "title": f"{quest_id}_title",
+            "descr": f"{quest_id}_descr",
+            "msg_reward": f"{quest_id}_msg_reward",
+            "msg_fail": f"{quest_id}_msg_fail",
+            "taken_info": quest.taken_info or "",
+            "complete_info": quest.complete_info or "",
+            "available_info": quest.available_info or "",
+            "done_info": quest.done_info or "",
+            "storyline": bool(quest.is_storyline),
+            "icon": quest.icon or DEFAULT_ICON,
+            "prior": quest.prior if quest.prior is not None else DEFAULT_PRIOR,
+            "money": quest.reward_money or 0,
+            "item": quest.reward_item_alias or "",
+            "item_count": quest.reward_item_count,
+            "return_stage": (
+                quest.return_to_giver_stage
+                if quest.return_to_giver_stage is not None
+                else -1
+            ),
+            "return_distance": quest.return_distance,
+            "last_stage": max(quest.stages) if quest.stages else 0,
+            "world": any(
+                stage.warfare_capture is not None
+                for stage in quest.stages.values()
+            ),
+            "stages": stages,
+            "init_actions": [
+                self._action_spec(action) for action in quest.on_init_actions
+            ],
+            "complete_actions": [
+                self._action_spec(action)
+                for action in quest.on_complete_actions
+            ],
+            "fail_actions": [
+                self._action_spec(action) for action in quest.on_fail_actions
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    # Генерация блоков
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_header(script_name: str) -> str:
+        """Формирует шапку-комментарий Lua-модуля.
+
+        Args:
+            script_name (str): Имя модуля для комментария.
+
+        Returns:
+            str: Текст комментария ``--[[ ... ]]``.
+        """
+        return f"""\
+--[[
+	{script_name}.script
+	---------------------------------------------------------------------------
+	Automatically generated by the quest-framework compiler.
+	Lua 5.1 / S.T.A.L.K.E.R. Anomaly.
+
+	All engine functions are registered at module level with flat keys in
+	task_functor / task_status_functor / xr_effects / dialogs.
+	Dialogs are bound declaratively through character_desc_<level>.xml.
+]]"""
+
+    def _build_quests_table(self, quest_data: dict[str, dict[str, Any]]) -> str:
+        """Формирует статическую таблицу ``local QUESTS``.
+
+        Args:
+            quest_data (dict[str, dict[str, Any]]):
+                Сериализованные данные квестов.
+
+        Returns:
+            str: Объявление ``local QUESTS = { ... }``.
+        """
+        return "local QUESTS = " + self._to_lua(quest_data, indent=0)
+
+    def _build_helpers(self, script_name: str) -> str:
+        """Подставляет имя модуля и константы в шаблон общих хелперов.
+
+        Args:
+            script_name (str): Имя модуля для логов.
+
+        Returns:
+            str: Lua-код generic-хелперов.
+        """
+        return (
+            _HELPERS_TEMPLATE.replace("__SCRIPT_NAME__", script_name)
+            .replace("__PDA_SOUND__", DEFAULT_PDA_SOUND)
+            .replace("__STATUS_THROTTLE__", str(DEFAULT_STATUS_THROTTLE_MS))
+            .replace("__RETURN_DISTANCE__", str(DEFAULT_RETURN_DISTANCE))
+            .strip()
+        )
+
+    def _build_quest_functions(
+        self, quest_id: str, quest: "Quest", data: dict[str, Any]
+    ) -> tuple[str, list[tuple[str, str, str]]]:
+        """Генерирует плоские функции одного квеста.
+
+        Функции ``_target``/``_descr``/``_status`` регистрируются в
+        ``task_functor``/``task_status_functor``; ``_start``/``_reward``/
+        ``_cleanup`` — в ``xr_effects``; ``_accept``/``_turn_in`` — в
+        ``dialogs`` (``standart_of_auto.md``, 2.3).
+
+        Args:
+            quest_id (str): ID квеста.
+            quest (Quest): Модель квеста.
+            data (dict[str, Any]): Сериализованные данные квеста.
+
+        Returns:
+            tuple[str, list[tuple[str, str, str]]]:
+                Lua-код и список регистраций ``(table, key, function)``.
+        """
+        q = self._lua_string(quest_id)
+        keys: list[tuple[str, str, str]] = []
+
+        target = f"""\
+-- Quest target: smart/story id of the current stage.
+local function {quest_id}_target(task_id, field, p, tsk)
+	if field ~= "target" then return nil end
+	local quest = QUESTS[{q}]
+	if not quest then return nil end
+	local stage = (tsk and tsk.stage) or 0
+	local stage_data = quest.stages[stage]
+	local target_name = (stage_data and stage_data.target) or ""
+	if target_name ~= "" then
+		return resolve_target(target_name)
+	end
+	if tsk and tsk.task_giver_id then return tsk.task_giver_id end
+	return resolve_target(quest.npc)
+end"""
+
+        descr = f"""\
+-- Quest description: per-stage string id, falls back to the quest descr.
+local function {quest_id}_descr(task_id, field, p, tsk)
+	if field ~= "descr" then return nil end
+	local quest = QUESTS[{q}]
+	local stage = (tsk and tsk.stage) or 0
+	local stage_data = quest and quest.stages[stage]
+	return (stage_data and stage_data.descr) or (quest and quest.descr) or nil
+end"""
+
+        advance = self._build_advance_code(quest_id, data)
+        status = f"""\
+-- Quest status: stage transitions and completion.
+local function {quest_id}_status(tsk, task_id)
+	if not (db.actor and tsk) then return nil end
+	if task_id and task_id ~= {q} then return nil end
+	local quest = QUESTS[{q}]
+	if not quest then return nil end
+	if quest.world and not is_warfare() then return nil end
+
+	local now = time_global()
+	if tsk.__quests_next and now < tsk.__quests_next then return nil end
+	tsk.__quests_next = now + STATUS_THROTTLE_MS
+
+	local stage = tsk.stage or 0
+	local stage_data = quest.stages[stage]
+	if not stage_data then return nil end
+
+	-- Run stage start actions exactly once.
+	local start_key = stage_key(quest, stage, "started")
+	if vget(start_key, 0) == 0 then
+		vset(start_key, 1)
+		run_actions(stage_data.start_actions, db.actor, nil)
+	end
+
+	spawn_stage_for(quest, stage, stage_data)
+	freeze_stage_for(quest, stage, stage_data)
+
+	if stage_data.fail and #stage_data.fail > 0 then
+		if eval_conditions(stage_data.fail, db.actor) then
+			return "fail"
+		end
+	end
+
+	if stage_cleared(quest, stage, stage_data) then
+{advance}	end
+
+	if stage_data.complete and #stage_data.complete > 0 then
+		if eval_conditions(stage_data.complete, db.actor) then
+{advance}		end
+	end
+
+	if quest.return_stage >= 0 and stage == quest.return_stage then
+		if reached_giver(quest, tsk) then
+			return "complete"
+		end
+	end
+
+	return nil
+end"""
+
+        start = f"""\
+-- on_init effect: resets pstor state, gives the "taken" info and runs actions.
+local function {quest_id}_start(actor, npc, p)
+	local quest = QUESTS[{q}]
+	if not (db.actor and quest) then return end
+
+	for stage, stage_data in pairs(quest.stages) do
+		vset(stage_key(quest, stage, "spawn"), 0)
+		vset(stage_key(quest, stage, "enemy"), 0)
+		vset(stage_key(quest, stage, "started"), 0)
+		local allies = (stage_data.capture and stage_data.capture.ally_count) or 0
+		for i = 1, allies do
+			vset(stage_key(quest, stage, "ally" .. i), 0)
+		end
+	end
+	vset(quest.key_prefix .. "_said", 0)
+
+	if quest.taken_info ~= "" then
+		db.actor:give_info_portion(quest.taken_info)
+	end
+	run_actions(quest.init_actions, actor or db.actor, npc)
+	sound_task()
+	printf("[__SCRIPT_NAME__] %s started", {q})
+end"""
+
+        reward = f"""\
+-- on_complete effect: money/item rewards, info portion and cleanup.
+local function {quest_id}_reward(actor, npc, p)
+	local quest = QUESTS[{q}]
+	if not (db.actor and quest) then return end
+
+	if quest.money and quest.money > 0 then
+		db.actor:give_money(quest.money)
+	end
+	if quest.item ~= "" then
+		give_item(quest.item, quest.item_count)
+	end
+	if quest.complete_info ~= "" then
+		db.actor:give_info_portion(quest.complete_info)
+	end
+
+	run_actions(quest.complete_actions, actor or db.actor, npc)
+	unmark_quest_squads(quest)
+	if quest.taken_info ~= "" then
+		db.actor:disable_info_portion(quest.taken_info)
+	end
+	sound_task()
+	pda_tip(quest.msg_reward)
+	printf("[__SCRIPT_NAME__] %s reward given", {q})
+end"""
+
+        cleanup = f"""\
+-- on_fail/on_cancel effect: releases squads and runs fail actions.
+local function {quest_id}_cleanup(actor, npc, p)
+	local quest = QUESTS[{q}]
+	if not quest then return end
+
+	unmark_quest_squads(quest)
+	run_actions(quest.fail_actions, actor or db.actor, npc)
+	if db.actor and quest.taken_info ~= "" then
+		db.actor:disable_info_portion(quest.taken_info)
+	end
+	pda_tip(quest.msg_fail)
+	printf("[__SCRIPT_NAME__] %s cleaned up", {q})
+end"""
+
+        accept = f"""\
+-- Dialog effect: gives the task exactly once.
+local function {quest_id}_accept(actor, npc, p)
+	give_task({q}, npc)
+end"""
+
+        turn_in = f"""\
+-- Dialog effect: completes the task.
+local function {quest_id}_turn_in(actor, npc, p)
+	complete_task({q})
+end"""
+
+        keys.extend(
             [
-                "}",
-                "",
-                "-- Безопасная регистрация диалогов мода через dialog_manager Anomaly.",
-                "function inject_mymod_dialogs()",
-                "    if not dialog_manager or not dialog_manager.start_dialogs then",
-                "        return",
-                "    end",
-                "",
-                "    for _, injection in ipairs(MYMOD_DIALOG_INJECTIONS) do",
-                "        local npc_id = injection.npc_id",
-                "        local dialog_id = injection.dialog_id",
-                "        if not dialog_manager.start_dialogs[npc_id] then",
-                "            dialog_manager.start_dialogs[npc_id] = {}",
-                "        end",
-                "        table.insert(dialog_manager.start_dialogs[npc_id], dialog_id)",
-                "    end",
-                "end",
-                "",
-                "-- Автозагрузка Anomaly: диалоги подключаются сразу после старта.",
-                "function on_game_start()",
-                "    inject_mymod_dialogs()",
-                "end",
+                ("task_functor", f"{quest_id}_target", f"{quest_id}_target"),
+                ("task_functor", f"{quest_id}_descr", f"{quest_id}_descr"),
+                (
+                    "task_status_functor",
+                    f"{quest_id}_status",
+                    f"{quest_id}_status",
+                ),
+                ("xr_effects", f"{quest_id}_start", f"{quest_id}_start"),
+                ("xr_effects", f"{quest_id}_reward", f"{quest_id}_reward"),
+                ("xr_effects", f"{quest_id}_cleanup", f"{quest_id}_cleanup"),
+                ("dialogs", f"{quest_id}_accept", f"{quest_id}_accept"),
+                ("dialogs", f"{quest_id}_turn_in", f"{quest_id}_turn_in"),
             ]
         )
-
-        logger.debug(
-            "Блок инжекции диалогов сформирован: записей — %d.",
-            len(injections),
+        code = "\n\n".join(
+            [target, descr, status, start, reward, cleanup, accept, turn_in]
         )
-        return lines
+        return code, keys
 
-
-    def _collect_dialog_injections(
-        self,
-        project: Any,
-        db_client: "GameDatabase | None",
-    ) -> list[tuple[str, str]]:
-        """Разрешает все диалоги проекта в пары ``(npc_id, dialog_id)``.
-
-        Для каждого диалога берётся ``npc_alias`` и ищется в
-        :class:`~src.db.repository.GameDatabase` методом
-        ``find_npc_by_alias``. Если алиас не найден, база недоступна или
-        запись повреждена, диалог пропускается с предупреждением в логе.
+    def _build_advance_code(self, quest_id: str, data: dict[str, Any]) -> str:
+        """Формирует Lua-код перехода на следующий этап или завершения.
 
         Args:
-            project (Any):
-                Проект мода с картой ``dialogs``.
-            db_client (GameDatabase | None):
-                Клиент базы. Если ``None``, используется клиент генератора
-                или стандартная база проекта.
+            quest_id (str): ID квеста.
+            data (dict[str, Any]): Данные квеста.
 
         Returns:
-            list[tuple[str, str]]: Список пар «Lua-литерал игрового id NPC» и
-            «идентификатор диалога». Пустой список означает, что инжекция
-            сгенерируется без записей.
+            str: Строки с отступом ``\\t\\t``, вставляемые в ``_status``.
         """
-        dialogs = getattr(project, "dialogs", None)
-        if not isinstance(dialogs, Mapping) or not dialogs:
-            logger.debug("В проекте нет диалогов для инжекции.")
-            return []
-
-        active_db = db_client if db_client is not None else self.db_client
-        owned_db = None
-        if active_db is None:
-            active_db, owned_db = self._open_default_database()
-
-        injections: list[tuple[str, str]] = []
-        try:
-            for dialog_id, dialog in dialogs.items():
-                try:
-                    dialog_key = str(dialog_id)
-                    npc_alias = getattr(dialog, "npc_alias", None)
-
-                    if not isinstance(npc_alias, str) or not npc_alias.strip():
-                        logger.warning(
-                            "Диалог '%s' пропущен для инжекции: "
-                            "некорректный npc_alias=%r.",
-                            dialog_key,
-                            npc_alias,
-                        )
-                        continue
-
-                    if active_db is None:
-                        logger.warning(
-                            "Диалог '%s' пропущен для инжекции: "
-                            "база ассетов недоступна.",
-                            dialog_key,
-                        )
-                        continue
-
-                    npc = active_db.find_npc_by_alias(npc_alias)
-                    if not isinstance(npc, Mapping):
-                        logger.warning(
-                            "Диалог '%s' пропущен для инжекции: NPC по "
-                            "алиасу '%s' не найден.",
-                            dialog_key,
-                            npc_alias,
-                        )
-                        continue
-
-                    npc_id = npc.get("id") or npc.get("entity_id")
-                    if npc_id is None:
-                        logger.warning(
-                            "Диалог '%s' пропущен для инжекции: у NPC '%s' "
-                            "нет игрового id.",
-                            dialog_key,
-                            npc_alias,
-                        )
-                        continue
-
-                    injections.append(
-                        (self._lua_scalar(npc_id), dialog_key)
-                    )
-                    logger.debug(
-                        "Диалог '%s' привязан к NPC '%s' (id=%r).",
-                        dialog_key,
-                        npc_alias,
-                        npc_id,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Не удалось разрешить NPC для диалога '%s': %s",
-                        dialog_id,
-                        exc,
-                        exc_info=True,
-                    )
-        finally:
-            if owned_db is not None:
-                try:
-                    owned_db.__exit__(None, None, None)
-                except Exception as exc:
-                    logger.exception(
-                        "Не удалось закрыть временное подключение к БД: %s",
-                        exc,
-                    )
-
-        logger.info(
-            "Разрешено диалогов для инжекции: %d из %d.",
-            len(injections),
-            len(dialogs),
-        )
-        return injections
-
-    def _open_default_database(
-        self,
-    ) -> tuple["GameDatabase | None", "GameDatabase | None"]:
-        """Открывает стандартную базу проекта как запасной источник алиасов.
-
-        Returns:
-            tuple[GameDatabase | None, GameDatabase | None]:
-                Пара ``(клиент, владелец)``. Второй элемент не равен ``None``,
-                если соединение открыто этим методом и должно быть закрыто
-                вызывающим кодом.
-
-        Raises:
-            None: Ошибки открытия базы журналируются и не пробрасываются.
-        """
-        if not _DEFAULT_DB_PATH.is_file():
-            logger.warning(
-                "База ассетов не найдена для инжекции диалогов: %s",
-                _DEFAULT_DB_PATH,
-            )
-            return None, None
-
-        try:
-            from src.db.repository import GameDatabase
-
-            db_client = GameDatabase(_DEFAULT_DB_PATH)
-            logger.debug(
-                "Для инжекции диалогов открыта база: %s",
-                _DEFAULT_DB_PATH,
-            )
-            return db_client, db_client
-        except Exception as exc:
-            logger.exception(
-                "Не удалось открыть базу для инжекции диалогов: %s",
-                exc,
-            )
-            return None, None
-
-    def _lua_scalar(self, value: Any) -> str:
-        """Преобразует скалярное значение в безопасный Lua-литерал.
-
-        Args:
-            value (Any):
-                Игровой id NPC: обычно строка вида
-                ``"esc_3_16_military_trader"``, но допускается и число.
-
-        Returns:
-            str: Строковый или числовой Lua-литерал.
-
-        Raises:
-            TypeError:
-                Если значение имеет неподдерживаемый тип.
-        """
-        if isinstance(value, bool):
-            return "true" if value else "false"
-
-        if isinstance(value, (int, float)):
-            return str(value)
-
-        if isinstance(value, str):
-            return self._lua_string(value)
-
-        raise TypeError(
-            "Игровой id NPC должен быть строкой или числом, а получен "
-            f"{type(value).__name__}."
+        return (
+            "\t\tif stage >= quest.last_stage then\n"
+            '\t\t\treturn "complete"\n'
+            "\t\tend\n"
+            "\t\ttsk.stage = stage + 1\n"
+            '\t\tlocal next_data = quest.stages[tsk.stage]\n'
+            "\t\tannounce(quest.key_prefix .. \"_said\", tsk.stage,\n"
+            "\t\t\t(next_data and next_data.msg) or \"\")\n"
+            "\t\treturn nil\n"
         )
 
-    def _build_footer(self) -> str:
-        """Собирает завершающий комментарий скрипта.
-
-        Returns:
-            str: Короткий финальный комментарий Lua-файла.
-
-        Raises:
-            Exception:
-                Ошибка формирования журналируется и пробрасывается дальше.
-        """
-        try:
-            logger.debug("Формирование завершающего блока Lua-скрипта.")
-            return "-- Конец автоматически сгенерированного mymod_quests.script"
-        except Exception as exc:
-            logger.exception(
-                "Не удалось сформировать завершающий блок Lua-скрипта: %s",
-                exc,
-            )
-            raise
-
-    # ------------------------------------------------------------------
-    # Сборка квеста
-    # ------------------------------------------------------------------
-
-    def _build_quest(self, quest_id: Any, quest: Any) -> str:
-        """Собирает все Lua-функторы одного квеста.
-
-        Args:
-            quest_id (Any):
-                Ключ карты квестов; должен совпадать с ``Quest.id``.
-            quest (Any):
-                Модель квеста или совместимый объект с ожидаемыми полями.
-
-        Returns:
-            str: Блок функций квеста без завершающей пустой строки.
-
-        Raises:
-            ValueError:
-                Если идентификатор квеста некорректен или не совпадает с
-                ``Quest.id``.
-            TypeError:
-                Если карта этапов или списки действий имеют неверный тип.
-            Exception:
-                Любая ошибка сборки журналируется и пробрасывается, чтобы
-                ``generate_quests_script`` мог пропустить повреждённый квест.
-        """
-        try:
-            self._validate_quest(quest_id, quest)
-
-            blocks = [
-                self._build_quest_on_init(quest_id, quest),
-                self._build_quest_on_complete(quest_id, quest),
-                self._build_quest_on_fail(quest_id, quest),
-                self._build_quest_status_functor(quest_id, quest),
-                self._build_quest_target_functor(quest_id, quest),
-            ]
-            content = "\n\n".join(blocks)
-
-            logger.debug(
-                "Квест '%s' собран: функций — %d, символов — %d.",
-                quest_id,
-                len(blocks),
-                len(content),
-            )
-            return content
-        except Exception as exc:
-            logger.error(
-                "Не удалось собрать Lua-квест '%s': %s",
-                quest_id,
-                exc,
-                exc_info=True,
-            )
-            raise
-
-    def _build_quest_on_init(self, quest_id: str, quest: Any) -> str:
-        """Собирает функцию ``{quest_id}_on_init(tsk)``.
-
-        Функция проигрывает звук КПК только один раз. Признак уже
-        проигранного звука сохраняется через ``mymod_save_var``, поэтому
-        загрузка сейва не вызывает повторный звук.
-
-        Args:
-            quest_id (str):
-                Идентификатор квеста.
-            quest (Any):
-                Модель квеста с полем ``on_init_actions``.
-
-        Returns:
-            str: Текст функции ``on_init``.
-
-        Raises:
-            TypeError:
-                Если ``on_init_actions`` не является списком.
-            Exception:
-                Ошибка формирования блока журналируется и пробрасывается.
-        """
-        try:
-            actions = getattr(quest, "on_init_actions", None)
-            self._require_list(actions, f"on_init_actions квеста '{quest_id}'")
-
-            lines = [
-                f"function {SCRIPT_TABLE}.{quest_id}_on_init(tsk)",
-                "    if not tsk then",
-                "        return",
-                "    end",
-                "",
-                f'    local sound_key = PDA_FLAG_PREFIX .. "_{quest_id}_on_init"',
-                "    if not mymod_load_var(sound_key) then",
-                "        mymod_save_var(sound_key, true)",
-                f'        xr_sound.set_sound_play(db.actor, "{PDA_SOUND}")',
-                "    end",
-                "",
-            ]
-            action_lines = self._build_action_lines(
-                actions,
-                f"квест '{quest_id}' (on_init)",
-                actor_expr="db.actor",
-            )
-            lines.extend(action_lines or ["    -- Действий при выдаче квеста нет."])
-            lines.append("end")
-
-            logger.debug(
-                "Функция '%s_on_init' сформирована: действий — %d.",
-                quest_id,
-                len(actions),
-            )
-            return "\n".join(lines)
-        except Exception as exc:
-            logger.error(
-                "Ошибка формирования '%s_on_init': %s",
-                quest_id,
-                exc,
-            )
-            raise
-
-    def _build_quest_on_complete(self, quest_id: str, quest: Any) -> str:
-        """Собирает функцию ``{quest_id}_on_complete(tsk)``.
-
-        Args:
-            quest_id (str):
-                Идентификатор квеста.
-            quest (Any):
-                Модель квеста с полями ``on_complete_actions`` и
-                ``title_ru``.
-
-        Returns:
-            str: Текст функции завершения квеста.
-
-        Raises:
-            TypeError:
-                Если ``on_complete_actions`` не является списком.
-            Exception:
-                Ошибка формирования блока журналируется и пробрасывается.
-        """
-        try:
-            actions = getattr(quest, "on_complete_actions", None)
-            self._require_list(
-                actions,
-                f"on_complete_actions квеста '{quest_id}'",
-            )
-            title = self._require_text(
-                getattr(quest, "title_ru", None),
-                f"title_ru квеста '{quest_id}'",
-            )
-
-            lines = [
-                f"function {SCRIPT_TABLE}.{quest_id}_on_complete(tsk)",
-                "    if not tsk then",
-                "        return",
-                "    end",
-                "",
-                "    news_manager.send_tip(",
-                "        db.actor,",
-                f"        {self._lua_string(title + ' — квест завершён.')},",
-                "        nil,",
-                "        nil,",
-                "        10000",
-                "    )",
-                "",
-            ]
-            action_lines = self._build_action_lines(
-                actions,
-                f"квест '{quest_id}' (on_complete)",
-                actor_expr="db.actor",
-            )
-            lines.extend(action_lines or ["    -- Наград у квеста нет."])
-            lines.append("end")
-
-            logger.debug(
-                "Функция '%s_on_complete' сформирована: действий — %d.",
-                quest_id,
-                len(actions),
-            )
-            return "\n".join(lines)
-        except Exception as exc:
-            logger.error(
-                "Ошибка формирования '%s_on_complete': %s",
-                quest_id,
-                exc,
-            )
-            raise
-
-    def _build_quest_on_fail(self, quest_id: str, quest: Any) -> str:
-        """Собирает функцию ``{quest_id}_on_fail(tsk)``.
-
-        Args:
-            quest_id (str):
-                Идентификатор квеста.
-            quest (Any):
-                Модель квеста с полями ``on_fail_actions`` и ``title_ru``.
-
-        Returns:
-            str: Текст функции провала квеста.
-
-        Raises:
-            TypeError:
-                Если ``on_fail_actions`` не является списком.
-            Exception:
-                Ошибка формирования блока журналируется и пробрасывается.
-        """
-        try:
-            actions = getattr(quest, "on_fail_actions", None)
-            self._require_list(
-                actions,
-                f"on_fail_actions квеста '{quest_id}'",
-            )
-            title = self._require_text(
-                getattr(quest, "title_ru", None),
-                f"title_ru квеста '{quest_id}'",
-            )
-
-            lines = [
-                f"function {SCRIPT_TABLE}.{quest_id}_on_fail(tsk)",
-                "    if not tsk then",
-                "        return",
-                "    end",
-                "",
-                "    news_manager.send_tip(",
-                "        db.actor,",
-                f"        {self._lua_string(title + ' — квест провален.')},",
-                "        nil,",
-                "        nil,",
-                "        10000",
-                "    )",
-                "",
-            ]
-            action_lines = self._build_action_lines(
-                actions,
-                f"квест '{quest_id}' (on_fail)",
-                actor_expr="db.actor",
-            )
-            lines.extend(action_lines or ["    -- Действий при провале нет."])
-            lines.append("end")
-
-            logger.debug(
-                "Функция '%s_on_fail' сформирована: действий — %d.",
-                quest_id,
-                len(actions),
-            )
-            return "\n".join(lines)
-        except Exception as exc:
-            logger.error(
-                "Ошибка формирования '%s_on_fail': %s",
-                quest_id,
-                exc,
-            )
-            raise
-
-    def _build_quest_status_functor(
-        self,
-        quest_id: str,
-        quest: Any,
-    ) -> str:
-        """Собирает функцию ``{quest_id}_status_functor(tsk, task_id)``.
-
-        Функтор проверяет Pydantic-условия ``transfer_conditions``. Правила
-        провала имеют приоритет над правилами завершения. При выполнении
-        условия не последнего этапа ``tsk.stage`` увеличивается на единицу;
-        на последнем этапе функтор возвращает ``"complete"``.
-
-        Args:
-            quest_id (str):
-                Идентификатор квеста.
-            quest (Any):
-                Модель квеста с картой ``stages`` и необязательным полем
-                ``transfer_conditions``.
-
-        Returns:
-            str: Текст функции ``status_functor``.
-
-        Raises:
-            TypeError:
-                Если карта этапов повреждена или правила переходов имеют
-                неподдерживаемую структуру.
-            Exception:
-                Ошибка формирования блока журналируется и пробрасывается.
-        """
-        try:
-            stages = getattr(quest, "stages", None)
-            self._require_mapping(stages, f"stages квеста '{quest_id}'")
-            stage_ids = sorted(stages)
-            if not stage_ids:
-                raise ValueError(f"Квест '{quest_id}' не содержит этапов.")
-
-            quest_rules, stage_rules = self._extract_transfer_rules(
-                quest_id,
-                quest,
-                stage_ids,
-            )
-
-            lines = [
-                f"function {SCRIPT_TABLE}.{quest_id}_status_functor(tsk, task_id)",
-                "    if not tsk then",
-                "        return nil",
-                "    end",
-                "",
-                "    tsk.stage = tsk.stage or 0",
-                "",
-            ]
-
-            quest_fail = self._conditions_to_lua(
-                quest_rules["fail"],
-                owner=f"квест '{quest_id}', общий fail",
-            )
-            if quest_rules["fail"]:
-                lines.extend(
-                    [
-                        f"    if {quest_fail} then",
-                        '        return "fail"',
-                        "    end",
-                        "",
-                    ]
-                )
-
-            quest_complete = self._conditions_to_lua(
-                quest_rules["complete"],
-                owner=f"квест '{quest_id}', общий complete",
-            )
-            if quest_rules["complete"]:
-                lines.extend(
-                    [
-                        f"    if {quest_complete} then",
-                        '        return "complete"',
-                        "    end",
-                        "",
-                    ]
-                )
-
-            last_stage_id = stage_ids[-1]
-
-            for stage_id in stage_ids:
-                rules = stage_rules[stage_id]
-                lines.append(f"    if tsk.stage == {stage_id} then")
-
-                if rules["fail"]:
-                    fail_expression = self._conditions_to_lua(
-                        rules["fail"],
-                        owner=f"квест '{quest_id}', этап {stage_id}, fail",
-                    )
-                    lines.extend(
-                        [
-                            f"        if {fail_expression} then",
-                            '            return "fail"',
-                            "        end",
-                        ]
-                    )
-
-                if rules["complete"]:
-                    complete_expression = self._conditions_to_lua(
-                        rules["complete"],
-                        owner=f"квест '{quest_id}', этап {stage_id}, complete",
-                    )
-                    lines.append(f"        if {complete_expression} then")
-                    if stage_id == last_stage_id:
-                        lines.append('            return "complete"')
-                    else:
-                        lines.append(
-                            f"            tsk.stage = {stage_id + 1}"
-                        )
-                        next_stage = stages.get(stage_id + 1)
-                        next_actions = getattr(
-                            next_stage,
-                            "on_start_actions",
-                            [],
-                        )
-                        if isinstance(next_actions, list) and next_actions:
-                            lines.extend(
-                                self._build_action_lines(
-                                    next_actions,
-                                    (
-                                        f"квест '{quest_id}', переход на этап "
-                                        f"{stage_id + 1}"
-                                    ),
-                                    actor_expr="db.actor",
-                                    indent="            ",
-                                )
-                            )
-                        lines.append("            return nil")
-                    lines.append("        end")
-
-                lines.extend(["        return nil", "    end", ""])
-
-            lines.extend(["    return nil", "end"])
-
-            logger.debug(
-                "Функция '%s_status_functor' сформирована: этапов — %d.",
-                quest_id,
-                len(stage_ids),
-            )
-            return "\n".join(lines)
-        except Exception as exc:
-            logger.error(
-                "Ошибка формирования '%s_status_functor': %s",
-                quest_id,
-                exc,
-            )
-            raise
-
-    def _build_quest_target_functor(
-        self,
-        quest_id: str,
-        quest: Any,
-    ) -> str:
-        """Собирает функцию ``{quest_id}_target_functor(tsk, task_id)``.
-
-        Для текущего ``tsk.stage`` функтор возвращает id цели, полученный из
-        ``Stage.target_alias`` через ``mymod_resolve_target``. Если алиас
-        пуст или движок не смог его разрешить, возвращается ``nil``.
-
-        Args:
-            quest_id (str):
-                Идентификатор квеста.
-            quest (Any):
-                Модель квеста с картой этапов.
-
-        Returns:
-            str: Текст функции ``target_functor``.
-
-        Raises:
-            TypeError:
-                Если карта этапов повреждена или алиас цели не является
-                строкой.
-            Exception:
-                Ошибка формирования блока журналируется и пробрасывается.
-        """
-        try:
-            stages = getattr(quest, "stages", None)
-            self._require_mapping(stages, f"stages квеста '{quest_id}'")
-            stage_ids = sorted(stages)
-            if not stage_ids:
-                raise ValueError(f"Квест '{quest_id}' не содержит этапов.")
-
-            lines = [
-                f"function {SCRIPT_TABLE}.{quest_id}_target_functor(tsk, task_id)",
-                "    if not tsk then",
-                "        return nil",
-                "    end",
-                "",
-                "    local stage = tsk.stage or 0",
-                "",
-            ]
-
-            for stage_id in stage_ids:
-                stage = stages[stage_id]
-                target_alias = getattr(stage, "target_alias", None)
-                if not isinstance(target_alias, str):
-                    raise TypeError(
-                        f"Этап {stage_id} квеста '{quest_id}' содержит "
-                        "нестроковый target_alias."
-                    )
-
-                lines.append(f"    if stage == {stage_id} then")
-                if target_alias.strip():
-                    lines.append(
-                        "        return mymod_resolve_target("
-                        f"{self._lua_string(target_alias)})"
-                    )
-                else:
-                    lines.append("        return nil")
-                lines.extend(["    end", ""])
-
-            lines.extend(["    return nil", "end"])
-
-            logger.debug(
-                "Функция '%s_target_functor' сформирована: этапов — %d.",
-                quest_id,
-                len(stage_ids),
-            )
-            return "\n".join(lines)
-        except Exception as exc:
-            logger.error(
-                "Ошибка формирования '%s_target_functor': %s",
-                quest_id,
-                exc,
-            )
-            raise
-
-    # ------------------------------------------------------------------
-    # Сборка диалогов
-    # ------------------------------------------------------------------
-
-    def _build_dialog(self, dialog_id: Any, dialog: Any) -> str:
-        """Собирает Lua-функторы всех фраз одного диалога.
-
-        Args:
-            dialog_id (Any):
-                Ключ карты диалогов; должен совпадать с ``Dialog.id``.
-            dialog (Any):
-                Модель диалога с картой ``phrases``.
-
-        Returns:
-            str: Блок функций диалога или пустая строка, если ни одна фраза не
-            содержит условий и действий.
-
-        Raises:
-            ValueError:
-                Если идентификатор диалога некорректен или не совпадает с
-                ``Dialog.id``.
-            TypeError:
-                Если карта фраз повреждена.
-            Exception:
-                Любая ошибка сборки журналируется и пробрасывается, чтобы
-                ``generate_quests_script`` мог пропустить диалог.
-        """
-        try:
-            self._validate_dialog(dialog_id, dialog)
-            phrases = getattr(dialog, "phrases", None)
-            self._require_mapping(phrases, f"phrases диалога '{dialog_id}'")
-
-            blocks: list[str] = []
-            for phrase_id in sorted(phrases):
-                block = self._build_phrase_functions(
-                    dialog_id,
-                    phrase_id,
-                    phrases[phrase_id],
-                )
-                if block:
-                    blocks.append(block)
-
-            content = "\n\n".join(blocks)
-            logger.debug(
-                "Диалог '%s' собран: фраз с логикой — %d.",
-                dialog_id,
-                len(blocks),
-            )
-            return content
-        except Exception as exc:
-            logger.error(
-                "Не удалось собрать Lua-диалог '%s': %s",
-                dialog_id,
-                exc,
-                exc_info=True,
-            )
-            raise
-
-    def _build_phrase_functions(
+    def _build_dialog_functions(
         self,
         dialog_id: str,
-        phrase_id: Any,
-        phrase: Any,
-    ) -> str:
-        """Собирает precondition и action одной фразы диалога.
+        dialog: "Dialog",
+        linked_quest_id: str | None,
+        quest_data: dict[str, dict[str, Any]],
+    ) -> tuple[str, list[tuple[str, str, str]]]:
+        """Генерирует функции диалога и реплик.
 
-        Функции создаются только для «фраз с логикой» — тех, у которых есть
-        хотя бы одно предусловие или хотя бы одно действие.
+        Диалоговые функции ``_can_take``/``_can_turn_in``/``_accept``/
+        ``_turn_in`` регистрируются в ``dialogs``; функции реплик получают
+        каноническую сигнатуру ``(actor, npc, p)``.
 
         Args:
-            dialog_id (str):
-                Идентификатор родительского диалога.
-            phrase_id (Any):
-                Ключ карты фраз; должен совпадать с ``Phrase.id``.
-            phrase (Any):
-                Модель реплики с полями ``preconditions`` и ``actions``.
+            dialog_id (str): Канонический id диалога.
+            dialog (Dialog): Модель диалога.
+            linked_quest_id (str | None): Связанный квест.
+            quest_data (dict[str, dict[str, Any]]): Данные квестов.
 
         Returns:
-            str: Две Lua-функции или пустая строка для фразы без логики.
-
-        Raises:
-            ValueError:
-                Если номер фразы некорректен или не совпадает с ``Phrase.id``.
-            TypeError:
-                Если списки условий или действий повреждены.
-            Exception:
-                Ошибка формирования блока журналируется и пробрасывается.
+            tuple[str, list[tuple[str, str, str]]]:
+                Lua-код и список регистраций ``(table, key, function)``.
         """
-        try:
-            self._validate_phrase_identity(dialog_id, phrase_id, phrase)
+        keys: list[tuple[str, str, str]] = []
+        blocks: list[str] = []
 
-            preconditions = getattr(phrase, "preconditions", None)
-            actions = getattr(phrase, "actions", None)
-            self._require_list(
-                preconditions,
-                f"preconditions фразы {phrase_id} диалога '{dialog_id}'",
-            )
-            self._require_list(
-                actions,
-                f"actions фразы {phrase_id} диалога '{dialog_id}'",
-            )
+        condition_specs = [
+            self._condition_spec(condition)
+            for condition in dialog.preconditions
+        ]
+        conditions_lua = self._to_lua(condition_specs, indent=1)
+        linked = self._lua_string(linked_quest_id or "")
 
-            if not preconditions and not actions:
-                logger.debug(
-                    "Фраза %s диалога '%s' не содержит логики.",
-                    phrase_id,
-                    dialog_id,
-                )
-                return ""
+        can_take = f"""\
+-- Dialog availability: all dialog-level conditions plus "task not given".
+local function {dialog_id}_can_take(actor, npc, p)
+	local linked = {linked}
+	if linked ~= "" then
+		local tm = task_manager and task_manager.get_task_manager()
+		if tm and tm.task_info[linked] then return false end
+	end
+	return eval_conditions({conditions_lua}, actor or db.actor)
+end"""
 
+        can_turn_in = f"""\
+-- Turn-in availability: the task exists and the return stage is reached.
+local function {dialog_id}_can_turn_in(actor, npc, p)
+	local linked = {linked}
+	if linked == "" then return true end
+	local quest = QUESTS[linked]
+	if not quest then return true end
+	local tm = task_manager and task_manager.get_task_manager()
+	local tsk = tm and tm.task_info[linked]
+	if not tsk then return false end
+	if quest.return_stage >= 0 and (tsk.stage or 0) < quest.return_stage then
+		return false
+	end
+	return true
+end"""
+
+        accept = f"""\
+-- Dialog effect: gives the linked task.
+local function {dialog_id}_accept(actor, npc, p)
+	local linked = {linked}
+	if linked ~= "" then give_task(linked, npc) end
+end"""
+
+        turn_in = f"""\
+-- Dialog effect: completes the linked task.
+local function {dialog_id}_turn_in(actor, npc, p)
+	local linked = {linked}
+	if linked ~= "" then complete_task(linked) end
+end"""
+
+        blocks.extend([can_take, can_turn_in, accept, turn_in])
+        keys.extend(
+            [
+                ("dialogs", f"{dialog_id}_can_take", f"{dialog_id}_can_take"),
+                (
+                    "dialogs",
+                    f"{dialog_id}_can_turn_in",
+                    f"{dialog_id}_can_turn_in",
+                ),
+                ("dialogs", f"{dialog_id}_accept", f"{dialog_id}_accept"),
+                ("dialogs", f"{dialog_id}_turn_in", f"{dialog_id}_turn_in"),
+            ]
+        )
+
+        for phrase_id in sorted(dialog.phrases):
+            phrase = dialog.phrases[phrase_id]
             prefix = f"{dialog_id}_phrase_{phrase_id}"
 
-            if preconditions:
-                condition_expression = self._conditions_to_lua(
-                    preconditions,
-                    owner=(
-                        f"диалог '{dialog_id}', фраза {phrase_id}, "
-                        "preconditions"
-                    ),
-                    actor_expr="second_speaker",
-                )
-            else:
-                condition_expression = "true"
-
-            precondition_lines = [
-                (
-                    f"function {SCRIPT_TABLE}.{prefix}_precondition("
-                    "first_speaker, second_speaker, dialog_id, phrase_id)"
-                ),
-                f"    return {condition_expression}",
-                "end",
+            non_info_conditions = [
+                self._condition_spec(condition)
+                for condition in phrase.preconditions
+                if not isinstance(condition, (HasInfo, DontHasInfo))
             ]
+            if non_info_conditions:
+                specs = self._to_lua(non_info_conditions, indent=1)
+                blocks.append(
+                    f"""\
+-- Phrase {phrase_id} precondition.
+local function {prefix}_precondition(actor, npc, p)
+	return eval_conditions({specs}, actor or db.actor)
+end"""
+                )
+                keys.append(
+                    (
+                        "dialogs",
+                        f"{prefix}_precondition",
+                        f"{prefix}_precondition",
+                    )
+                )
 
-            action_lines = self._build_action_lines(
-                actions,
-                f"диалог '{dialog_id}', фраза {phrase_id}, actions",
-                actor_expr="second_speaker",
-            )
-            action_function = [
-                (
-                    f"function {SCRIPT_TABLE}.{prefix}_action("
-                    "first_speaker, second_speaker, dialog_id, phrase_id)"
-                ),
+            lua_actions = [
+                action
+                for action in phrase.actions
+                if not isinstance(action, (GiveInfo, GiveTask, CompleteTask))
             ]
-            action_function.extend(
-                action_lines or ["    -- Действий у фразы нет."]
-            )
-            action_function.append("end")
+            if lua_actions:
+                specs = self._to_lua(
+                    [self._action_spec(action) for action in lua_actions],
+                    indent=1,
+                )
+                blocks.append(
+                    f"""\
+-- Phrase {phrase_id} action.
+local function {prefix}_action(actor, npc, p)
+	run_actions({specs}, actor or db.actor, npc)
+end"""
+                )
+                keys.append(
+                    ("dialogs", f"{prefix}_action", f"{prefix}_action")
+                )
 
-            logger.debug(
-                "Логика фразы %s диалога '%s' сформирована: условий — %d, "
-                "действий — %d.",
-                phrase_id,
-                dialog_id,
-                len(preconditions),
-                len(actions),
-            )
-            return "\n".join(precondition_lines + [""] + action_function)
-        except Exception as exc:
-            logger.error(
-                "Ошибка формирования логики фразы %s диалога '%s': %s",
-                phrase_id,
-                dialog_id,
-                exc,
-            )
-            raise
+        return "\n\n".join(blocks), keys
 
-    # ------------------------------------------------------------------
-    # Трансляция действий и условий
-    # ------------------------------------------------------------------
-
-    def _build_action_lines(
+    def _build_registration(
         self,
-        actions: Iterable[Any],
-        owner: str,
-        *,
-        actor_expr: str,
-        indent: str = "    ",
-    ) -> list[str]:
-        """Переводит список Pydantic-действий в строки Lua.
-
-        Повреждённое действие не прерывает сборку всей сущности: оно
-        журналируется и заменяется Lua-комментарием.
-
-        Args:
-            actions (Iterable[Any]):
-                Действия квеста, этапа или реплики.
-            owner (str):
-                Контекст для сообщений лога.
-            actor_expr (str):
-                Lua-выражение получателя предмета (``db.actor`` или
-                ``second_speaker``).
-            indent (str):
-                Отступ для каждой строки действия.
-
-        Returns:
-            list[str]: Строки Lua-кода с указанным отступом.
-
-        Raises:
-            TypeError:
-                Если ``actions`` не является итерируемой коллекцией.
-            Exception:
-                Непредвиденная ошибка журналируется и пробрасывается.
-        """
-        try:
-            if isinstance(actions, (str, bytes)) or not isinstance(
-                actions,
-                Iterable,
-            ):
-                raise TypeError(
-                    f"Список действий ({owner}) должен быть итерируемым, "
-                    f"а получен {type(actions).__name__}."
-                )
-
-            lines: list[str] = []
-            for index, action in enumerate(actions):
-                try:
-                    lua_code = self._action_to_lua(
-                        action,
-                        actor_expr=actor_expr,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Действие #%d (%s) пропущено: %s",
-                        index,
-                        owner,
-                        exc,
-                        exc_info=True,
-                    )
-                    lines.append(
-                        f"{indent}-- Пропущено действие #{index}: "
-                        f"{self._sanitize_comment(str(exc))}"
-                    )
-                    continue
-
-                lines.append(f"{indent}{lua_code}")
-
-            logger.debug(
-                "Действия (%s) переведены в Lua: строк — %d.",
-                owner,
-                len(lines),
-            )
-            return lines
-        except Exception as exc:
-            logger.error(
-                "Не удалось перевести действия (%s) в Lua: %s",
-                owner,
-                exc,
-            )
-            raise
-
-    def _action_to_lua(self, action: Any, *, actor_expr: str) -> str:
-        """Переводит одно Pydantic-действие в вызов Lua-API Anomaly.
-
-        Поддерживаемые действия:
-
-        * ``GiveInfo`` — ``db.actor:give_info_portion``;
-        * ``RemoveInfo`` — ``db.actor:disable_info_portion``;
-        * ``SpawnSquad`` — ``mymod_quests.spawn_task_squad``;
-        * ``SetTarget`` — ``mymod_quests.set_task_target``;
-        * ``GiveItem`` — ``dialogs.relocate_item_section(..., "in")``;
-        * ``RemoveItem`` — ``dialogs.relocate_item_section(..., "out")``;
-        * ``GiveMoney`` — ``db.actor:give_money``.
-
-        Args:
-            action (Any):
-                Конкретный наследник ``BaseAction``.
-            actor_expr (str):
-                Lua-выражение игрока — получателя предмета.
-
-        Returns:
-            str: Одна строка Lua-кода без отступа.
-
-        Raises:
-            TypeError:
-                Если действие имеет неподдерживаемый тип или повреждённые
-                обязательные поля.
-        """
-        try:
-            if isinstance(action, GiveInfo):
-                return (
-                    "db.actor:give_info_portion("
-                    f"{self._lua_string(action.info)})"
-                )
-
-            if isinstance(action, RemoveInfo):
-                return (
-                    "db.actor:disable_info_portion("
-                    f"{self._lua_string(action.info)})"
-                )
-
-            if isinstance(action, SpawnSquad):
-                return (
-                    f"{SCRIPT_TABLE}.spawn_task_squad("
-                    f"{self._lua_string(action.squad_alias)}, "
-                    f"{self._lua_string(action.smart_alias)})"
-                )
-
-            if isinstance(action, SetTarget):
-                return (
-                    f"{SCRIPT_TABLE}.set_task_target("
-                    f"{self._lua_string(action.squad_alias)}, "
-                    f"{self._lua_string(action.smart_alias)})"
-                )
-
-            if isinstance(action, GiveItem):
-                return (
-                    "dialogs.relocate_item_section("
-                    f"{actor_expr}, {self._lua_string(action.item_alias)}, "
-                    '"in")'
-                )
-
-            if isinstance(action, RemoveItem):
-                return (
-                    "dialogs.relocate_item_section("
-                    f"{actor_expr}, {self._lua_string(action.item_alias)}, "
-                    '"out")'
-                )
-
-            if isinstance(action, GiveMoney):
-                amount = action.amount
-                if not isinstance(amount, int) or isinstance(amount, bool):
-                    raise TypeError(
-                        "Сумма GiveMoney должна быть целым числом, а "
-                        f"получена {type(amount).__name__}."
-                    )
-                return f"db.actor:give_money({amount})"
-
-            raise TypeError(
-                "Неподдерживаемый тип действия: "
-                f"{type(action).__name__}."
-            )
-        except Exception as exc:
-            logger.error("Ошибка трансляции действия в Lua: %s", exc)
-            raise
-
-    def _conditions_to_lua(
-        self,
-        conditions: Iterable[Any],
-        *,
-        owner: str,
-        actor_expr: str = "db.actor",
+        registrations: Sequence[tuple[str, str, str]],
+        script_name: str,
     ) -> str:
-        """Переводит список Pydantic-условий в Lua-выражение.
-
-        Условия объединяются логическим ``and``. Пустой список даёт ``true``.
+        """Формирует ``register()`` и callback-обвязку модуля.
 
         Args:
-            conditions (Iterable[Any]):
-                Условия доступности или перехода.
-            owner (str):
-                Контекст для сообщений лога.
-            actor_expr (str):
-                Lua-выражение игрока для проверки предметов.
+            registrations (Sequence[tuple[str, str, str]]):
+                Пары ``(engine_table, flat_key, function_name)``.
+            script_name (str): Имя модуля для логов.
 
         Returns:
-            str: Lua-выражение, пригодное для ``if`` и ``return``.
-
-        Raises:
-            TypeError:
-                Если список условий не является итерируемой коллекцией.
-            ValueError:
-                Если хотя бы одно условие не удалось перевести в Lua.
+            str: Lua-код регистрации и автоматического вызова.
         """
-        try:
-            if isinstance(conditions, (str, bytes)) or not isinstance(
-                conditions,
-                Iterable,
-            ):
-                raise TypeError(
-                    f"Список условий ({owner}) должен быть итерируемым, "
-                    f"а получен {type(conditions).__name__}."
+        unique: dict[tuple[str, str], str] = {}
+        for table, key, function_name in registrations:
+            identity = (table, key)
+            if identity in unique:
+                logger.warning(
+                    "Дублирующаяся регистрация %s[\"%s\"] пропущена.",
+                    table,
+                    key,
                 )
+                continue
+            unique[identity] = function_name
 
-            expressions: list[str] = []
-            failures = 0
-            for index, condition in enumerate(conditions):
-                try:
-                    expressions.append(
-                        self._condition_to_lua(
-                            condition,
-                            actor_expr=actor_expr,
-                        )
-                    )
-                except Exception as exc:
-                    failures += 1
-                    logger.error(
-                        "Условие #%d (%s) не удалось перевести: %s",
-                        index,
-                        owner,
-                        exc,
-                        exc_info=True,
-                    )
-
-            if failures:
-                raise ValueError(
-                    f"Не удалось перевести условий ({owner}): {failures}."
-                )
-
-            if not expressions:
-                return "true"
-
-            if len(expressions) == 1:
-                return expressions[0]
-
-            logger.debug(
-                "Условия (%s) объединены: выражений — %d.",
-                owner,
-                len(expressions),
+        lines = [
+            "-- ------------------------------------------------------------------",
+            "-- Registration (module level, flat keys only)",
+            "-- ------------------------------------------------------------------",
+            "local function register()",
+            "\tif registered then return end",
+            "\tif not (task_functor and task_status_functor and xr_effects and dialogs) then",
+            "\t\treturn",
+            "\tend",
+            "",
+        ]
+        for (table, key), function_name in unique.items():
+            lines.append(
+                f'\t{table}["{key}"] = {function_name}'
             )
-            return " and ".join(f"({expression})" for expression in expressions)
-        except Exception as exc:
-            logger.error(
-                "Не удалось перевести условия (%s) в Lua: %s",
-                owner,
-                exc,
-            )
-            raise
-
-    def _condition_to_lua(self, condition: Any, *, actor_expr: str) -> str:
-        """Переводит одно Pydantic-условие в Lua-выражение.
-
-        Args:
-            condition (Any):
-                Конкретный наследник ``BaseCondition``.
-            actor_expr (str):
-                Lua-выражение игрока для проверки инвентаря.
-
-        Returns:
-            str: Lua-выражение без завершающей точки с запятой.
-
-        Raises:
-            TypeError:
-                Если тип условия не поддерживается или его поля повреждены.
-        """
-        try:
-            if isinstance(condition, HasInfo):
-                return (
-                    "has_alife_info("
-                    f"{self._lua_string(condition.info)})"
-                )
-
-            if isinstance(condition, DontHasInfo):
-                return (
-                    "not has_alife_info("
-                    f"{self._lua_string(condition.info)})"
-                )
-
-            if isinstance(condition, HasItem):
-                return (
-                    f"{actor_expr}:object("
-                    f"{self._lua_string(condition.item_alias)}) ~= nil"
-                )
-
-            if isinstance(condition, SmartOwner):
-                return (
-                    f"{SCRIPT_TABLE}.is_smart_captured("
-                    f"{self._lua_string(condition.smart_alias)}, "
-                    f"{self._lua_string(condition.faction)})"
-                )
-
-            raise TypeError(
-                "Неподдерживаемый тип условия: "
-                f"{type(condition).__name__}."
-            )
-        except Exception as exc:
-            logger.error("Ошибка трансляции условия в Lua: %s", exc)
-            raise
+        lines.extend(
+            [
+                "",
+                "\tregistered = true",
+                f'\tprintf("[{script_name}] task functors registered")',
+                "end",
+                "",
+                "-- Called by axr_main's script scanner on a new game.",
+                "function on_game_start()",
+                "\tregister()",
+                "end",
+                "",
+                "pcall(function()",
+                '\tRegisterScriptCallback("on_game_load", function(binder) register() end)',
+                '\tRegisterScriptCallback("actor_on_first_update", function(binder, delta) register() end)',
+                "end)",
+                "",
+                "register()",
+            ]
+        )
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    # Правила transfer_conditions
+    # Lua-сериализация
     # ------------------------------------------------------------------
 
-    def _extract_transfer_rules(
-        self,
-        quest_id: str,
-        quest: Any,
-        stage_ids: Sequence[int],
-    ) -> tuple[dict[str, list[Any]], dict[int, dict[str, list[Any]]]]:
-        """Извлекает правила завершения и провала из модели квеста.
-
-        Правила могут храниться в поле ``transfer_conditions`` самого квеста
-        или отдельного этапа. Метод приводит обе формы к единому виду:
-        общие правила квеста и правила для каждого этапа.
+    @staticmethod
+    def _lua_string(value: Any) -> str:
+        """Экранирует строку для вставки в Lua-исходник.
 
         Args:
-            quest_id (str):
-                Идентификатор квеста для логов и сообщений об ошибках.
-            quest (Any):
-                Модель квеста.
-            stage_ids (Sequence[int]):
-                Отсортированные идентификаторы этапов.
+            value (Any): Значение, которое нужно превратить в строковый
+                литерал.
 
         Returns:
-            tuple[dict[str, list[Any]], dict[int, dict[str, list[Any]]]]:
-                Пара ``(quest_rules, stage_rules)``. Каждый словарь содержит
-                ключи ``"complete"`` и ``"fail"`` со списками условий.
-
-        Raises:
-            TypeError:
-                Если ``transfer_conditions`` имеет неподдерживаемую структуру
-                или ссылается на несуществующий этап.
+            str: Литерал в двойных кавычках с экранированными спецсимволами.
         """
-        try:
-            quest_rules: dict[str, list[Any]] = {
-                result: [] for result in _TRANSFER_RESULTS
-            }
-            stage_rules: dict[int, dict[str, list[Any]]] = {
-                stage_id: {result: [] for result in _TRANSFER_RESULTS}
-                for stage_id in stage_ids
-            }
+        text = "" if value is None else str(value)
+        escaped = (
+            text.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\r", "\\r")
+            .replace("\n", "\\n")
+            .replace("\t", "\\t")
+        )
+        return f'"{escaped}"'
 
-            raw_quest_rules = getattr(quest, "transfer_conditions", None)
-            if raw_quest_rules is not None:
-                self._merge_transfer_rules(
-                    raw_quest_rules,
-                    quest_id=quest_id,
-                    owner="квест",
-                    quest_rules=quest_rules,
-                    stage_rules=stage_rules,
-                    stage_ids=stage_ids,
-                )
+    def _to_lua(self, value: Any, *, indent: int = 0) -> str:
+        """Сериализует Python-значение в Lua-литерал.
 
-            for stage_id in stage_ids:
-                stage = quest.stages[stage_id]
-                raw_stage_rules = getattr(
-                    stage,
-                    "transfer_conditions",
-                    None,
-                )
-                if raw_stage_rules is not None:
-                    self._merge_transfer_rules(
-                        raw_stage_rules,
-                        quest_id=quest_id,
-                        owner=f"этап {stage_id}",
-                        quest_rules=quest_rules,
-                        stage_rules=stage_rules,
-                        stage_ids=stage_ids,
-                        forced_stage_id=stage_id,
-                    )
-
-            logger.debug(
-                "Правила transfer_conditions квеста '%s' разобраны: "
-                "общих условий — %d, этапов с правилами — %d.",
-                quest_id,
-                len(quest_rules["complete"]) + len(quest_rules["fail"]),
-                sum(
-                    1
-                    for rules in stage_rules.values()
-                    if rules["complete"] or rules["fail"]
-                ),
-            )
-            return quest_rules, stage_rules
-        except Exception as exc:
-            logger.error(
-                "Не удалось разобрать transfer_conditions квеста '%s': %s",
-                quest_id,
-                exc,
-            )
-            raise
-
-    def _merge_transfer_rules(
-        self,
-        raw_rules: Any,
-        *,
-        quest_id: str,
-        owner: str,
-        quest_rules: dict[str, list[Any]],
-        stage_rules: dict[int, dict[str, list[Any]]],
-        stage_ids: Sequence[int],
-        forced_stage_id: int | None = None,
-    ) -> None:
-        """Добавляет одну порцию правил в нормализованные структуры.
+        Поддерживаются словари, списки/кортежи, строки, числа, булевы
+        значения и ``None``.
 
         Args:
-            raw_rules (Any):
-                Значение ``transfer_conditions`` квеста или этапа.
-            quest_id (str):
-                Идентификатор квеста для сообщений об ошибках.
-            owner (str):
-                Человекочитаемый владелец правил (``"квест"`` или
-                ``"этап 1"``).
-            quest_rules (dict[str, list[Any]]):
-                Накопитель общих правил квеста.
-            stage_rules (dict[int, dict[str, list[Any]]]):
-                Накопитель правил по этапам.
-            stage_ids (Sequence[int]):
-                Допустимые идентификаторы этапов.
-            forced_stage_id (int | None):
-                Если задан, все правила относятся к этому этапу.
+            value (Any): Сериализуемое значение.
+            indent (int): Текущий уровень отступа (табуляции).
 
         Returns:
-            None: Функция изменяет переданные словари на месте.
-
-        Raises:
-            TypeError:
-                Если структура правил не поддерживается.
-            ValueError:
-                Если правило ссылается на несуществующий этап.
+            str: Lua-литерал, пригодный для вставки в исходник.
         """
-        try:
-            if forced_stage_id is not None:
-                target = stage_rules[forced_stage_id]
-                self._store_stage_rule_value(
-                    raw_rules,
-                    target,
-                    quest_id=quest_id,
-                    owner=f"{owner} (этап {forced_stage_id})",
+        pad = "\t" * indent
+        child_pad = "\t" * (indent + 1)
+
+        if value is None:
+            return "nil"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, str):
+            return self._lua_string(value)
+        if isinstance(value, dict):
+            if not value:
+                return "{}"
+            lines = ["{"]
+            for key, item in value.items():
+                if isinstance(key, int):
+                    key_text = f"[{key}]"
+                elif isinstance(key, str) and _is_lua_identifier(key):
+                    key_text = key
+                else:
+                    key_text = f"[{self._lua_string(key)}]"
+                lines.append(
+                    f"{child_pad}{key_text} = "
+                    f"{self._to_lua(item, indent=indent + 1)},"
                 )
-                return
-
-            if isinstance(raw_rules, Mapping):
-                keys = {str(key) for key in raw_rules}
-                if keys & set(_TRANSFER_RESULTS):
-                    for result in _TRANSFER_RESULTS:
-                        quest_rules[result].extend(
-                            self._as_condition_list(
-                                raw_rules.get(result),
-                                quest_id=quest_id,
-                                owner=f"{owner}, {result}",
-                            )
-                        )
-                    return
-
-                for raw_stage_id, value in raw_rules.items():
-                    stage_id = self._coerce_stage_id(
-                        raw_stage_id,
-                        quest_id=quest_id,
-                        owner=owner,
-                    )
-                    if stage_id not in stage_rules:
-                        raise ValueError(
-                            f"Правило {owner} ссылается на несуществующий "
-                            f"этап {stage_id} квеста '{quest_id}'."
-                        )
-                    self._store_stage_rule_value(
-                        value,
-                        stage_rules[stage_id],
-                        quest_id=quest_id,
-                        owner=f"{owner}, этап {stage_id}",
-                    )
-                return
-
-            if isinstance(raw_rules, (list, tuple)):
-                last_stage_id = stage_ids[-1]
-                stage_rules[last_stage_id]["complete"].extend(
-                    self._as_condition_list(
-                        raw_rules,
-                        quest_id=quest_id,
-                        owner=f"{owner}, последний этап",
-                    )
+            lines.append(f"{pad}}}")
+            return "\n".join(lines)
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return "{}"
+            lines = ["{"]
+            for item in value:
+                lines.append(
+                    f"{child_pad}{self._to_lua(item, indent=indent + 1)},"
                 )
-                return
-
-            raise TypeError(
-                f"Правила {owner} квеста '{quest_id}' должны быть словарём "
-                "или списком условий, а получены "
-                f"{type(raw_rules).__name__}."
-            )
-        except Exception as exc:
-            logger.error(
-                "Ошибка правил %s квеста '%s': %s",
-                owner,
-                quest_id,
-                exc,
-            )
-            raise
-
-    def _store_stage_rule_value(
-        self,
-        value: Any,
-        target: dict[str, list[Any]],
-        *,
-        quest_id: str,
-        owner: str,
-    ) -> None:
-        """Сохраняет правила одного этапа в накопителе.
-
-        Args:
-            value (Any):
-                Список условий завершения либо словарь с ключами
-                ``"complete"``/``"fail"``.
-            target (dict[str, list[Any]]):
-                Накопитель правил конкретного этапа.
-            quest_id (str):
-                Идентификатор квеста для сообщений об ошибках.
-            owner (str):
-                Контекст правила для логов.
-
-        Returns:
-            None: Функция изменяет ``target`` на месте.
-
-        Raises:
-            TypeError:
-                Если значение правила имеет неподдерживаемый тип.
-        """
-        try:
-            if isinstance(value, Mapping):
-                for result in _TRANSFER_RESULTS:
-                    target[result].extend(
-                        self._as_condition_list(
-                            value.get(result),
-                            quest_id=quest_id,
-                            owner=f"{owner}, {result}",
-                        )
-                    )
-                return
-
-            target["complete"].extend(
-                self._as_condition_list(
-                    value,
-                    quest_id=quest_id,
-                    owner=f"{owner}, complete",
-                )
-            )
-        except Exception as exc:
-            logger.error(
-                "Ошибка правила %s квеста '%s': %s",
-                owner,
-                quest_id,
-                exc,
-            )
-            raise
-
-    def _as_condition_list(
-        self,
-        value: Any,
-        *,
-        quest_id: str,
-        owner: str,
-    ) -> list[Any]:
-        """Приводит значение правила к списку Pydantic-условий.
-
-        Args:
-            value (Any):
-                ``None``, одно условие или последовательность условий.
-            quest_id (str):
-                Идентификатор квеста для сообщений об ошибках.
-            owner (str):
-                Контекст правила для логов.
-
-        Returns:
-            list[Any]: Список условий; для ``None`` возвращается пустой список.
-
-        Raises:
-            TypeError:
-                Если значение не является условием или их последовательностью.
-        """
-        try:
-            if value is None:
-                return []
-
-            if isinstance(value, (HasInfo, DontHasInfo, HasItem, SmartOwner)):
-                return [value]
-
-            if isinstance(value, (str, bytes, Mapping)):
-                raise TypeError(
-                    f"Условия {owner} квеста '{quest_id}' должны быть "
-                    "Pydantic-объектами, а получены "
-                    f"{type(value).__name__}."
-                )
-
-            if isinstance(value, Sequence):
-                result = list(value)
-                for index, condition in enumerate(result):
-                    if not isinstance(
-                        condition,
-                        (HasInfo, DontHasInfo, HasItem, SmartOwner),
-                    ):
-                        raise TypeError(
-                            f"Условие #{index} ({owner}) квеста "
-                            f"'{quest_id}' имеет неподдерживаемый тип "
-                            f"{type(condition).__name__}."
-                        )
-                return result
-
-            raise TypeError(
-                f"Условия {owner} квеста '{quest_id}' имеют "
-                f"неподдерживаемый тип {type(value).__name__}."
-            )
-        except Exception as exc:
-            logger.error(
-                "Ошибка списка условий %s квеста '%s': %s",
-                owner,
-                quest_id,
-                exc,
-            )
-            raise
-
-    def _coerce_stage_id(
-        self,
-        value: Any,
-        *,
-        quest_id: str,
-        owner: str,
-    ) -> int:
-        """Приводит ключ правила к целочисленному номеру этапа.
-
-        Args:
-            value (Any):
-                Ключ словаря ``transfer_conditions``.
-            quest_id (str):
-                Идентификатор квеста для сообщений об ошибках.
-            owner (str):
-                Контекст правила для логов.
-
-        Returns:
-            int: Неотрицательный номер этапа.
-
-        Raises:
-            TypeError:
-                Если ключ не является целым числом или числовой строкой.
-            ValueError:
-                Если номер этапа отрицательный.
-        """
-        try:
-            if isinstance(value, bool):
-                raise TypeError(
-                    f"Ключ этапа ({owner}) квеста '{quest_id}' не может быть "
-                    "булевым значением."
-                )
-
-            if isinstance(value, int):
-                stage_id = value
-            elif isinstance(value, str) and value.strip().isdigit():
-                stage_id = int(value.strip())
-            else:
-                raise TypeError(
-                    f"Ключ этапа ({owner}) квеста '{quest_id}' должен быть "
-                    f"целым числом, а получен {type(value).__name__}."
-                )
-
-            if stage_id < 0:
-                raise ValueError(
-                    f"Номер этапа ({owner}) квеста '{quest_id}' не может "
-                    f"быть отрицательным: {stage_id}."
-                )
-
-            return stage_id
-        except Exception as exc:
-            logger.error(
-                "Ошибка ключа этапа %r (%s) квеста '%s': %s",
-                value,
-                owner,
-                quest_id,
-                exc,
-            )
-            raise
-
-    # ------------------------------------------------------------------
-    # Валидация и вспомогательные функции
-    # ------------------------------------------------------------------
-
-    def _validate_quest(self, quest_id: Any, quest: Any) -> None:
-        """Проверяет минимальную структуру квеста перед генерацией.
-
-        Args:
-            quest_id (Any):
-                Ключ карты квестов.
-            quest (Any):
-                Проверяемая модель квеста.
-
-        Returns:
-            None: Функция ничего не возвращает.
-
-        Raises:
-            ValueError:
-                Если идентификатор некорректен или не совпадает с
-                ``Quest.id``.
-            TypeError:
-                Если отсутствуют обязательные поля или карта этапов имеет
-                неверный тип.
-        """
-        try:
-            self._validate_identifier(quest_id, "квеста")
-
-            actual_id = getattr(quest, "id", None)
-            if actual_id != quest_id:
-                raise ValueError(
-                    f"Ключ карты '{quest_id}' не совпадает с "
-                    f"Quest.id='{actual_id}'."
-                )
-
-            stages = getattr(quest, "stages", None)
-            self._require_mapping(stages, f"stages квеста '{quest_id}'")
-            if not stages:
-                raise ValueError(
-                    f"Квест '{quest_id}' не содержит ни одного этапа."
-                )
-
-            for stage_id, stage in stages.items():
-                if not isinstance(stage_id, int) or isinstance(stage_id, bool):
-                    raise TypeError(
-                        f"Ключ этапа квеста '{quest_id}' должен быть целым "
-                        f"числом, а получен {type(stage_id).__name__}."
-                    )
-
-                actual_stage_id = getattr(stage, "id", None)
-                if actual_stage_id != stage_id:
-                    raise ValueError(
-                        f"Ключ этапа {stage_id} квеста '{quest_id}' не "
-                        f"совпадает с Stage.id='{actual_stage_id}'."
-                    )
-
-                target_alias = getattr(stage, "target_alias", None)
-                if not isinstance(target_alias, str):
-                    raise TypeError(
-                        f"Этап {stage_id} квеста '{quest_id}' содержит "
-                        "нестроковый target_alias."
-                    )
-
-            for field_name in (
-                "on_init_actions",
-                "on_complete_actions",
-                "on_fail_actions",
-            ):
-                self._require_list(
-                    getattr(quest, field_name, None),
-                    f"{field_name} квеста '{quest_id}'",
-                )
-
-            self._require_text(
-                getattr(quest, "title_ru", None),
-                f"title_ru квеста '{quest_id}'",
-            )
-
-            logger.debug("Структура квеста '%s' корректна.", quest_id)
-        except Exception as exc:
-            logger.error(
-                "Квест '%s' не прошёл проверку структуры: %s",
-                quest_id,
-                exc,
-            )
-            raise
-
-    def _validate_dialog(self, dialog_id: Any, dialog: Any) -> None:
-        """Проверяет минимальную структуру диалога перед генерацией.
-
-        Args:
-            dialog_id (Any):
-                Ключ карты диалогов.
-            dialog (Any):
-                Проверяемая модель диалога.
-
-        Returns:
-            None: Функция ничего не возвращает.
-
-        Raises:
-            ValueError:
-                Если идентификатор некорректен или не совпадает с
-                ``Dialog.id``.
-            TypeError:
-                Если карта фраз отсутствует или имеет неверный тип.
-        """
-        try:
-            self._validate_identifier(dialog_id, "диалога")
-
-            actual_id = getattr(dialog, "id", None)
-            if actual_id != dialog_id:
-                raise ValueError(
-                    f"Ключ карты '{dialog_id}' не совпадает с "
-                    f"Dialog.id='{actual_id}'."
-                )
-
-            phrases = getattr(dialog, "phrases", None)
-            self._require_mapping(phrases, f"phrases диалога '{dialog_id}'")
-            if not phrases:
-                raise TypeError(
-                    f"Диалог '{dialog_id}' должен содержать непустую карту "
-                    "phrases."
-                )
-
-            logger.debug("Структура диалога '%s' корректна.", dialog_id)
-        except Exception as exc:
-            logger.error(
-                "Диалог '%s' не прошёл проверку структуры: %s",
-                dialog_id,
-                exc,
-            )
-            raise
-
-    def _validate_phrase_identity(
-        self,
-        dialog_id: str,
-        phrase_id: Any,
-        phrase: Any,
-    ) -> None:
-        """Проверяет номер фразы и его совпадение с моделью.
-
-        Args:
-            dialog_id (str):
-                Идентификатор родительского диалога.
-            phrase_id (Any):
-                Ключ карты фраз.
-            phrase (Any):
-                Проверяемая модель реплики.
-
-        Returns:
-            None: Функция ничего не возвращает.
-
-        Raises:
-            ValueError:
-                Если номер фразы некорректен или не совпадает с ``Phrase.id``.
-        """
-        try:
-            if not isinstance(phrase_id, int) or isinstance(phrase_id, bool):
-                raise ValueError(
-                    f"Номер фразы диалога '{dialog_id}' должен быть целым "
-                    f"числом, а получен {type(phrase_id).__name__}."
-                )
-
-            if phrase_id < 0:
-                raise ValueError(
-                    f"Номер фразы диалога '{dialog_id}' не может быть "
-                    f"отрицательным: {phrase_id}."
-                )
-
-            actual_id = getattr(phrase, "id", None)
-            if actual_id != phrase_id:
-                raise ValueError(
-                    f"Ключ фразы {phrase_id} диалога '{dialog_id}' не "
-                    f"совпадает с Phrase.id='{actual_id}'."
-                )
-
-            logger.debug(
-                "Фраза %s диалога '%s' прошла проверку идентификатора.",
-                phrase_id,
-                dialog_id,
-            )
-        except Exception as exc:
-            logger.error(
-                "Ошибка идентификатора фразы %s диалога '%s': %s",
-                phrase_id,
-                dialog_id,
-                exc,
-            )
-            raise
-
-    def _validate_identifier(self, value: Any, entity: str) -> str:
-        """Проверяет, что значение можно использовать в имени Lua-функции.
-
-        Args:
-            value (Any):
-                Проверяемый идентификатор.
-            entity (str):
-                Название сущности для сообщения об ошибке.
-
-        Returns:
-            str: Исходный идентификатор после успешной проверки.
-
-        Raises:
-            ValueError:
-                Если значение пустое, не является строкой или содержит
-                недопустимые для Lua-идентификатора символы.
-        """
-        try:
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(
-                    f"Идентификатор {entity} должен быть непустой строкой, "
-                    f"а получен {value!r}."
-                )
-
-            if not _IDENTIFIER_PATTERN.match(value):
-                raise ValueError(
-                    f"Идентификатор {entity} '{value}' должен содержать "
-                    "только латиницу, цифры и символ подчёркивания и не "
-                    "начинаться с цифры."
-                )
-
-            return value
-        except Exception as exc:
-            logger.error(
-                "Некорректный идентификатор %s %r: %s",
-                entity,
-                value,
-                exc,
-            )
-            raise
-
-    def _require_mapping(self, value: Any, owner: str) -> Mapping[Any, Any]:
-        """Проверяет, что значение является словарём.
-
-        Args:
-            value (Any):
-                Проверяемое значение.
-            owner (str):
-                Название поля для сообщения об ошибке.
-
-        Returns:
-            Mapping[Any, Any]: Исходный словарь после проверки.
-
-        Raises:
-            TypeError:
-                Если значение не является ``Mapping``.
-        """
-        try:
-            if not isinstance(value, Mapping):
-                raise TypeError(
-                    f"Поле {owner} должно быть словарём, а получен "
-                    f"{type(value).__name__}."
-                )
-            return value
-        except Exception as exc:
-            logger.error("Ошибка поля %s: %s", owner, exc)
-            raise
-
-    def _require_list(self, value: Any, owner: str) -> list[Any]:
-        """Проверяет, что значение является списком.
-
-        Args:
-            value (Any):
-                Проверяемое значение.
-            owner (str):
-                Название поля для сообщения об ошибке.
-
-        Returns:
-            list[Any]: Исходный список после проверки.
-
-        Raises:
-            TypeError:
-                Если значение не является списком.
-        """
-        try:
-            if not isinstance(value, list):
-                raise TypeError(
-                    f"Поле {owner} должно быть списком, а получен "
-                    f"{type(value).__name__}."
-                )
-            return value
-        except Exception as exc:
-            logger.error("Ошибка поля %s: %s", owner, exc)
-            raise
-
-    def _require_text(self, value: Any, owner: str) -> str:
-        """Проверяет, что значение является строкой.
-
-        Args:
-            value (Any):
-                Проверяемое значение.
-            owner (str):
-                Название поля для сообщения об ошибке.
-
-        Returns:
-            str: Исходная строка после проверки.
-
-        Raises:
-            TypeError:
-                Если значение не является строкой.
-        """
-        try:
-            if not isinstance(value, str):
-                raise TypeError(
-                    f"Поле {owner} должно быть строкой, а получен "
-                    f"{type(value).__name__}."
-                )
-            return value
-        except Exception as exc:
-            logger.error("Ошибка поля %s: %s", owner, exc)
-            raise
-
-    def _lua_string(self, value: Any) -> str:
-        """Экранирует Python-строку для использования в Lua-литерале.
-
-        Args:
-            value (Any):
-                Значение, которое нужно превратить в строковый литерал.
-
-        Returns:
-            str: Lua-литерал в двойных кавычках с экранированными символами.
-
-        Raises:
-            TypeError:
-                Если значение не является строкой.
-        """
-        try:
-            self._require_text(value, "Lua-строки")
-            escaped = (
-                value.replace("\\", "\\\\")
-                .replace('"', '\\"')
-                .replace("\r", "\\r")
-                .replace("\n", "\\n")
-                .replace("\t", "\\t")
-            )
-            return f'"{escaped}"'
-        except Exception as exc:
-            logger.error("Не удалось сформировать Lua-строку: %s", exc)
-            raise
-
-    def _sanitize_comment(self, text: str) -> str:
-        """Очищает текст для безопасного Lua-комментария.
-
-        Args:
-            text (str):
-                Произвольный текст исключения или пояснения.
-
-        Returns:
-            str: Однострочный текст без переводов строк и ``--``.
-
-        Raises:
-            TypeError:
-                Если ``text`` не является строкой.
-        """
-        try:
-            self._require_text(text, "текста комментария")
-            sanitized = " ".join(text.split())
-            return sanitized.replace("--", "- -")
-        except Exception as exc:
-            logger.error("Не удалось подготовить Lua-комментарий: %s", exc)
-            raise
+            lines.append(f"{pad}}}")
+            return "\n".join(lines)
+        raise TypeError(f"Не удалось сериализовать в Lua: {type(value).__name__}")
+
+
+def _is_lua_identifier(value: str) -> bool:
+    """Проверяет, является ли строка допустимым Lua-идентификатором.
+
+    Args:
+        value (str): Проверяемая строка.
+
+    Returns:
+        bool: ``True``, если строка начинается с буквы/``_`` и содержит только
+            буквы, цифры и ``_``, а также не является зарезервированным словом.
+    """
+    if not value or value in _LUA_RESERVED:
+        return False
+    if not (value[0].isalpha() or value[0] == "_"):
+        return False
+    return all(char.isalnum() or char == "_" for char in value)
 
 
 __all__ = ["LuaGenerator"]

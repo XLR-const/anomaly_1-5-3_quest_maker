@@ -1,13 +1,16 @@
-"""Автоматические тесты генератора XML-строк и диалогов мода.
+"""Тесты XML-генератора диалогов и таблиц локализации.
 
-Запуск из корня проекта::
+Проверяются требования ``standart_of_auto.md`` (2.1):
 
-    python -m unittest tests.test_compiler_xml -v
-    python -m unittest discover -s tests -v
+* корень ``<game_dialogs>`` и обязательный ``<phrase_list>`` у каждого
+  диалога;
+* переходы только парными ``<next>ID</next>``;
+* условия/эффекты только как ``dialogs.<flat_function>``;
+* идентификатор диалога берётся из модели, а не из ключа словаря.
 
-Тесты проверяют раскладку русских и английских текстов по отдельным
-string-таблицам, структуру файла диалогов и отказоустойчивость генератора
-при повреждённом диалоге.
+Запуск::
+
+    .\\venv\\Scripts\\python.exe -m unittest tests.test_compiler_xml -v
 """
 
 from __future__ import annotations
@@ -23,265 +26,343 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.compiler.xml_gen import XmlGenerator  # noqa: E402
 from src.core.models import (  # noqa: E402
+    CompleteTask,
     Dialog,
+    DontHasInfo,
     GiveInfo,
+    GiveItem,
+    GiveTask,
     HasInfo,
+    HasItem,
     ModProject,
     Phrase,
     Quest,
     Stage,
 )
 
-QUEST_ID = "mymod_test_quest"
-DIALOG_ID = "mymod_test_dialog"
-BROKEN_DIALOG_ID = "mymod_broken_dialog"
-XML_LOGGER_NAME = "aqb.compiler.xml_gen"
-XML_DECLARATION = '<?xml version="1.0" encoding="windows-1251"?>'
-
-QUEST_TITLE_RU = "Квест & <тайна>"
-QUEST_TITLE_EN = "Quest & <mystery>"
-QUEST_DESCR_RU = "Описание квеста"
-QUEST_DESCR_EN = "Quest description"
-STAGE_TITLE_RU = "Первый этап"
-STAGE_TITLE_EN = "First stage"
-STAGE_DESCR_RU = "Описание первого этапа"
-STAGE_DESCR_EN = "First stage description"
-PHRASE_0_RU = "Здравствуй, сталкер!"
-PHRASE_0_EN = "Hello, stalker!"
-PHRASE_1_RU = "До встречи."
-PHRASE_1_EN = "See you."
-
-
-def _make_quest() -> Quest:
-    """Создаёт валидный квест с одним этапом для тестов XML-строк.
-
-    Returns:
-        Quest: Квест с названием, описанием и этапом ``id=0``.
-    """
-    return Quest(
-        id=QUEST_ID,
-        title_ru=QUEST_TITLE_RU,
-        title_en=QUEST_TITLE_EN,
-        descr_ru=QUEST_DESCR_RU,
-        descr_en=QUEST_DESCR_EN,
-        stages={
-            0: Stage(
-                id=0,
-                title_ru=STAGE_TITLE_RU,
-                title_en=STAGE_TITLE_EN,
-                descr_ru=STAGE_DESCR_RU,
-                descr_en=STAGE_DESCR_EN,
-                target_alias="esc.test_target",
-            )
-        },
-    )
-
-
-def _make_dialog() -> Dialog:
-    """Создаёт валидный диалог с переходами, условием и действием.
-
-    Returns:
-        Dialog: Диалог из двух реплик; стартовая реплика содержит переход,
-        предусловие и действие.
-    """
-    return Dialog(
-        id=DIALOG_ID,
-        npc_alias="esc.mayor_zhurov",
-        phrases={
-            0: Phrase(
-                id=0,
-                text_ru=PHRASE_0_RU,
-                text_en=PHRASE_0_EN,
-                next_phrases=[1],
-                preconditions=[HasInfo(info="mymod_test_info")],
-                actions=[GiveInfo(info="mymod_test_reward_info")],
-            ),
-            1: Phrase(
-                id=1,
-                text_ru=PHRASE_1_RU,
-                text_en=PHRASE_1_EN,
-            ),
-        },
-    )
+QUEST_ID = "mymod_xml_quest"
+DIALOG_ID = "mymod_xml_dialog_take"
+DICT_KEY = "different_dict_key"
 
 
 def _make_project() -> ModProject:
-    """Создаёт проект мода с одним квестом и одним диалогом.
+    """Создаёт проект с квестом и диалогом для XML-тестов.
 
     Returns:
-        ModProject: Валидный проект для проверки строковых таблиц.
+        ModProject: Проект с проверочными текстами и условиями.
     """
+    quest = Quest(
+        id=QUEST_ID,
+        title_ru="Квест & проверка",
+        title_en="Quest & check",
+        descr_ru="Описание <квеста>",
+        descr_en="Quest <description>",
+        stages={
+            0: Stage(
+                id=0,
+                title_ru="Этап 0",
+                title_en="Stage 0",
+                descr_ru="Описание этапа 0",
+                descr_en="Stage 0 description",
+            ),
+            1: Stage(
+                id=1,
+                title_ru="Этап 1",
+                title_en="Stage 1",
+                descr_ru="Описание этапа 1",
+                descr_en="Stage 1 description",
+            ),
+        },
+    )
+    dialog = Dialog(
+        id=DIALOG_ID,
+        npc_id="esc_mayor",
+        npc_location="escape",
+        task_id=QUEST_ID,
+        role="take",
+        preconditions=[
+            HasInfo(info="mymod_available"),
+            DontHasInfo(info="mymod_blocked"),
+            HasItem(item_alias="mymod_item"),
+        ],
+        phrases={
+            0: Phrase(
+                id=0,
+                text_ru="Здравствуй, сталкер!",
+                text_en="Hello, stalker!",
+                next_phrases=[1],
+                preconditions=[HasInfo(info="mymod_met")],
+                actions=[GiveInfo(info="mymod_talked")],
+            ),
+            1: Phrase(
+                id=1,
+                text_ru="Возьму работу.",
+                text_en="I will take the job.",
+                preconditions=[HasItem(item_alias="mymod_item")],
+                actions=[
+                    GiveTask(task_id=QUEST_ID),
+                    GiveItem(item_alias="mymod_reward", count=1),
+                ],
+            ),
+            2: Phrase(
+                id=2,
+                text_ru="Готово.",
+                text_en="Done.",
+                actions=[CompleteTask(task_id=QUEST_ID)],
+            ),
+        },
+    )
     return ModProject(
-        name="mymod_test",
-        quests={QUEST_ID: _make_quest()},
-        dialogs={DIALOG_ID: _make_dialog()},
+        name="XML Test",
+        quests={QUEST_ID: quest},
+        dialogs={DICT_KEY: dialog},
     )
 
 
-def _find_phrase_by_id(dialog: ET.Element, phrase_id: str) -> ET.Element:
-    """Находит XML-элемент фразы по атрибуту ``id``.
+def _find_dialog(root: ET.Element, dialog_id: str) -> ET.Element:
+    """Находит ``<dialog id="...">`` в дереве.
 
     Args:
-        dialog (ET.Element):
-            Корневой элемент диалога.
-        phrase_id (str):
-            Искомый идентификатор фразы.
+        root (ET.Element): Корень ``<game_dialogs>``.
+        dialog_id (str): Искомый id.
 
     Returns:
-        ET.Element: Найденный элемент ``<phrase>``.
+        ET.Element: Найденный элемент.
 
     Raises:
-        AssertionError:
-            Если фраза с указанным идентификатором отсутствует.
+        AssertionError: Если диалог отсутствует.
     """
-    for phrase in dialog.findall("phrase"):
+    for element in root.findall("dialog"):
+        if element.get("id") == dialog_id:
+            return element
+    raise AssertionError(f"Диалог id='{dialog_id}' не найден.")
+
+
+def _find_phrase(dialog: ET.Element, phrase_id: str) -> ET.Element:
+    """Находит ``<phrase id="...">`` внутри ``<phrase_list>``.
+
+    Args:
+        dialog (ET.Element): Элемент диалога.
+        phrase_id (str): Искомый id реплики.
+
+    Returns:
+        ET.Element: Найденная реплика.
+
+    Raises:
+        AssertionError: Если ``<phrase_list>`` или реплика отсутствуют.
+    """
+    phrase_list = dialog.find("phrase_list")
+    if phrase_list is None:
+        raise AssertionError("У диалога нет обязательного <phrase_list>.")
+    for phrase in phrase_list.findall("phrase"):
         if phrase.get("id") == phrase_id:
             return phrase
-    raise AssertionError(f"Фраза с id='{phrase_id}' не найдена.")
+    raise AssertionError(f"Реплика id='{phrase_id}' не найдена.")
+
+
+class TestXmlGeneratorDialogs(unittest.TestCase):
+    """Проверка структуры ``dialogs_<mod>.xml``."""
+
+    def setUp(self) -> None:
+        """Готовит проект и XML-дерево перед каждым тестом."""
+        self.project = _make_project()
+        self.generator = XmlGenerator()
+        self.xml = self.generator.generate_dialogs_xml(self.project.dialogs)
+        self.root = ET.fromstring(self.xml)
+
+    def test_root_and_dialog_id_from_model(self) -> None:
+        """Корень ``game_dialogs``, id берётся из модели, не из ключа."""
+        self.assertEqual(self.root.tag, "game_dialogs")
+        dialog = _find_dialog(self.root, DIALOG_ID)
+        self.assertEqual(dialog.get("id"), DIALOG_ID)
+        self.assertIsNone(
+            self.root.find(f"./dialog[@id='{DICT_KEY}']")
+        )
+
+    def test_every_dialog_contains_phrase_list(self) -> None:
+        """У каждого ``<dialog>`` есть непустой ``<phrase_list>``."""
+        for dialog in self.root.findall("dialog"):
+            phrase_list = dialog.find("phrase_list")
+            self.assertIsNotNone(phrase_list)
+            self.assertGreater(len(phrase_list.findall("phrase")), 0)
+
+    def test_next_tags_are_paired_and_integer(self) -> None:
+        """Переходы записаны только как парные ``<next>ID</next>``."""
+        phrase = _find_phrase(
+            _find_dialog(self.root, DIALOG_ID), "0"
+        )
+        next_tags = phrase.findall("next")
+        self.assertEqual([tag.text for tag in next_tags], ["1"])
+        self.assertTrue(all(tag.attrib == {} for tag in next_tags))
+
+    def test_dialog_level_infos_and_flat_precondition(self) -> None:
+        """Info-условия остаются тегами, остальные уходят в ``can_take``."""
+        dialog = _find_dialog(self.root, DIALOG_ID)
+        self.assertEqual(
+            dialog.findtext("has_info"), "mymod_available"
+        )
+        self.assertEqual(
+            dialog.findtext("dont_has_info"), "mymod_blocked"
+        )
+        self.assertEqual(
+            dialog.findtext("precondition"),
+            f"dialogs.{DIALOG_ID}_can_take",
+        )
+        self.assertNotIn("mymod_quests", self.xml)
+
+    def test_phrase_preconditions_and_actions(self) -> None:
+        """Условия и эффекты фраз — только ``dialogs.<fn>``."""
+        dialog = _find_dialog(self.root, DIALOG_ID)
+        phrase_0 = _find_phrase(dialog, "0")
+        phrase_1 = _find_phrase(dialog, "1")
+
+        self.assertEqual(phrase_0.findtext("has_info"), "mymod_met")
+        self.assertEqual(phrase_0.findtext("give_info"), "mymod_talked")
+
+        actions_1 = [
+            tag.text for tag in phrase_1.findall("action")
+        ]
+        self.assertEqual(
+            actions_1,
+            [
+                f"dialogs.{DIALOG_ID}_accept",
+                f"dialogs.{DIALOG_ID}_phrase_1_action",
+            ],
+        )
+        self.assertEqual(
+            phrase_1.findtext("precondition"),
+            f"dialogs.{DIALOG_ID}_phrase_1_precondition",
+        )
+
+    def test_complete_task_uses_turn_in_effect(self) -> None:
+        """``CompleteTask`` превращается в ``dialogs.<id>_turn_in``."""
+        phrase_2 = _find_phrase(
+            _find_dialog(self.root, DIALOG_ID), "2"
+        )
+        self.assertEqual(
+            [tag.text for tag in phrase_2.findall("action")],
+            [f"dialogs.{DIALOG_ID}_turn_in"],
+        )
+
+    def test_every_action_and_precondition_has_dialogs_prefix(self) -> None:
+        """Любой функциональный тег имеет префикс ``dialogs.``."""
+        for dialog in self.root.findall("dialog"):
+            for tag_name in ("precondition",):
+                for tag in dialog.findall(tag_name):
+                    self.assertTrue(
+                        (tag.text or "").startswith("dialogs."),
+                        tag.text,
+                    )
+            for phrase in dialog.findall("./phrase_list/phrase"):
+                for tag in phrase.findall("precondition"):
+                    self.assertTrue(
+                        (tag.text or "").startswith("dialogs."),
+                        tag.text,
+                    )
+                for tag in phrase.findall("action"):
+                    self.assertTrue(
+                        (tag.text or "").startswith("dialogs."),
+                        tag.text,
+                    )
+
+    def test_invalid_dialog_is_skipped(self) -> None:
+        """Повреждённый диалог логируется и не ломает остальные."""
+        broken = Dialog.model_construct(
+            id="mymod_broken",
+            dialog_id="mymod_broken",
+            phrases=None,
+        )
+        dialogs = dict(self.project.dialogs)
+        dialogs["broken"] = broken
+
+        with self.assertLogs(
+            "aqb.compiler.xml_gen", level="ERROR"
+        ):
+            xml = self.generator.generate_dialogs_xml(dialogs)
+
+        self.assertIn(f'id="{DIALOG_ID}"', xml)
+        self.assertNotIn('id="mymod_broken"', xml)
+
+    def test_rejects_non_dict_dialogs(self) -> None:
+        """Неверный тип карты диалогов даёт ``TypeError``."""
+        with self.assertRaises(TypeError):
+            self.generator.generate_dialogs_xml([])  # type: ignore[arg-type]
 
 
 class TestXmlGeneratorStringTables(unittest.TestCase):
-    """Проверка раскладки локализации по русской и английской таблицам."""
+    """Проверка ``st_<mod>.xml`` для русского и английского языков."""
 
     def setUp(self) -> None:
-        """Создаёт генератор XML перед каждым тестом."""
-        self.generator = XmlGenerator()
+        """Готовит таблицы строк для одного проекта."""
+        self.project = _make_project()
+        self.tables = XmlGenerator().generate_string_tables(self.project)
 
-    def test_generate_string_tables_splits_ru_and_en_texts(self) -> None:
-        """Русские и английские тексты попадают в разные XML-документы."""
-        tables = self.generator.generate_string_tables(_make_project())
+    def _string_map(self, language: str) -> dict[str, str]:
+        """Возвращает ``id -> text`` для выбранного языка.
 
-        self.assertEqual(set(tables), {"rus", "eng"})
-        self.assertTrue(tables["rus"].startswith(f"{XML_DECLARATION}\n<string_table>\n"))
-        self.assertTrue(tables["eng"].startswith(f"{XML_DECLARATION}\n<string_table>\n"))
-        self.assertTrue(tables["rus"].endswith("</string_table>"))
-        self.assertTrue(tables["eng"].endswith("</string_table>"))
+        Args:
+            language (str): ``"rus"`` или ``"eng"``.
 
-        expected_ids = {
+        Returns:
+            dict[str, str]: Карта строк.
+        """
+        root = ET.fromstring(self.tables[language])
+        return {
+            element.get("id", ""): element.findtext("text", "")
+            for element in root.findall("string")
+        }
+
+    def test_contains_all_quest_and_phrase_strings(self) -> None:
+        """Таблицы содержат заголовки, описания, этапы и реплики."""
+        expected = {
             f"{QUEST_ID}_title",
             f"{QUEST_ID}_descr",
             f"{QUEST_ID}_stage_0_title",
             f"{QUEST_ID}_stage_0_descr",
+            f"{QUEST_ID}_stage_0_msg",
+            f"{QUEST_ID}_stage_1_title",
+            f"{QUEST_ID}_stage_1_descr",
+            f"{QUEST_ID}_stage_1_msg",
             f"{DIALOG_ID}_phrase_0_text",
             f"{DIALOG_ID}_phrase_1_text",
+            f"{DIALOG_ID}_phrase_2_text",
         }
+        self.assertEqual(set(self._string_map("rus")), expected)
+        self.assertEqual(set(self._string_map("eng")), expected)
 
-        rus_root = ET.fromstring(tables["rus"].encode("windows-1251"))
-        eng_root = ET.fromstring(tables["eng"].encode("windows-1251"))
+    def test_russian_and_english_texts_are_separated(self) -> None:
+        """Русский текст попадает только в ``rus``, английский — в ``eng``."""
+        rus = self._string_map("rus")
+        eng = self._string_map("eng")
 
-        self.assertEqual(rus_root.tag, "string_table")
-        self.assertEqual(eng_root.tag, "string_table")
-
-        rus_texts = {
-            element.get("id"): element.findtext("text")
-            for element in rus_root.findall("string")
-        }
-        eng_texts = {
-            element.get("id"): element.findtext("text")
-            for element in eng_root.findall("string")
-        }
-
-        self.assertEqual(set(rus_texts), expected_ids)
-        self.assertEqual(set(eng_texts), expected_ids)
-
-        self.assertEqual(rus_texts[f"{QUEST_ID}_title"], QUEST_TITLE_RU)
-        self.assertEqual(eng_texts[f"{QUEST_ID}_title"], QUEST_TITLE_EN)
-        self.assertEqual(rus_texts[f"{QUEST_ID}_descr"], QUEST_DESCR_RU)
-        self.assertEqual(eng_texts[f"{QUEST_ID}_descr"], QUEST_DESCR_EN)
-        self.assertEqual(rus_texts[f"{QUEST_ID}_stage_0_title"], STAGE_TITLE_RU)
-        self.assertEqual(eng_texts[f"{QUEST_ID}_stage_0_title"], STAGE_TITLE_EN)
-        self.assertEqual(rus_texts[f"{QUEST_ID}_stage_0_descr"], STAGE_DESCR_RU)
-        self.assertEqual(eng_texts[f"{QUEST_ID}_stage_0_descr"], STAGE_DESCR_EN)
-        self.assertEqual(rus_texts[f"{DIALOG_ID}_phrase_0_text"], PHRASE_0_RU)
-        self.assertEqual(eng_texts[f"{DIALOG_ID}_phrase_0_text"], PHRASE_0_EN)
-        self.assertEqual(rus_texts[f"{DIALOG_ID}_phrase_1_text"], PHRASE_1_RU)
-        self.assertEqual(eng_texts[f"{DIALOG_ID}_phrase_1_text"], PHRASE_1_EN)
-
-        self.assertNotIn(PHRASE_0_EN, tables["rus"])
-        self.assertNotIn(PHRASE_0_RU, tables["eng"])
-        self.assertIn("&amp;", tables["rus"])
-        self.assertIn("&lt;", tables["rus"])
-        self.assertIn("&amp;", tables["eng"])
-        self.assertIn("&lt;", tables["eng"])
-
-
-class TestXmlGeneratorDialogs(unittest.TestCase):
-    """Проверка структуры и отказоустойчивости файла диалогов."""
-
-    def setUp(self) -> None:
-        """Создаёт генератор XML перед каждым тестом."""
-        self.generator = XmlGenerator()
-
-    def test_generate_dialogs_xml_builds_valid_structure(self) -> None:
-        """Валидный диалог содержит переходы, условие и действие."""
-        content = self.generator.generate_dialogs_xml(
-            {DIALOG_ID: _make_dialog()}
-        )
-
-        self.assertTrue(content.startswith(f"{XML_DECLARATION}\n<game_dialogs>"))
-        self.assertTrue(content.endswith("</game_dialogs>"))
-
-        root = ET.fromstring(content.encode("windows-1251"))
-        self.assertEqual(root.tag, "game_dialogs")
-
-        dialogs = root.findall("dialog")
-        self.assertEqual(len(dialogs), 1)
-        self.assertEqual(dialogs[0].get("id"), DIALOG_ID)
-
-        phrase_0 = _find_phrase_by_id(dialogs[0], "0")
+        self.assertEqual(rus[f"{QUEST_ID}_title"], "Квест & проверка")
+        self.assertEqual(eng[f"{QUEST_ID}_title"], "Quest & check")
         self.assertEqual(
-            phrase_0.findtext("text"),
-            f"{DIALOG_ID}_phrase_0_text",
+            rus[f"{DIALOG_ID}_phrase_0_text"],
+            "Здравствуй, сталкер!",
         )
         self.assertEqual(
-            [next_tag.get("id") for next_tag in phrase_0.findall("next")],
-            ["1"],
-        )
-        self.assertEqual(
-            phrase_0.findtext("precondition"),
-            f"mymod_quests.{DIALOG_ID}_phrase_0_precondition",
-        )
-        self.assertEqual(
-            phrase_0.findtext("action"),
-            f"mymod_quests.{DIALOG_ID}_phrase_0_action",
+            eng[f"{DIALOG_ID}_phrase_0_text"],
+            "Hello, stalker!",
         )
 
-        phrase_1 = _find_phrase_by_id(dialogs[0], "1")
-        self.assertEqual(
-            phrase_1.findtext("text"),
-            f"{DIALOG_ID}_phrase_1_text",
-        )
-        self.assertEqual(phrase_1.findall("next"), [])
-        self.assertIsNone(phrase_1.find("precondition"))
-        self.assertIsNone(phrase_1.find("action"))
-
-    def test_generate_dialogs_xml_skips_broken_dialog(self) -> None:
-        """Повреждённый диалог логируется и пропускается без падения."""
-        broken_dialog = Dialog.model_construct(
-            id=BROKEN_DIALOG_ID,
-            npc_alias="esc.broken_npc",
-            preconditions=[],
-            phrases="повреждённая структура вместо карты фраз",
-        )
-
-        with self.assertLogs(XML_LOGGER_NAME, level="ERROR") as captured:
-            content = self.generator.generate_dialogs_xml(
-                {
-                    DIALOG_ID: _make_dialog(),
-                    BROKEN_DIALOG_ID: broken_dialog,
-                }
-            )
-
-        root = ET.fromstring(content.encode("windows-1251"))
-        dialog_ids = [element.get("id") for element in root.findall("dialog")]
-
-        self.assertIn(DIALOG_ID, dialog_ids)
-        self.assertNotIn(BROKEN_DIALOG_ID, dialog_ids)
-        self.assertEqual(content.count("<game_dialogs>"), 1)
-        self.assertEqual(content.count("</game_dialogs>"), 1)
+    def test_xml_is_escaped_and_declares_cp1251(self) -> None:
+        """Спецсимволы экранируются, декларация — windows-1251."""
+        xml = self.tables["rus"]
         self.assertTrue(
-            any(BROKEN_DIALOG_ID in message for message in captured.output),
-            "В лог должно попасть сообщение о пропущенном диалоге.",
+            xml.startswith(
+                '<?xml version="1.0" encoding="windows-1251"?>'
+            )
+        )
+        self.assertIn("Квест &amp; проверка", xml)
+        self.assertIn("Описание &lt;квеста&gt;", xml)
+        self.assertNotIn("Квест & проверка", xml)
+
+    def test_generator_does_not_render_character_desc(self) -> None:
+        """Генератор не создаёт ``character_desc_<mod>.xml``."""
+        generator = XmlGenerator()
+        self.assertFalse(
+            hasattr(generator, "generate_character_desc_xml")
         )
 
 
