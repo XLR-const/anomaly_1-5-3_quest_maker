@@ -1,177 +1,116 @@
-"""Сквозной сценарий: кампания против наёмников на Болоте."""
+# build_deadcity_test.py
+"""Сценарий автоматической сборки тестового квеста наемников в Мёртвом городе.
+
+Скрипт формирует Pydantic-модель ModProject, передает расширенные метаданные
+локации и профилей Душмана и запускает ModBuilder для компиляции оверлея gamedata
+строго по стандартам `standart_of_auto.md` и лекалам эталона «M».
+"""
+
+from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-# ВАЖНО: sys.path ДО всех импортов из src.*
+# Гарантируем, что корень проекта находится в sys.path для импорта модулей src
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.compiler.builder import ModBuilder, _slugify
-from src.core.models import (
-    CompleteTask,
-    Dialog,
-    DontHasInfo,
-    GiveTask,
-    HasInfo,
-    ModProject,
-    Phrase,
-    Quest,
-    Stage,
-    WarfareCapture,
-)
-from src.core.validator import ProjectValidator
-from src.db.repository import GameDatabase
+from src.compiler.builder import ModBuilder
+from src.core.models import Dialog, ModProject, Phrase, Quest, Stage
 
-PROJECT_NAME = "Merc Hunt Campaign"
-QUEST_ID = "mymod_merc_hunt"
-ZHUROV_ID = "esc_3_16_military_trader"
-ZHUROV_ALIAS = "esc.mayor_zhurov"
+# Константы идентификаторов для Мёртвого города по базе игры
+PROJECT_NAME = "Dead City Merc Test"
+# Было: DUSHMAN_CHARACTER_ID = "cit_killers_merc_trader"
+# Меняем на ОФИЦИАЛЬНЫЙ XML ID Душмана:
+DUSHMAN_CHARACTER_ID = "cit_killers_merc_trader_stalker"
 
-TAKEN_INFO = "mymod_merc_taken"
-DONE_INFO = "mymod_merc_done"
+DIALOG_ID = "mymod_dushman_test_dialog"
+QUEST_ID = "mymod_dushman_test_quest"
 
 
-def build_project() -> ModProject:
-    quest = Quest(
+def _build_test_quest() -> Quest:
+    """Формирует модель тестового квеста Синдиката в Мёртвом городе."""
+    return Quest(
         id=QUEST_ID,
-        npc_id=ZHUROV_ID,
-        giver_npc_id=ZHUROV_ID,
-        npc_location="escape",
-        dialog_id="mymod_merc_hunt_take",
-        dialog_ids=["mymod_merc_hunt_turnin"],
-        title_ru="Охота на наёмников",
-        title_en="Merc Hunt",
-        descr_ru="Зачистите базу на Болоте.",
-        descr_en="Clear the Swamps base.",
-        taken_info=TAKEN_INFO,
-        complete_info=DONE_INFO,
-        reward_money=25000,
-        reward_item_alias="weapon.vssk_vykhlop",
-        return_to_giver_stage=1,
+        title_ru="Тестовый контракт Душмана",
+        title_en="Test Dushman Contract",
+        descr_ru="Проверка стабильности No-Code конвейера автоматизации в Мёртвом городе.",
+        descr_en="Testing No-Code automation pipeline stability in Dead City.",
+        is_storyline=False,
         stages={
             0: Stage(
                 id=0,
-                title_ru="Зачистить",
-                title_en="Clear",
-                descr_ru="Убейте наёмников на Болоте.",
-                descr_en="Kill mercs in the Swamps.",
-                target_alias="marsh.hidden_merc_base",
-                warfare_capture=WarfareCapture(
-                    smart_alias="marsh.hidden_merc_base",
-                    enemy_squad_alias="merc_sim_squad_advanced",
-                    ally_squad_alias="army_sim_squad_advanced",
-                    ally_count=1,
-                ),
-            ),
-            1: Stage(
-                id=1,
-                title_ru="Вернуться к Журову",
-                title_en="Return to Zhurov",
-                descr_ru="Вернитесь к майору на Южный блокпост.",
-                descr_en="Return to the Major at the Southern checkpoint.",
-                target_alias=ZHUROV_ALIAS,
+                title_ru="Поговорить с Душманом",
+                title_en="Talk to Dushman",
+                descr_ru="Убедитесь, что диалоговое No-Code дерево и скрипты слинковались без вылетов.",
+                descr_en="Make sure the dialogue No-Code tree and scripts linked without crashes.",
+                target_alias=DUSHMAN_CHARACTER_ID,
             ),
         },
+        # Передача метаданных в extra-поля для компилятора и патчера character_desc
+        npc_id=DUSHMAN_CHARACTER_ID,
+        npc_location="deadcity",
+        dialog_id=DIALOG_ID,
     )
 
-    dlg_take = Dialog(
-        id="mymod_merc_hunt_take",
-        npc_alias=ZHUROV_ALIAS,
-        npc_id=ZHUROV_ID,
-        npc_location="escape",
-        task_id=QUEST_ID,
-        role="take",
-        preconditions=[
-            DontHasInfo(info=TAKEN_INFO),
-            DontHasInfo(info=DONE_INFO),
-        ],
+
+def _build_dushman_dialog() -> Dialog:
+    """Строит полный граф диалога Душмана с соблюдением phrase_list и парных next."""
+    return Dialog(
+        id=DIALOG_ID,
+        npc_alias=DUSHMAN_CHARACTER_ID,
+        npc_location="deadcity",  # Локация для нормализации в character_desc_deadcity.xml
         phrases={
             0: Phrase(
                 id=0,
-                text_ru="Есть работа, майор?",
-                text_en="Got any work, Major?",
+                text_ru="Душман, Синдикат готов запустить тестовый конвейер квестов?",
+                text_en="Dushman, is the Syndicate ready to launch the test quest pipeline?",
                 next_phrases=[1],
+                preconditions=[],
+                actions=[],
             ),
             1: Phrase(
                 id=1,
-                text_ru="На Болоте наёмники обосновались. Возьмёшься?",
-                text_en="Mercs have set up in the Swamps. Will you take it?",
-                next_phrases=[2, 4],
+                text_ru="Да, наёмник. Раз ты видишь этот текст, значит XML-граф, string-таблицы и Lua слинковались идеально.",
+                text_en="Yes, mercenary. If you see this text, the XML graph, string tables, and Lua linked perfectly.",
+                next_phrases=[2],
+                preconditions=[],
+                actions=[],
             ),
             2: Phrase(
                 id=2,
-                text_ru="Возьму. Выдвигаюсь.",
-                text_en="I'll take it. Moving out.",
-                actions=[GiveTask(task_id=QUEST_ID)],
-            ),
-            4: Phrase(
-                id=4,
-                text_ru="Не сейчас, майор.",
-                text_en="Not now, Major.",
+                text_ru="Отлично. Конвейер запущен, переходим к графическому интерфейсу!",
+                text_en="Excellent. The pipeline is live, moving on to the graphical interface!",
+                next_phrases=[],
+                preconditions=[],
+                actions=[],
             ),
         },
     )
 
-    dlg_turnin = Dialog(
-        id="mymod_merc_hunt_turnin",
-        npc_alias=ZHUROV_ALIAS,
-        npc_id=ZHUROV_ID,
-        npc_location="escape",
-        task_id=QUEST_ID,
-        role="turnin",
-        preconditions=[
-            HasInfo(info=TAKEN_INFO),
-            DontHasInfo(info=DONE_INFO),
-        ],
-        phrases={
-            0: Phrase(
-                id=0,
-                text_ru="Наёмники на Болоте уничтожены, майор.",
-                text_en="The mercs in the Swamps are destroyed, Major.",
-                next_phrases=[1],
-            ),
-            1: Phrase(
-                id=1,
-                text_ru="Отличная работа. Вот награда.",
-                text_en="Excellent work. Here is your reward.",
-                actions=[CompleteTask(task_id=QUEST_ID)],
-            ),
-        },
-    )
 
-    return ModProject(
+def main() -> int:
+    """Запускает процесс компиляции проекта оверлея gamedata."""
+    print("[Компиляция] Сборка проекта: " + PROJECT_NAME)
+    
+    project = ModProject(
         name=PROJECT_NAME,
-        quests={quest.id: quest},
-        dialogs={
-            dlg_take.id: dlg_take,
-            dlg_turnin.id: dlg_turnin,
-        },
+        quests={QUEST_ID: _build_test_quest()},
+        dialogs={DIALOG_ID: _build_dushman_dialog()},
     )
-
-
-def main() -> None:
-    project = build_project()
-    db_path = PROJECT_ROOT / "data" / "anomaly_db.sqlite"
-
-    with GameDatabase(db_path) as db:
-        if not ProjectValidator(db).validate_project(project):
-            raise SystemExit("Ошибка валидации проекта.")
-        builder = ModBuilder(
-            output_dir=PROJECT_ROOT / "output",
-            db_client=db,
-        )
-        if not builder.build_project(project):
-            raise SystemExit("Ошибка сборки мода.")
-
-    out_dir = builder.output_dir / _slugify(project.name)
-    print(f"\nМод собран: {out_dir.resolve()}")
-    print("\nУстановка:")
-    print("1. Скопировать gamedata в игру.")
-    print("2. system.ltx и character_desc_escape.xml уже пропатчены в сборке.")
-    print("3. Новая игра. Поговорить с майором Журовым.")
+    
+    # Инициализируем МодБилдер, передавая выходную директорию
+    builder = ModBuilder(output_dir=Path("output"))
+    
+    # Запускаем компиляцию. Возвращаем 0 при успехе, 1 при ошибке.
+    success = builder.build_project(project)
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(f"[Критическая ошибка]: {e}", file=sys.stderr)
+        sys.exit(1)
