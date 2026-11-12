@@ -28,11 +28,14 @@ from src.core.models import (
     GiveTask,
     HasInfo,
     HasItem,
+    HasMoney,
     RemoveInfo,
     RemoveItem,
     SetTarget,
     SmartOwner,
     SpawnSquad,
+    TakeItem,
+    TakeMoney,
 )
 from src.logger import get_logger
 
@@ -144,6 +147,115 @@ local function squad_alive(id)
 	if not squad then return false end
 	local ok, count = pcall(function() return squad:npc_count() end)
 	return ok and (count or 0) > 0
+end
+
+-- Counts items of one section in the actor inventory (stack-aware).
+local function actor_item_count(section, actor)
+	local obj = actor or db.actor
+	if not (obj and section and section ~= "") then return 0 end
+	local ok, total = pcall(function()
+		local sum = 0
+		obj:iterate_inventory(function(owner, item)
+			if item and item:section() == section then
+				local count = 1
+				local counted, value = pcall(function() return item:count() end)
+				if counted and value then count = value end
+				sum = sum + count
+			end
+		end, nil)
+		return sum
+	end)
+	if ok and total then return total end
+	return obj:object(section) and 1 or 0
+end
+
+-- Returns the number of live NPCs in a squad-like object.
+local function squad_npc_count(obj)
+	if not obj then return 0 end
+	local ok, count = pcall(function() return obj:npc_count() end)
+	if ok and count then return count end
+	return 0
+end
+
+-- Prefers a living squad when several objects share one section name.
+local function prefer_squad(candidate, current)
+	if not candidate then return current end
+	if not current then return candidate end
+	local candidate_alive = squad_npc_count(candidate) > 0
+	local current_alive = squad_npc_count(current) > 0
+	if candidate_alive and not current_alive then return candidate end
+	return current
+end
+
+-- Resolves a numeric id, story id, squad section or server object section.
+local function resolve_alife_object(target)
+	if not target or target == "" then return nil end
+	local numeric = tonumber(target)
+	if numeric then return alife_object(numeric) end
+
+	local ok, obj = pcall(function() return alife():story_object(target) end)
+	if ok and obj then return obj end
+
+	if get_story_squad then
+		local squad_ok, squad = pcall(get_story_squad, target)
+		if squad_ok and squad then return squad end
+	end
+	if get_story_object then
+		local object_ok, story_obj = pcall(get_story_object, target)
+		if object_ok and story_obj then return story_obj end
+	end
+
+	local found = nil
+	if SIMBOARD and SIMBOARD.squads then
+		pcall(function()
+			for _, squad in pairs(SIMBOARD.squads) do
+				if squad and squad:section_name() == target then
+					found = prefer_squad(squad, found)
+				end
+			end
+		end)
+		if found then return found end
+	end
+
+	pcall(function()
+		local game = alife()
+		if not game then return end
+		game:iterate_objects(function(se_obj)
+			if se_obj and se_obj:section_name() == target then
+				found = prefer_squad(se_obj, found)
+			end
+		end)
+	end)
+	return found
+end
+
+-- True only after the target squad was seen alive and then lost all NPCs.
+local function target_squad_dead(q, stage)
+	local data = q and q.stages and q.stages[stage]
+	local target = (data and data.target_squad) or ""
+	if target == "" then return false end
+
+	local seen_key = stage_key(q, stage, "target_seen")
+	local squad = resolve_alife_object(target)
+	if squad then
+		vset(seen_key, 1)
+		if squad.id and not alife_object(squad.id) then return true end
+		return squad_npc_count(squad) <= 0
+	end
+	return vget(seen_key, 0) == 1
+end
+
+-- Withdraws money without going below zero.
+local function take_money(amount, actor)
+	local obj = actor or db.actor
+	amount = tonumber(amount) or 0
+	if not (obj and amount > 0) then return end
+
+	local balance = 0
+	local ok, value = pcall(function() return obj:money() end)
+	if ok and value then balance = value end
+	local delta = math.min(amount, balance)
+	if delta > 0 then obj:give_money(-delta) end
 end
 
 -- Plays the PDA task sound once.
@@ -303,18 +415,55 @@ local function give_item(section, count)
 	end
 end
 
--- Removes items from the actor (through the speaker when possible).
-local function take_item(section, count, npc)
-	if not (db.actor and section and section ~= "") then return end
-	if not db.actor:object(section) then return end
+-- Removes the requested number of items directly from the actor inventory.
+-- The transfer is reported exactly once at the end, so the engine does not
+-- show a second "item lost" message.
+local function take_item(section, count, actor)
+	local obj = actor or db.actor
+	if not (obj and section and section ~= "") then return end
 	count = tonumber(count) or 1
+	if count <= 0 then return end
 
-	if npc and dialogs and dialogs.relocate_item_section then
-		local ok = pcall(dialogs.relocate_item_section, npc, section, "out", count)
-		if ok and not db.actor:object(section) then return end
-	end
-	if itms_manager and itms_manager.relocate_item_from_actor then
-		pcall(itms_manager.relocate_item_from_actor, db.actor, nil, section, count)
+	local removed = 0
+	pcall(function()
+		obj:iterate_inventory(function(owner, item)
+			if removed >= count or not item then return end
+
+			local item_section = nil
+			local sec_ok, section_value = pcall(function() return item:section() end)
+			if sec_ok then item_section = section_value end
+			if item_section ~= section then return end
+
+			local stack = 1
+			local cnt_ok, cnt = pcall(function() return item:count() end)
+			if cnt_ok and cnt and cnt > 0 then stack = cnt end
+
+			local need = count - removed
+			if stack > need then
+				local cut_ok = pcall(function() item:set_count(stack - need) end)
+				if cut_ok then removed = removed + need end
+				return
+			end
+
+			local item_id = nil
+			local id_ok, id_value = pcall(function() return item:id() end)
+			if id_ok then item_id = id_value end
+			if not item_id then return end
+
+			local release_ok = pcall(function()
+				alife_release(alife_object(item_id))
+			end)
+			if not release_ok then
+				release_ok = pcall(function()
+					alife():release(alife():object(item_id), true)
+				end)
+			end
+			if release_ok then removed = removed + stack end
+		end, nil)
+	end)
+
+	if removed > 0 and news_manager and news_manager.relocate_item then
+		news_manager.relocate_item(obj, "out", section, removed)
 	end
 end
 
@@ -374,8 +523,12 @@ local function eval_condition(spec, actor)
 	elseif kind == "dont_has_info" then
 		return not has_alife_info(spec.info)
 	elseif kind == "has_item" then
+		return actor_item_count(spec.item, actor) >= (spec.count or 1)
+	elseif kind == "has_money" then
 		local obj = actor or db.actor
-		return (obj and obj:object(spec.item)) ~= nil
+		if not obj then return false end
+		local ok, balance = pcall(function() return obj:money() end)
+		return ok and (balance or 0) >= (spec.amount or 0)
 	elseif kind == "smart_owner" then
 		return is_smart_owned(spec.smart, spec.faction)
 	end
@@ -402,10 +555,12 @@ local function run_actions(actions, actor, npc)
 			if db.actor then db.actor:disable_info_portion(spec.info) end
 		elseif kind == "give_money" then
 			if db.actor then db.actor:give_money(spec.amount) end
+		elseif kind == "take_money" then
+			take_money(spec.amount, actor or db.actor)
 		elseif kind == "give_item" then
 			give_item(spec.item, spec.count)
-		elseif kind == "remove_item" then
-			take_item(spec.item, spec.count, npc)
+		elseif kind == "remove_item" or kind == "take_item" then
+			take_item(spec.item, spec.count, actor or db.actor)
 		elseif kind == "spawn_squad" or kind == "set_target" then
 			spawn_task_squad(spec.smart, spec.squad, spec.smart)
 		elseif kind == "give_task" then
@@ -595,8 +750,71 @@ class LuaGenerator:
                     return quest_id
         return None
 
-    @staticmethod
-    def _condition_spec(condition: "Condition") -> dict[str, Any]:
+    def _resolve_item_section(self, item_alias: str) -> str:
+        """Приводит алиас БД к секции предмета, не ломая прямой section.
+
+        Если клиент базы не передан, не содержит ``find_item_by_alias`` или
+        алиас не найден, возвращается исходная строка. Это позволяет писать
+        как ``itm_pda_common``, так и алиасы из ``data/anomaly_db.sqlite``.
+
+        Args:
+            item_alias (str): Секция или алиас предмета.
+
+        Returns:
+            str: Секция предмета для игрового Lua.
+        """
+        value = str(item_alias or "").strip()
+        if not value:
+            return ""
+        finder = getattr(self.db_client, "find_item_by_alias", None)
+        if not callable(finder):
+            return value
+        try:
+            row = finder(value)
+        except Exception as exc:  # noqa: BLE001 - база не должна ронять сборку
+            logger.warning(
+                "Не удалось разрешить алиас предмета %r через БД: %s",
+                value,
+                exc,
+            )
+            return value
+        if isinstance(row, dict):
+            section = row.get("id") or row.get("section")
+            if isinstance(section, str) and section.strip():
+                return section.strip()
+        return value
+
+    def _resolve_squad_section(self, squad_id: str | None) -> str:
+        """Приводит алиас отряда к секции, сохраняя прямые section/story id.
+
+        Args:
+            squad_id (str | None): Секция, story id или алиас отряда.
+
+        Returns:
+            str: Секция/ID отряда для игрового Lua либо пустая строка.
+        """
+        value = str(squad_id or "").strip()
+        if not value:
+            return ""
+        finder = getattr(self.db_client, "find_squad_by_alias", None)
+        if not callable(finder):
+            return value
+        try:
+            row = finder(value)
+        except Exception as exc:  # noqa: BLE001 - база не должна ронять сборку
+            logger.warning(
+                "Не удалось разрешить алиас отряда %r через БД: %s",
+                value,
+                exc,
+            )
+            return value
+        if isinstance(row, dict):
+            section = row.get("id") or row.get("section")
+            if isinstance(section, str) and section.strip():
+                return section.strip()
+        return value
+
+    def _condition_spec(self, condition: "Condition") -> dict[str, Any]:
         """Преобразует Pydantic-условие в словарь для Lua.
 
         Args:
@@ -613,7 +831,13 @@ class LuaGenerator:
         if isinstance(condition, DontHasInfo):
             return {"kind": "dont_has_info", "info": condition.info}
         if isinstance(condition, HasItem):
-            return {"kind": "has_item", "item": condition.item_alias}
+            return {
+                "kind": "has_item",
+                "item": self._resolve_item_section(condition.item_alias),
+                "count": condition.count,
+            }
+        if isinstance(condition, HasMoney):
+            return {"kind": "has_money", "amount": condition.amount}
         if isinstance(condition, SmartOwner):
             return {
                 "kind": "smart_owner",
@@ -622,8 +846,7 @@ class LuaGenerator:
             }
         raise TypeError(f"Неизвестный тип условия: {type(condition).__name__}")
 
-    @staticmethod
-    def _action_spec(action: Any) -> dict[str, Any]:
+    def _action_spec(self, action: Any) -> dict[str, Any]:
         """Преобразует Pydantic-действие в словарь для Lua.
 
         Args:
@@ -654,17 +877,25 @@ class LuaGenerator:
         if isinstance(action, GiveItem):
             return {
                 "kind": "give_item",
-                "item": action.item_alias,
+                "item": self._resolve_item_section(action.item_alias),
                 "count": action.count,
             }
         if isinstance(action, RemoveItem):
             return {
                 "kind": "remove_item",
-                "item": action.item_alias,
+                "item": self._resolve_item_section(action.item_alias),
+                "count": action.count,
+            }
+        if isinstance(action, TakeItem):
+            return {
+                "kind": "take_item",
+                "item": self._resolve_item_section(action.item_alias),
                 "count": action.count,
             }
         if isinstance(action, GiveMoney):
             return {"kind": "give_money", "amount": action.amount}
+        if isinstance(action, TakeMoney):
+            return {"kind": "take_money", "amount": action.amount}
         if isinstance(action, GiveTask):
             return {"kind": "give_task", "task": action.task_id}
         if isinstance(action, CompleteTask):
@@ -707,6 +938,9 @@ class LuaGenerator:
                 }
             stages[stage_id] = {
                 "target": stage.target_alias or "",
+                "target_squad": self._resolve_squad_section(
+                    stage.target_squad_id
+                ),
                 "descr": f"{quest_id}_stage_{stage_id}_descr",
                 "msg": f"{quest_id}_stage_{stage_id}_msg",
                 "capture": capture,
@@ -743,7 +977,7 @@ class LuaGenerator:
             "icon": quest.icon or DEFAULT_ICON,
             "prior": quest.prior if quest.prior is not None else DEFAULT_PRIOR,
             "money": quest.reward_money or 0,
-            "item": quest.reward_item_alias or "",
+            "item": self._resolve_item_section(quest.reward_item_alias or ""),
             "item_count": quest.reward_item_count,
             "return_stage": (
                 quest.return_to_giver_stage
@@ -856,7 +1090,15 @@ local function {quest_id}_target(task_id, field, p, tsk)
 	local stage_data = quest.stages[stage]
 	local target_name = (stage_data and stage_data.target) or ""
 	if target_name ~= "" then
-		return resolve_target(target_name)
+		local target_id = resolve_target(target_name)
+		if target_id then return target_id end
+		local target_obj = resolve_alife_object(target_name)
+		if target_obj then return target_obj.id end
+	end
+	local target_squad = (stage_data and stage_data.target_squad) or ""
+	if target_squad ~= "" then
+		local squad = resolve_alife_object(target_squad)
+		return squad and squad.id or nil
 	end
 	if tsk and tsk.task_giver_id then return tsk.task_giver_id end
 	return resolve_target(quest.npc)
@@ -906,6 +1148,9 @@ local function {quest_id}_status(tsk, task_id)
 		end
 	end
 
+	if target_squad_dead(quest, stage) then
+{advance}	end
+
 	if stage_cleared(quest, stage, stage_data) then
 {advance}	end
 
@@ -933,6 +1178,7 @@ local function {quest_id}_start(actor, npc, p)
 		vset(stage_key(quest, stage, "spawn"), 0)
 		vset(stage_key(quest, stage, "enemy"), 0)
 		vset(stage_key(quest, stage, "started"), 0)
+		vset(stage_key(quest, stage, "target_seen"), 0)
 		local allies = (stage_data.capture and stage_data.capture.ally_count) or 0
 		for i = 1, allies do
 			vset(stage_key(quest, stage, "ally" .. i), 0)

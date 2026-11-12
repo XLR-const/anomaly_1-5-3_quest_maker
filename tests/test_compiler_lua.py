@@ -33,10 +33,13 @@ from src.core.models import (  # noqa: E402
     GiveTask,
     HasInfo,
     HasItem,
+    HasMoney,
     ModProject,
     Phrase,
     Quest,
     Stage,
+    TakeItem,
+    TakeMoney,
     WarfareCapture,
 )
 
@@ -310,6 +313,221 @@ class TestLuaGeneratorBehaviour(unittest.TestCase):
         """Проект без словарей quests/dialogs даёт ``TypeError``."""
         with self.assertRaises(TypeError):
             LuaGenerator().generate_quests_script(object())  # type: ignore[arg-type]
+
+
+class TestTraderMechanicsAndSquadTracking(unittest.TestCase):
+    """Новые действия/условия, алиасы БД и отслеживание целевого отряда."""
+
+    @staticmethod
+    def _make_trader_project() -> ModProject:
+        """Создаёт квест с изъятием предмета/денег и целью-отрядом."""
+        quest = Quest(
+            id="trader_kill_quest",
+            npc_id="esc_mayor",
+            stages={
+                0: Stage(
+                    id=0,
+                    target_squad_id="esc_3_16_military_trader_squad",
+                    on_start_actions=[
+                        TakeItem(item_alias="itm_pda_common", count=2),
+                        TakeMoney(amount=1500),
+                    ],
+                ),
+            },
+            transfer_conditions={
+                0: {
+                    "complete": [
+                        HasItem(item_alias="itm_pda_common", count=2),
+                        HasMoney(amount=5000),
+                    ]
+                }
+            },
+        )
+        dialog = Dialog(
+            id="trader_kill_dialog",
+            task_id=quest.id,
+            phrases={
+                0: Phrase(
+                    id=0,
+                    text_ru="Проверка",
+                    text_en="Check",
+                    preconditions=[
+                        HasItem(item_alias="itm_pda_common", count=2),
+                        HasMoney(amount=5000),
+                    ],
+                    actions=[
+                        TakeItem(item_alias="itm_pda_common", count=2),
+                        TakeMoney(amount=1500),
+                    ],
+                ),
+            },
+        )
+        return ModProject(
+            name="Trader Kill",
+            quests={quest.id: quest},
+            dialogs={dialog.id: dialog},
+        )
+
+    def test_new_action_and_condition_specs_are_emitted(self) -> None:
+        """``take_item``/``take_money``/``has_money`` попадают в Lua-таблицы."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_trader_project(),
+            script_name="trader_quests",
+            mod_prefix="trader",
+        )
+
+        for fragment in (
+            'kind = "take_item"',
+            'kind = "take_money"',
+            'kind = "has_money"',
+            'item = "itm_pda_common"',
+            "count = 2",
+            "amount = 1500",
+            "amount = 5000",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
+
+    def test_helpers_are_generated(self) -> None:
+        """Генератор создаёт безопасные хелперы подсчёта и списания."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_trader_project()
+        )
+
+        for fragment in (
+            "local function actor_item_count(section, actor)",
+            "local function resolve_alife_object(target)",
+            "local function target_squad_dead(q, stage)",
+            "local function take_item(section, count, actor)",
+            "local function take_money(amount, actor)",
+            'local function trader_kill_dialog_phrase_0_precondition',
+            'local function trader_kill_dialog_phrase_0_action',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
+
+    def test_take_item_uses_inventory_and_single_notification(self) -> None:
+        """Изъятие идёт через инвентарь и сообщает о потере один раз."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_trader_project()
+        )
+
+        for fragment in (
+            "obj:iterate_inventory",
+            "alife_release(alife_object(item_id))",
+            'news_manager.relocate_item(obj, "out", section, removed)',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
+
+        self.assertEqual(script.count("news_manager.relocate_item("), 1)
+        self.assertNotIn("dialogs.relocate_item_section", script)
+        self.assertNotIn("itms_manager.relocate_item_from_actor", script)
+
+    def test_resolve_alife_object_searches_squad_section(self) -> None:
+        """Секция сквада находится через SIMBOARD и перебор ``alife()``."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_trader_project()
+        )
+
+        for fragment in (
+            "if get_story_squad then",
+            "pcall(get_story_squad, target)",
+            "if get_story_object then",
+            "if SIMBOARD and SIMBOARD.squads then",
+            "squad:section_name() == target",
+            "game:iterate_objects",
+            "se_obj:section_name() == target",
+            "prefer_squad(se_obj, found)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
+
+        target_start = script.index("local function trader_kill_quest_target")
+        target_end = script.index("local function trader_kill_quest_descr")
+        target_block = script[target_start:target_end]
+        self.assertIn(
+            "local target_obj = resolve_alife_object(target_name)",
+            target_block,
+        )
+        self.assertIn("return target_obj.id", target_block)
+        self.assertIn(
+            "if squad.id and not alife_object(squad.id) then return true end",
+            script,
+        )
+        self.assertIn("return squad_npc_count(squad) <= 0", script)
+
+    def test_target_squad_is_tracked_in_status_functor(self) -> None:
+        """``target_squad_id`` даёт автоматическую проверку в ``_status``."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_trader_project()
+        )
+
+        self.assertIn(
+            'target_squad = "esc_3_16_military_trader_squad"', script
+        )
+        self.assertIn("if target_squad_dead(quest, stage) then", script)
+        self.assertIn('vset(seen_key, 1)', script)
+
+    def test_database_aliases_are_resolved(self) -> None:
+        """Алиасы БД заменяются секциями; прямые секции не меняются."""
+
+        class FakeDatabase:
+            """Минимальный двойник ``GameDatabase`` для разрешения алиасов."""
+
+            def find_item_by_alias(self, alias: str):
+                if alias == "weapon.pda":
+                    return {"id": "itm_pda_common"}
+                return None
+
+            def find_squad_by_alias(self, alias: str):
+                if alias == "squad.merc_target":
+                    return {"id": "esc_3_16_military_trader_squad"}
+                return None
+
+        project = self._make_trader_project()
+        project.quests["trader_kill_quest"].stages[0].target_squad_id = (
+            "squad.merc_target"
+        )
+        project.quests["trader_kill_quest"].stages[0].on_start_actions[0] = (
+            TakeItem(item_alias="weapon.pda", count=2)
+        )
+
+        script = LuaGenerator(db_client=FakeDatabase()).generate_quests_script(
+            project
+        )
+
+        self.assertIn('item = "itm_pda_common"', script)
+        self.assertNotIn('item = "weapon.pda"', script)
+        self.assertIn(
+            'target_squad = "esc_3_16_military_trader_squad"', script
+        )
+
+    def test_database_failure_falls_back_to_raw_section(self) -> None:
+        """Ошибка или отсутствие БД не роняет генерацию."""
+
+        class BrokenDatabase:
+            """Двойник, который всегда падает."""
+
+            def find_item_by_alias(self, alias: str):
+                raise RuntimeError("database is not connected")
+
+            def find_squad_by_alias(self, alias: str):
+                raise RuntimeError("database is not connected")
+
+        project = self._make_trader_project()
+
+        with self.assertLogs(
+            "aqb.compiler.lua_gen", level="WARNING"
+        ):
+            script = LuaGenerator(
+                db_client=BrokenDatabase()
+            ).generate_quests_script(project)
+
+        self.assertIn('item = "itm_pda_common"', script)
+        self.assertIn(
+            'target_squad = "esc_3_16_military_trader_squad"', script
+        )
 
 
 if __name__ == "__main__":

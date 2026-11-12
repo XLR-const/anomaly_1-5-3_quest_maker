@@ -149,11 +149,28 @@ class HasItem(BaseCondition):
     """Условие «в инвентаре игрока есть предмет».
 
     В XML не имеет отдельного тега, поэтому выносится в Lua-предусловие
-    ``dialogs.<dialog_id>_phrase_<id>_precondition``.
+    ``dialogs.<dialog_id>_phrase_<id>_precondition``. Поле ``count`` задаёт
+    минимальное требуемое количество; значение по умолчанию — один предмет.
     """
 
     type: Literal["has_item"] = Field(default="has_item")
     item_alias: str = Field(description="Секция/алиас предмета.")
+    count: int = Field(
+        default=1,
+        ge=1,
+        description="Минимальное количество предметов в инвентаре актора.",
+    )
+
+
+class HasMoney(BaseCondition):
+    """Условие «у игрока достаточно денег».
+
+    В XML не имеет отдельного тега, поэтому транслируется в Lua-проверку
+    ``db.actor:money() >= amount``.
+    """
+
+    type: Literal["has_money"] = Field(default="has_money")
+    amount: int = Field(ge=0, description="Минимальная сумма денег у актора.")
 
 
 class SmartOwner(BaseCondition):
@@ -169,7 +186,7 @@ class SmartOwner(BaseCondition):
 
 
 Condition: TypeAlias = Annotated[
-    Union[HasInfo, DontHasInfo, HasItem, SmartOwner],
+    Union[HasInfo, DontHasInfo, HasItem, HasMoney, SmartOwner],
     Field(discriminator="type"),
 ]
 
@@ -242,11 +259,36 @@ class RemoveItem(BaseAction):
     count: int = Field(default=1, ge=1, description="Количество предметов.")
 
 
+class TakeItem(BaseAction):
+    """Изъять предмет у игрока (семантический алиас ``RemoveItem``).
+
+    Удаляет предметы напрямую через ``actor:iterate_inventory`` и
+    ``alife_release``. Сообщение о передаче выводится ровно один раз через
+    ``news_manager.relocate_item`` и только если предмет действительно был
+    изъят. Поддерживает как секции, так и алиасы БД.
+    """
+
+    type: Literal["take_item"] = Field(default="take_item")
+    item_alias: str = Field(description="Секция/алиас изымаемого предмета.")
+    count: int = Field(default=1, ge=1, description="Количество предметов.")
+
+
 class GiveMoney(BaseAction):
     """Выдать игроку деньги (``db.actor:give_money``)."""
 
     type: Literal["give_money"] = Field(default="give_money")
     amount: int = Field(ge=0, description="Сумма в игровой валюте.")
+
+
+class TakeMoney(BaseAction):
+    """Списать деньги у игрока.
+
+    Сумма ограничивается текущим балансом, чтобы ``give_money`` не ушёл в
+    отрицательное значение.
+    """
+
+    type: Literal["take_money"] = Field(default="take_money")
+    amount: int = Field(ge=0, description="Списываемая сумма в игровой валюте.")
 
 
 class GiveTask(BaseAction):
@@ -277,7 +319,9 @@ Action: TypeAlias = Annotated[
         SetTarget,
         GiveItem,
         RemoveItem,
+        TakeItem,
         GiveMoney,
+        TakeMoney,
         GiveTask,
         CompleteTask,
     ],
@@ -500,6 +544,14 @@ class Stage(BaseModel):
     target_alias: str = Field(
         default="",
         description="Алиас смарта/NPC/предмета для маркера цели.",
+    )
+    target_squad_id: str | None = Field(
+        default=None,
+        description=(
+            "ID/секция/алиас отряда, который нужно физически уничтожить на "
+            "этом этапе. При заданном значении status_functor автоматически "
+            "проверяет отряд через alife()/SIMBOARD и продвигает этап."
+        ),
     )
     on_start_actions: list[Action] = Field(
         default_factory=list,

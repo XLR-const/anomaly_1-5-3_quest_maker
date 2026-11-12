@@ -83,7 +83,9 @@ quest = Quest(
 ## Шаг 3. Объявите диалог и граф реплик
 
 Диалог — это `Dialog`, реплики — `Phrase`. В каждом диалоге обязательна стартовая
-реплика `id=0`. Ключи словаря `phrases` обязаны совпадать с `Phrase.id`. Каждый
+реплика `id=0`, и она **всегда принадлежит Игроку**. Далее действует правило:
+чётные ID (`0`, `2`, `4`, ...) — реплики Игрока, нечётные (`1`, `3`, ...) —
+реплики NPC. Ключи словаря `phrases` обязаны совпадать с `Phrase.id`. Каждый
 элемент `next_phrases` обязан ссылаться на существующую реплику.
 
 ```python
@@ -98,21 +100,33 @@ take_dialog = Dialog(
     phrases={
         0: Phrase(
             id=0,
-            text_ru="Есть работёнка. Возьмёшься?",
-            text_en="I have a job. Will you take it?",
-            next_phrases=[1, 2],
+            text_ru="Душман, есть работёнка?",
+            text_en="Dushman, got any work?",
+            next_phrases=[1],
         ),
         1: Phrase(
             id=1,
+            text_ru="Есть. Возьмёшься?",
+            text_en="I do. Will you take it?",
+            next_phrases=[2, 4],
+        ),
+        2: Phrase(
+            id=2,
             text_ru="Берусь.",
             text_en="I'm in.",
             actions=[
                 GiveInfo(info="my_first_quest_started"),
                 GiveTask(task_id="my_first_quest"),
             ],
+            next_phrases=[3],
         ),
-        2: Phrase(
-            id=2,
+        3: Phrase(
+            id=3,
+            text_ru="Не подведи.",
+            text_en="Don't let me down.",
+        ),
+        4: Phrase(
+            id=4,
             text_ru="Не сейчас.",
             text_en="Not now.",
         ),
@@ -237,8 +251,10 @@ RequiredId: TypeAlias = Annotated[
 | `SpawnSquad` | `"spawn_squad"` | `squad_alias: str`, `smart_alias: str` | Lua `SIMBOARD:create_squad` + `sim_squad_warfare.set_target` + заморозка. |
 | `SetTarget` | `"set_target"` | `squad_alias: str`, `smart_alias: str` | Lua `sim_squad_warfare.set_target`. |
 | `GiveItem` | `"give_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `alife_create_item(section, db.actor)` в цикле. |
-| `RemoveItem` | `"remove_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `take_item(...)`: изъятие через диалоговый/инвентарный менеджер. |
+| `RemoveItem` | `"remove_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `take_item(...)`: прямое изъятие из инвентаря игрока через `actor:iterate_inventory` + `alife_release`. |
+| `TakeItem` | `"take_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Семантический алиас `RemoveItem`: та же реализация `take_item`; ровно одно уведомление `news_manager.relocate_item(..., "out", ...)` при `removed > 0`. |
 | `GiveMoney` | `"give_money"` | `amount: int` (`ge=0`) | Lua `db.actor:give_money(amount)`. |
+| `TakeMoney` | `"take_money"` | `amount: int` (`ge=0`) | Lua `take_money(...)`: списание с ограничением по текущему балансу, без ухода в минус. |
 | `GiveTask` | `"give_task"` | `task_id: RequiredId` | В XML — `<action>dialogs.<текущий_dialog_id>_accept</action>`; в Lua — `give_task`. |
 | `CompleteTask` | `"complete_task"` | `task_id: RequiredId` | В XML — `<action>dialogs.<текущий_dialog_id>_turn_in</action>`; в Lua — `complete_task`. |
 
@@ -254,6 +270,8 @@ from src.core.models import (
     RemoveItem,
     SetTarget,
     SpawnSquad,
+    TakeItem,
+    TakeMoney,
 )
 
 actions = [
@@ -262,11 +280,28 @@ actions = [
     SetTarget(squad_alias="squad.mercenary_advanced", smart_alias="deadcity.hospital"),
     GiveItem(item_alias="wpn_ak74", count=1),
     RemoveItem(item_alias="itm_pda_common", count=1),
+    TakeItem(item_alias="itm_pda_common", count=1),
     GiveMoney(amount=50000),
+    TakeMoney(amount=2500),
     GiveTask(task_id="my_quest"),
     CompleteTask(task_id="my_quest"),
 ]
 ```
+
+> **Алиасы и секции.** Поля `item_alias` в `GiveItem`/`RemoveItem`/`TakeItem`
+> и `item_alias` в `HasItem` принимают как прямую секцию (`itm_pda_common`,
+> `wpn_ak105`), так и алиас из `data/anomaly_db.sqlite`. Если генератор получил
+> `db_client`, алиас разрешается в секцию на этапе компиляции; без БД или при
+> ошибке запроса строка используется как есть и сборка не падает.
+
+> **Уведомления при изъятии предмета.** `TakeItem`/`RemoveItem` удаляют
+> предметы напрямую через `actor:iterate_inventory` и `alife_release`. Сообщение
+> о передаче выводится ровно один раз — вызовом
+> `news_manager.relocate_item(actor, "out", section, removed)` и только если
+> хотя бы один предмет действительно был изъят. Ванильные
+> `dialogs.relocate_item_section` и `itms_manager.relocate_item_from_actor` не
+> используются: в Anomaly 1.5.3 они приводили к дублированию сообщения
+> «Потерян предмет».
 
 > **Семантика `GiveTask`/`CompleteTask` в XML:** действие всегда ссылается на
 > **текущий диалог**, в реплике которого оно объявлено:
@@ -282,21 +317,33 @@ actions = [
 |---|---|---|---|
 | `HasInfo` | `"has_info"` | `info: RequiredId` | XML `<has_info>`; Lua `has_alife_info(info)`. |
 | `DontHasInfo` | `"dont_has_info"` | `info: RequiredId` | XML `<dont_has_info>`; Lua `not has_alife_info(info)`. |
-| `HasItem` | `"has_item"` | `item_alias: str` | Только Lua: `db.actor:object(item_alias) ~= nil`. Выносится в `dialogs.<...>_precondition` или `dialogs.<dialog_id>_can_take`. |
+| `HasItem` | `"has_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Только Lua: подсчёт стаков в инвентаре `actor_item_count(item, actor) >= count`. Выносится в `dialogs.<...>_precondition` или `dialogs.<dialog_id>_can_take`. |
+| `HasMoney` | `"has_money"` | `amount: int` (`ge=0`) | Только Lua: `db.actor:money() >= amount`. |
 | `SmartOwner` | `"smart_owner"` | `smart_alias: str`, `faction: str` | Только Lua: `SIMBOARD.smarts_by_names[smart_alias].owning_faction == faction`. |
 
 Пример:
 
 ```python
-from src.core.models import DontHasInfo, HasInfo, HasItem, SmartOwner
+from src.core.models import (
+    DontHasInfo,
+    HasInfo,
+    HasItem,
+    HasMoney,
+    SmartOwner,
+)
 
 conditions = [
     HasInfo(info="my_quest_started"),
     DontHasInfo(info="my_quest_done"),
-    HasItem(item_alias="itm_pda_common"),
+    HasItem(item_alias="itm_pda_common", count=2),
+    HasMoney(amount=50000),
     SmartOwner(smart_alias="deadcity.hospital", faction="army"),
 ]
 ```
+
+> **Подсчёт `HasItem`.** Условие учитывает количество в стаке: два ПДА или
+> патроны с `count()` суммируются. Для одиночных предметов поведение прежнее.
+> `HasItem` принимает и прямую секцию, и алиас БД (см. примечание в 2.2).
 
 > **Важно:** `HasInfo` и `DontHasInfo` имеют штатные XML-теги и не создают
 > Lua-функцию. Все остальные условия не представимы тегами X-Ray, поэтому
@@ -380,6 +427,13 @@ class Dialog(BaseModel):
 6. Ключи `phrases` обязаны совпадать с `Phrase.id`.
 7. Все `next_phrases` обязаны ссылаться на существующие фразы.
 
+> **Обязательное правило порядка реплик.** В любом `<actor_dialog>` первую
+> реплику произносит Игрок: `Phrase(id=0)` — Игрок, `Phrase(id=1)` — NPC,
+> `Phrase(id=2)` — снова Игрок и так далее. Чётные ID (`0`, `2`, `4`, ...)
+> принадлежат Игроку, нечётные (`1`, `3`, ...) — NPC. Если нужно показать
+> несколько вариантов ответа Игрока, используйте чётные ID, а нечётные
+> оставляйте за NPC.
+
 Порядок ролей при вставке `<actor_dialog>`:
 
 ```text
@@ -434,6 +488,7 @@ class Stage(BaseModel):
     descr_ru: str = ""
     descr_en: str = ""
     target_alias: str = ""
+    target_squad_id: str | None = None
     on_start_actions: list[Action] = []
     warfare_capture: WarfareCapture | None = None
 ```
@@ -446,6 +501,7 @@ class Stage(BaseModel):
 | `descr_ru` | `str` | `""` | Русское описание этапа. |
 | `descr_en` | `str` | `""` | Английское описание этапа. |
 | `target_alias` | `str` | `""` | Цель маркера: имя смарта, числовой server ID или story ID. |
+| `target_squad_id` | `str \| None` | `None` | ID/секция/алиас отряда, который нужно физически уничтожить. Включает автоматическую проверку в `_status`. |
 | `on_start_actions` | `list[Action]` | `[]` | Действия, выполняемые ровно один раз при входе в этап. |
 | `warfare_capture` | `WarfareCapture \| None` | `None` | Включает автоматическую логику захвата смарта. |
 
@@ -463,6 +519,48 @@ ID квестодателя) — это удобно для этапа «вер�
 `on_start_actions` выполняются Lua-функцией `_status` при первом обнаружении
 текущего этапа. Факт выполнения сохраняется в pstor, поэтому действия не
 повторяются после загрузки сохранения.
+
+### Автоматическое отслеживание ликвидации отряда (`target_squad_id`)
+
+Если у этапа задано `target_squad_id`, генератор добавляет в
+`<quest_id>_status` проверку `target_squad_dead(quest, stage)` **до** обычных
+условий `transfer_conditions`. Когда целевой отряд уничтожен, этап продвигается
+тем же кодом, что и при выполнении `complete`-условий; последний этап
+возвращает `"complete"`.
+
+```python
+from src.core.models import Quest, Stage
+
+quest = Quest(
+    id="my_kill_quest",
+    npc_id="esc_mayor",
+    stages={
+        0: Stage(
+            id=0,
+            target_squad_id="esc_3_16_military_trader_squad",
+        ),
+        # ... последующие этапы
+    },
+)
+```
+
+`target_squad_id` принимает:
+
+- числовой server ID (`"12345"`) — `alife_object(id)`;
+- story ID — `alife():story_object(name)`;
+- секцию/алиас отряда из `SIMBOARD.squads` (при наличии) или БД.
+
+Рантайм-проверка использует проверенные вызовы эталона:
+`resolve_alife_object` → `alife_object`/`story_object`/`SIMBOARD.squads`, а
+признак смерти — `squad:npc_count() <= 0` под `pcall`.
+
+> **Защита от преждевременного завершения.** Этап не завершится, пока отряд
+> хотя бы раз не был обнаружен живым. Факт обнаружения хранится в pstor-ключе
+> `<mod_prefix>_<quest_id>_v_<stage>_target_seen`; он сбрасывается в `_start`.
+> Это не даёт «мёртвому»/ещё не заспавненному отряду закрыть этап сразу.
+
+Если `target_alias` пуст, `target_functor` использует `target_squad_id` как
+источник маркера цели.
 
 ## 2.8. `Quest` — сюжетный квест
 
@@ -814,6 +912,8 @@ output/<slug>/
 9. `GiveTask`/`CompleteTask` в реплике ссылаются на **текущий диалог**:
    `dialogs.<dialog_id>_accept` и `dialogs.<dialog_id>_turn_in`.
 10. Никакого захардкоженного `hello_dialog`: ID всегда приходит из модели.
+11. `Phrase(id=0)` всегда принадлежит Игроку; чётные ID — Игрок, нечётные —
+    NPC. Не начинайте `<actor_dialog>` с реплики NPC.
 
 Пример сгенерированного файла:
 
@@ -825,17 +925,30 @@ output/<slug>/
         <dont_has_info>deadcity_dushman_pda_started</dont_has_info>
         <phrase_list>
             <phrase id="0">
+                <!-- Игрок -->
                 <text>deadcity_dushman_take_phrase_0_text</text>
                 <next>1</next>
-                <next>2</next>
             </phrase>
             <phrase id="1">
+                <!-- NPC -->
                 <text>deadcity_dushman_take_phrase_1_text</text>
-                <give_info>deadcity_dushman_pda_started</give_info>
-                <action>dialogs.deadcity_dushman_take_accept</action>
+                <next>2</next>
+                <next>4</next>
             </phrase>
             <phrase id="2">
+                <!-- Игрок -->
                 <text>deadcity_dushman_take_phrase_2_text</text>
+                <give_info>deadcity_dushman_pda_started</give_info>
+                <action>dialogs.deadcity_dushman_take_accept</action>
+                <next>3</next>
+            </phrase>
+            <phrase id="3">
+                <!-- NPC -->
+                <text>deadcity_dushman_take_phrase_3_text</text>
+            </phrase>
+            <phrase id="4">
+                <!-- Игрок -->
+                <text>deadcity_dushman_take_phrase_4_text</text>
             </phrase>
         </phrase_list>
     </dialog>
@@ -843,19 +956,32 @@ output/<slug>/
     <dialog id="deadcity_dushman_turnin">
         <phrase_list>
             <phrase id="0">
+                <!-- Игрок -->
                 <text>deadcity_dushman_turnin_phrase_0_text</text>
                 <next>1</next>
-                <next>2</next>
             </phrase>
             <phrase id="1">
+                <!-- NPC -->
                 <text>deadcity_dushman_turnin_phrase_1_text</text>
-                <precondition>dialogs.deadcity_dushman_turnin_phrase_1_precondition</precondition>
-                <give_info>deadcity_dushman_pda_done</give_info>
-                <action>dialogs.deadcity_dushman_turnin_turn_in</action>
-                <action>dialogs.deadcity_dushman_turnin_phrase_1_action</action>
+                <next>2</next>
+                <next>4</next>
             </phrase>
             <phrase id="2">
+                <!-- Игрок -->
                 <text>deadcity_dushman_turnin_phrase_2_text</text>
+                <precondition>dialogs.deadcity_dushman_turnin_phrase_2_precondition</precondition>
+                <give_info>deadcity_dushman_pda_done</give_info>
+                <action>dialogs.deadcity_dushman_turnin_turn_in</action>
+                <action>dialogs.deadcity_dushman_turnin_phrase_2_action</action>
+                <next>3</next>
+            </phrase>
+            <phrase id="3">
+                <!-- NPC -->
+                <text>deadcity_dushman_turnin_phrase_3_text</text>
+            </phrase>
+            <phrase id="4">
+                <!-- Игрок -->
+                <text>deadcity_dushman_turnin_phrase_4_text</text>
             </phrase>
         </phrase_list>
     </dialog>
@@ -967,8 +1093,8 @@ register()
   - `GiveInfo` → прямой XML-тег `<give_info>`;
   - `GiveTask` → XML `<action>dialogs.<dialog_id>_accept</action>`;
   - `CompleteTask` → XML `<action>dialogs.<dialog_id>_turn_in</action>`;
-  - все остальные (`SpawnSquad`, `GiveMoney`, `GiveItem`, `RemoveItem`,
-    `RemoveInfo`, `SetTarget`) → Lua-функция
+  - все остальные (`SpawnSquad`, `GiveMoney`, `TakeMoney`, `GiveItem`,
+    `RemoveItem`, `TakeItem`, `RemoveInfo`, `SetTarget`) → Lua-функция
     `dialogs.<dialog_id>_phrase_<n>_action`.
 
 > **Строки подсказок.** `_reward` и `_cleanup` вызывают `pda_tip` со строковыми
@@ -983,6 +1109,9 @@ register()
   не совпадают с `task_id` (его `task_manager` очищает сам).
 - Отряды, заспавненные квестом, помечаются в
   `sim_offline_combat.task_squads`, чтобы не уходить в офлайн-бой.
+- Для `Stage.target_squad_id` используется отдельный ключ
+  `<...>_target_seen`: он фиксирует, что отряд был обнаружен живым, и
+  сбрасывается при старте квеста.
 - При завершении/провале квеста отряды освобождаются.
 
 ## 3.5. Стандарты генерации LTX-задач
@@ -1346,21 +1475,33 @@ def create_dushman_project() -> ModProject:
         phrases={
             0: Phrase(
                 id=0,
-                text_ru="Слышал, у тебя проблемы с наёмниками?",
-                text_en="I heard you have a problem with the mercenaries?",
-                next_phrases=[1, 2],
+                text_ru="Душман, слышал, у тебя проблемы с наёмниками?",
+                text_en="Dushman, I heard you have a problem with the mercenaries?",
+                next_phrases=[1],
             ),
             1: Phrase(
                 id=1,
+                text_ru="Есть дело. Возьмёшься?",
+                text_en="I have a job. Will you take it?",
+                next_phrases=[2, 4],
+            ),
+            2: Phrase(
+                id=2,
                 text_ru="Берусь. Говори, где искать.",
                 text_en="I'm in. Tell me where to look.",
                 actions=[
                     GiveInfo(info=START_INFO),
                     GiveTask(task_id=QUEST_ID),
                 ],
+                next_phrases=[3],
             ),
-            2: Phrase(
-                id=2,
+            3: Phrase(
+                id=3,
+                text_ru="Не подведи.",
+                text_en="Don't let me down.",
+            ),
+            4: Phrase(
+                id=4,
                 text_ru="Не сейчас. Найди кого-нибудь другого.",
                 text_en="Not now. Find someone else.",
             ),
@@ -1377,15 +1518,21 @@ def create_dushman_project() -> ModProject:
         phrases={
             0: Phrase(
                 id=0,
-                text_ru="Ну что, принёс ПДА?",
-                text_en="Well, did you bring the PDA?",
-                next_phrases=[1, 2],
+                text_ru="Душман, я принёс ПДА.",
+                text_en="Dushman, I brought the PDA.",
+                next_phrases=[1],
             ),
             1: Phrase(
                 id=1,
+                text_ru="Показывай, что там у тебя.",
+                text_en="Show me what you've got.",
+                next_phrases=[2, 4],
+            ),
+            2: Phrase(
+                id=2,
                 text_ru="Держи. ПДА у меня.",
                 text_en="Here. I have the PDA.",
-                # Вторая ветка доступна только при наличии предмета.
+                # Ветка сдачи доступна только при наличии предмета.
                 preconditions=[HasItem(item_alias=QUEST_ITEM)],
                 actions=[
                     RemoveItem(item_alias=QUEST_ITEM, count=1),
@@ -1394,9 +1541,15 @@ def create_dushman_project() -> ModProject:
                     GiveInfo(info=DONE_INFO),
                     CompleteTask(task_id=QUEST_ID),
                 ],
+                next_phrases=[3],
             ),
-            2: Phrase(
-                id=2,
+            3: Phrase(
+                id=3,
+                text_ru="Хорошая работа. Держи награду.",
+                text_en="Good work. Here's your reward.",
+            ),
+            4: Phrase(
+                id=4,
                 text_ru="Ещё ищу. Не всё так просто.",
                 text_en="Still looking. It's not that simple.",
             ),
@@ -1468,11 +1621,12 @@ output/dead_city_dushmans_debt/gamedata/
    `[profiles] specific_characters_files` — `character_desc_deadcity`.
 3. В `dialogs_dead_city_dushmans_debt.xml`:
    - у обоих диалогов есть `<phrase_list>`;
+   - `phrase id="0"` — реплика Игрока, `phrase id="1"` — ответ NPC;
    - переходы оформлены как `<next>1</next>`, `<next>2</next>`;
    - в диалоге сдачи есть
-     `<precondition>dialogs.deadcity_dushman_turnin_phrase_1_precondition</precondition>`;
+     `<precondition>dialogs.deadcity_dushman_turnin_phrase_2_precondition</precondition>`;
    - есть `<action>dialogs.deadcity_dushman_turnin_turn_in</action>` и
-     `<action>dialogs.deadcity_dushman_turnin_phrase_1_action</action>`.
+     `<action>dialogs.deadcity_dushman_turnin_phrase_2_action</action>`.
 4. В `<slug>_quests.script`:
    - есть `local QUESTS = { ... }`;
    - функции имеют сигнатуру `(actor, npc, p)`;
@@ -1530,13 +1684,16 @@ from src.core.models import (
     SetTarget,
     GiveItem,
     RemoveItem,
+    TakeItem,
     GiveMoney,
+    TakeMoney,
     GiveTask,
     CompleteTask,
     # Условия
     HasInfo,
     DontHasInfo,
     HasItem,
+    HasMoney,
     SmartOwner,
     # Типы-алиасы
     Action,
@@ -1597,6 +1754,7 @@ Lua-скрипт генерируется автоматически.
 
 **Почему квест не продвигается?**
 Проверьте `transfer_conditions`, `warfare_capture` (работает только в Warfare),
+`target_squad_id` (отряд должен быть обнаружен живым, а затем уничтожен),
 `on_start_actions` и наличие этапа с нужным `target_alias`. Состояние хранится
 в pstor; после изменения логики лучше начать новую игру или очистить сохранение.
 

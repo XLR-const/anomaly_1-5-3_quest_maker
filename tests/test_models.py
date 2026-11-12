@@ -33,12 +33,16 @@ from src.core.models import (  # noqa: E402
     GiveItem,
     GiveMoney,
     HasInfo,
+    HasItem,
+    HasMoney,
     ModProject,
     Phrase,
     Quest,
     RemoveInfo,
     SpawnSquad,
     Stage,
+    TakeItem,
+    TakeMoney,
 )
 
 #: Эталонный русский текст реплики для проверки Unicode при Round-trip.
@@ -540,6 +544,59 @@ class TestStalkerMetadataFields(unittest.TestCase):
         self.assertIsInstance(rule["complete"][0], HasInfo)
         self.assertIsInstance(rule["fail"][0], DontHasInfo)
         self.assertEqual(rule["complete"][0].info, "done")
+
+
+class TestTraderActionsAndConditions(unittest.TestCase):
+    """Проверка новых действий/условий и поля ``target_squad_id``."""
+
+    def test_new_actions_are_polymorphic(self) -> None:
+        """``TakeItem`` и ``TakeMoney`` входят в общий ``Action`` union."""
+        adapter = TypeAdapter(Action)
+        take_item = adapter.validate_python(
+            {"type": "take_item", "item_alias": "itm_pda_common", "count": 3}
+        )
+        take_money = adapter.validate_python(
+            {"type": "take_money", "amount": 2500}
+        )
+
+        self.assertIsInstance(take_item, TakeItem)
+        self.assertEqual(take_item.count, 3)
+        self.assertIsInstance(take_money, TakeMoney)
+        self.assertEqual(take_money.amount, 2500)
+
+    def test_new_conditions_are_polymorphic(self) -> None:
+        """``HasItem(count)`` и ``HasMoney`` входят в ``Condition`` union."""
+        adapter = TypeAdapter(Condition)
+        has_item = adapter.validate_python(
+            {"type": "has_item", "item_alias": "wpn_ak105", "count": 2}
+        )
+        has_money = adapter.validate_python(
+            {"type": "has_money", "amount": 50000}
+        )
+
+        self.assertIsInstance(has_item, HasItem)
+        self.assertEqual(has_item.count, 2)
+        self.assertIsInstance(has_money, HasMoney)
+        self.assertEqual(has_money.amount, 50000)
+
+    def test_has_item_defaults_to_one_and_rejects_zero(self) -> None:
+        """Количество по умолчанию — 1; ``count=0`` недопустим."""
+        self.assertEqual(HasItem(item_alias="x").count, 1)
+        self.assertEqual(TakeItem(item_alias="x").count, 1)
+        with self.assertRaises(ValidationError):
+            HasItem(item_alias="x", count=0)
+        with self.assertRaises(ValidationError):
+            TakeItem(item_alias="x", count=0)
+
+    def test_stage_accepts_target_squad_id(self) -> None:
+        """Этап хранит ID/секцию целевого отряда."""
+        stage = Stage(
+            id=0,
+            target_squad_id="esc_3_16_military_trader_squad",
+        )
+        self.assertEqual(
+            stage.target_squad_id, "esc_3_16_military_trader_squad"
+        )
 
 
 if __name__ == "__main__":
