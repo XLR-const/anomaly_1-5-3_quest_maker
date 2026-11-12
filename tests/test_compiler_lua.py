@@ -30,6 +30,7 @@ from src.core.models import (  # noqa: E402
     Dialog,
     GiveInfo,
     GiveItem,
+    GiveMoney,
     GiveTask,
     HasInfo,
     HasItem,
@@ -358,6 +359,8 @@ class TestTraderMechanicsAndSquadTracking(unittest.TestCase):
                     actions=[
                         TakeItem(item_alias="itm_pda_common", count=2),
                         TakeMoney(amount=1500),
+                        GiveItem(item_alias="itm_pda_common", count=1),
+                        GiveMoney(amount=2500),
                     ],
                 ),
             },
@@ -379,10 +382,13 @@ class TestTraderMechanicsAndSquadTracking(unittest.TestCase):
         for fragment in (
             'kind = "take_item"',
             'kind = "take_money"',
+            'kind = "give_item"',
+            'kind = "give_money"',
             'kind = "has_money"',
             'item = "itm_pda_common"',
             "count = 2",
             "amount = 1500",
+            "amount = 2500",
             "amount = 5000",
         ):
             with self.subTest(fragment=fragment):
@@ -400,6 +406,8 @@ class TestTraderMechanicsAndSquadTracking(unittest.TestCase):
             "local function target_squad_dead(q, stage)",
             "local function take_item(section, count, actor)",
             "local function take_money(amount, actor)",
+            "local function give_item(section, count, actor)",
+            "local function give_money(amount, actor)",
             'local function trader_kill_dialog_phrase_0_precondition',
             'local function trader_kill_dialog_phrase_0_action',
         ):
@@ -420,9 +428,40 @@ class TestTraderMechanicsAndSquadTracking(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, script)
 
-        self.assertEqual(script.count("news_manager.relocate_item("), 1)
+        self.assertEqual(script.count("news_manager.relocate_item("), 2)
+        self.assertIn(
+            'news_manager.relocate_item(obj, "out", section, removed)',
+            script,
+        )
+        self.assertIn(
+            'news_manager.relocate_item(obj, "in", section, given)',
+            script,
+        )
         self.assertNotIn("dialogs.relocate_item_section", script)
         self.assertNotIn("itms_manager.relocate_item_from_actor", script)
+
+    def test_give_money_and_item_use_standard_in_notifications(self) -> None:
+        """Выдача денег/предмета показывает стандартные иконки и перевод."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_trader_project()
+        )
+
+        for fragment in (
+            "news_manager.relocate_money(obj, \"in\", amount)",
+            "news_manager.relocate_item(obj, \"in\", section, given)",
+            "give_money(spec.amount, actor or db.actor)",
+            "give_item(spec.item, spec.count, actor or db.actor)",
+            "give_money(quest.money, actor or db.actor)",
+            "give_item(quest.item, quest.item_count, actor or db.actor)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
+
+        # Сырые строковые ID не должны попадать в левый бар КПК.
+        self.assertIn("game.translate_string", script)
+        self.assertNotIn("pda_tip(spec.item", script)
+        self.assertNotIn("pda_tip(section", script)
+        self.assertNotIn("pda_tip(quest.item", script)
 
     def test_resolve_alife_object_searches_squad_section(self) -> None:
         """Секция сквада находится через SIMBOARD и перебор ``alife()``."""
@@ -478,6 +517,8 @@ class TestTraderMechanicsAndSquadTracking(unittest.TestCase):
             def find_item_by_alias(self, alias: str):
                 if alias == "weapon.pda":
                     return {"id": "itm_pda_common"}
+                if alias == "weapon.kobra":
+                    return {"id": "wpn_val_modern_kobra"}
                 return None
 
             def find_squad_by_alias(self, alias: str):
@@ -492,13 +533,19 @@ class TestTraderMechanicsAndSquadTracking(unittest.TestCase):
         project.quests["trader_kill_quest"].stages[0].on_start_actions[0] = (
             TakeItem(item_alias="weapon.pda", count=2)
         )
+        project.quests["trader_kill_quest"].reward_item_alias = "weapon.kobra"
+        project.dialogs["trader_kill_dialog"].phrases[0].actions[2] = (
+            GiveItem(item_alias="weapon.pda", count=1)
+        )
 
         script = LuaGenerator(db_client=FakeDatabase()).generate_quests_script(
             project
         )
 
         self.assertIn('item = "itm_pda_common"', script)
+        self.assertIn('item = "wpn_val_modern_kobra"', script)
         self.assertNotIn('item = "weapon.pda"', script)
+        self.assertNotIn('item = "weapon.kobra"', script)
         self.assertIn(
             'target_squad = "esc_3_16_military_trader_squad"', script
         )

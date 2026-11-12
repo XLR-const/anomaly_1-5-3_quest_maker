@@ -244,7 +244,13 @@ class SetTarget(BaseAction):
 
 
 class GiveItem(BaseAction):
-    """Выдать предмет игроку через ``alife_create_item``."""
+    """Выдать предмет игроку через ``alife_create_item``.
+
+    После выдачи ровно один раз вызывается
+    ``news_manager.relocate_item(actor, "in", section, count)``: в окне диалога
+    появляется иконка предмета, а в КПК — переведённое название. Секция
+    разрешается из алиаса БД ещё на этапе компиляции.
+    """
 
     type: Literal["give_item"] = Field(default="give_item")
     item_alias: str = Field(description="Секция выдаваемого предмета.")
@@ -274,7 +280,12 @@ class TakeItem(BaseAction):
 
 
 class GiveMoney(BaseAction):
-    """Выдать игроку деньги (``db.actor:give_money``)."""
+    """Выдать игроку деньги (``db.actor:give_money``).
+
+    После начисления ровно один раз вызывается
+    ``news_manager.relocate_money(actor, "in", amount)``, что показывает
+    стандартную иконку и сумму в окне диалога.
+    """
 
     type: Literal["give_money"] = Field(default="give_money")
     amount: int = Field(ge=0, description="Сумма в игровой валюте.")

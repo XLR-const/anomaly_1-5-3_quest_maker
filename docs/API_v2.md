@@ -250,10 +250,10 @@ RequiredId: TypeAlias = Annotated[
 | `RemoveInfo` | `"remove_info"` | `info: RequiredId` | Lua `db.actor:disable_info_portion(info)`. |
 | `SpawnSquad` | `"spawn_squad"` | `squad_alias: str`, `smart_alias: str` | Lua `SIMBOARD:create_squad` + `sim_squad_warfare.set_target` + заморозка. |
 | `SetTarget` | `"set_target"` | `squad_alias: str`, `smart_alias: str` | Lua `sim_squad_warfare.set_target`. |
-| `GiveItem` | `"give_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `alife_create_item(section, db.actor)` в цикле. |
+| `GiveItem` | `"give_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `give_item(...)`: `alife_create_item(section, actor)` по одному и одно уведомление `news_manager.relocate_item(actor, "in", section, count)`. Алиас разрешается в реальную секцию. |
 | `RemoveItem` | `"remove_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `take_item(...)`: прямое изъятие из инвентаря игрока через `actor:iterate_inventory` + `alife_release`. |
 | `TakeItem` | `"take_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Семантический алиас `RemoveItem`: та же реализация `take_item`; ровно одно уведомление `news_manager.relocate_item(..., "out", ...)` при `removed > 0`. |
-| `GiveMoney` | `"give_money"` | `amount: int` (`ge=0`) | Lua `db.actor:give_money(amount)`. |
+| `GiveMoney` | `"give_money"` | `amount: int` (`ge=0`) | Lua `give_money(...)`: `actor:give_money(amount)` и одно уведомление `news_manager.relocate_money(actor, "in", amount)`. |
 | `TakeMoney` | `"take_money"` | `amount: int` (`ge=0`) | Lua `take_money(...)`: списание с ограничением по текущему балансу, без ухода в минус. |
 | `GiveTask` | `"give_task"` | `task_id: RequiredId` | В XML — `<action>dialogs.<текущий_dialog_id>_accept</action>`; в Lua — `give_task`. |
 | `CompleteTask` | `"complete_task"` | `task_id: RequiredId` | В XML — `<action>dialogs.<текущий_dialog_id>_turn_in</action>`; в Lua — `complete_task`. |
@@ -302,6 +302,13 @@ actions = [
 > `dialogs.relocate_item_section` и `itms_manager.relocate_item_from_actor` не
 > используются: в Anomaly 1.5.3 они приводили к дублированию сообщения
 > «Потерян предмет».
+
+> **Уведомления при выдаче наград.** `GiveMoney` после начисления вызывает
+> `news_manager.relocate_money(actor, "in", amount)`, а `GiveItem` — одно
+> `news_manager.relocate_item(actor, "in", section, count)` на всю выданную
+> стопку. Это показывает стандартные иконки денег/оружия в окне диалога.
+> `GiveItem` всегда получает уже разрешённую секцию (`wpn_val_modern_kobra`), а
+> не алиас из БД, поэтому в КПК отображается переведённое название предмета.
 
 > **Семантика `GiveTask`/`CompleteTask` в XML:** действие всегда ссылается на
 > **текущий диалог**, в реплике которого оно объявлено:
@@ -1101,7 +1108,8 @@ register()
 > ID `<quest_id>_msg_reward` и `<quest_id>_msg_fail`. Базовый генератор
 > `st_<slug>.xml` создаёт `_title`, `_descr` и `_stage_<n>_*`; если вы хотите
 > кастомные подсказки завершения/провала, добавьте `_msg_reward`/`_msg_fail` в
-> свою таблицу строк.
+> свою таблицу строк. `pda_tip` проверяет перевод через `game.translate_string`
+> и не выводит строку, если перевода нет, — сырые ID не попадают в левый бар КПК.
 
 ### Pstor и отряды
 

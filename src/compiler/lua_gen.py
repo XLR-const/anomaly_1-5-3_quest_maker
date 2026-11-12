@@ -264,10 +264,17 @@ local function sound_task()
 	pcall(xr_sound.set_sound_play, db.actor:id(), PDA_SOUND)
 end
 
--- Shows a PDA tip by string id.
+-- Shows a PDA tip by string id; ignores ids without a translation so the PDA
+-- never displays raw technical identifiers.
 local function pda_tip(text_id)
 	if not text_id or text_id == "" then return end
 	if not (db.actor and news_manager and news_manager.send_tip) then return end
+	if game and game.translate_string then
+		local ok, translated = pcall(game.translate_string, text_id)
+		if not ok or not translated or translated == "" or translated == text_id then
+			return
+		end
+	end
 	pcall(news_manager.send_tip, db.actor, text_id, nil, "default", 5000)
 end
 
@@ -400,18 +407,41 @@ local function is_smart_owned(smart_name, faction)
 	return smart.owning_faction == faction
 end
 
--- Gives items to the actor one by one.
-local function give_item(section, count)
-	if not (db.actor and section and section ~= "") then return end
+-- Adds money and reports the transfer once, using the vanilla news icon.
+local function give_money(amount, actor)
+	local obj = actor or db.actor
+	amount = tonumber(amount) or 0
+	if not (obj and amount > 0) then return end
+
+	obj:give_money(amount)
+	if news_manager and news_manager.relocate_money then
+		news_manager.relocate_money(obj, "in", amount)
+	end
+end
+
+-- Gives items to the actor one by one and reports the received stack once.
+-- The section is resolved at compile time, so the news manager can show the
+-- localized item name and icon instead of a raw alias.
+local function give_item(section, count, actor)
+	local obj = actor or db.actor
+	if not (obj and section and section ~= "") then return end
 	count = tonumber(count) or 1
+	if count <= 0 then return end
+
+	local given = 0
 	for _ = 1, count do
 		local ok, se_item = pcall(function()
-			return alife_create_item(section, db.actor)
+			return alife_create_item(section, obj)
 		end)
 		if not (ok and se_item) then
 			printe("[__SCRIPT_NAME__] ! cannot give item [%s]", tostring(section))
-			return
+			break
 		end
+		given = given + 1
+	end
+
+	if given > 0 and news_manager and news_manager.relocate_item then
+		news_manager.relocate_item(obj, "in", section, given)
 	end
 end
 
@@ -554,11 +584,11 @@ local function run_actions(actions, actor, npc)
 		elseif kind == "remove_info" then
 			if db.actor then db.actor:disable_info_portion(spec.info) end
 		elseif kind == "give_money" then
-			if db.actor then db.actor:give_money(spec.amount) end
+			give_money(spec.amount, actor or db.actor)
 		elseif kind == "take_money" then
 			take_money(spec.amount, actor or db.actor)
 		elseif kind == "give_item" then
-			give_item(spec.item, spec.count)
+			give_item(spec.item, spec.count, actor or db.actor)
 		elseif kind == "remove_item" or kind == "take_item" then
 			take_item(spec.item, spec.count, actor or db.actor)
 		elseif kind == "spawn_squad" or kind == "set_target" then
@@ -1201,10 +1231,10 @@ local function {quest_id}_reward(actor, npc, p)
 	if not (db.actor and quest) then return end
 
 	if quest.money and quest.money > 0 then
-		db.actor:give_money(quest.money)
+		give_money(quest.money, actor or db.actor)
 	end
 	if quest.item ~= "" then
-		give_item(quest.item, quest.item_count)
+		give_item(quest.item, quest.item_count, actor or db.actor)
 	end
 	if quest.complete_info ~= "" then
 		db.actor:give_info_portion(quest.complete_info)
