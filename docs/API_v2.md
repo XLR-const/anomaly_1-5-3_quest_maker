@@ -363,6 +363,15 @@ conditions = [
 > `false`, если задача уже выдана. Для проверки предмета при сдаче используйте
 > `Phrase.preconditions` (как в примере раздела 4).
 
+> **Одноразовые квесты.** Для диалога с `role="take"` (а также `take_assault`,
+> `take_solo`, ...) генератор `xml_gen.py` всегда добавляет
+> `<precondition>dialogs.<dialog_id>_can_take</precondition>`, даже если все
+> условия заданы простыми info-тегами. Сгенерированная `_can_take` возвращает
+> `false`, если у актора уже есть `Quest.complete_info` или `Quest.done_info`,
+> либо задача всё ещё активна в `task_manager`. Поэтому после успешной сдачи
+> стартовый диалог не открывается повторно. `taken_info` при успехе не
+> снимается — только `_cleanup` (провал/отмена) очищает его.
+
 ## 2.4. `Phrase` — одна реплика диалога
 
 ```python
@@ -420,7 +429,7 @@ class Dialog(BaseModel):
 | `npc_id` | `OptionalId` | `None` | Точный `<specific_character id="...">` из `character_desc_<level>.xml`. |
 | `npc_location` | `str \| None` | `None` | Имя локации (`deadcity`, `escape`, `zaton`, ...). Выбирает `character_desc_<level>.xml`. |
 | `task_id` | `OptionalId` | `None` | ID связанного квеста (`Quest.id`) для `GiveTask`/`CompleteTask` и `_can_take`/`_can_turn_in`. |
-| `role` | `str \| None` | `None` | Роль: `take`, `take_assault`, `take_solo`, `turnin`, `turn_in`, `branch`. Влияет только на порядок вставки `<actor_dialog>`. |
+| `role` | `str \| None` | `None` | Роль: `take`, `take_assault`, `take_solo`, `turnin`, `turn_in`, `branch`. Влияет на порядок вставки `<actor_dialog>`. Для `take`/`take_*` диалог всегда получает `<precondition>dialogs.<dialog_id>_can_take</precondition>`, который блокирует повторное взятие после выдачи `complete_info`. |
 | `preconditions` | `list[Condition]` | `[]` | Условия доступности всего диалога. |
 | `phrases` | `dict[int, Phrase]` | `{}` | Карта реплик. Ключ обязан совпадать с `Phrase.id`. |
 
@@ -655,7 +664,7 @@ class Quest(BaseModel):
 | `reward_item_alias` | `str \| None` | `None` | Секция предмета, автоматически выдаваемого в `_reward`. |
 | `reward_item_count` | `int` (`ge=1`) | `1` | Количество предметов награды. |
 | `complete_info` | `str \| None` | `None` | Поршень, выдаваемый в `_reward`. |
-| `taken_info` | `str \| None` | `None` | Поршень, выдаваемый в `_start` и снимаемый в `_reward`/`_cleanup`. |
+| `taken_info` | `str \| None` | `None` | Поршень, выдаваемый в `_start`. Снимается только в `_cleanup` (провал/отмена); при успешном завершении сохраняется. |
 | `return_to_giver_stage` | `int \| None` | `None` | Этап, на котором игрок должен вернуться к квестодателю. |
 | `return_distance` | `float` (`ge=0`) | `40.0` | Радиус «подошёл к квестодателю» в метрах. |
 | `available_info` | `str \| None` | `None` | Зарезервировано для внешних скриптов/UI; ядро только сохраняет значение в таблице `QUESTS`. |
@@ -1093,8 +1102,10 @@ register()
 
 - `Quest.on_init_actions` — в `<quest_id>_start`, после выдачи `taken_info`.
 - `Quest.on_complete_actions` — в `<quest_id>_reward`, после `reward_money`/
-  `reward_item_alias`/`complete_info`.
-- `Quest.on_fail_actions` — в `<quest_id>_cleanup`.
+  `reward_item_alias`/`complete_info`. `taken_info` при успехе **не снимается**:
+  это защищает стартовый диалог от повторного открытия.
+- `Quest.on_fail_actions` — в `<quest_id>_cleanup`; здесь `taken_info`
+  снимается, потому что квест можно взять заново.
 - `Stage.on_start_actions` — в `<quest_id>_status` ровно один раз за этап.
 - `Phrase.actions`:
   - `GiveInfo` → прямой XML-тег `<give_info>`;

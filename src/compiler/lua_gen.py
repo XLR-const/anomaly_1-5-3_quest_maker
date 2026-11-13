@@ -1242,9 +1242,6 @@ local function {quest_id}_reward(actor, npc, p)
 
 	run_actions(quest.complete_actions, actor or db.actor, npc)
 	unmark_quest_squads(quest)
-	if quest.taken_info ~= "" then
-		db.actor:disable_info_portion(quest.taken_info)
-	end
 	sound_task()
 	pda_tip(quest.msg_reward)
 	printf("[__SCRIPT_NAME__] %s reward given", {q})
@@ -1351,12 +1348,28 @@ end"""
         ]
         conditions_lua = self._to_lua(condition_specs, indent=1)
         linked = self._lua_string(linked_quest_id or "")
+        linked_data = (
+            quest_data.get(linked_quest_id) if linked_quest_id else None
+        ) or {}
+        complete_info = self._lua_string(
+            str(linked_data.get("complete_info") or "")
+        )
+        done_info = self._lua_string(str(linked_data.get("done_info") or ""))
 
         can_take = f"""\
 -- Dialog availability: all dialog-level conditions plus "task not given".
+-- A completed quest stays closed even after task_manager drops its task.
 local function {dialog_id}_can_take(actor, npc, p)
 	local linked = {linked}
 	if linked ~= "" then
+		local complete_info = {complete_info}
+		if complete_info ~= "" and has_alife_info(complete_info) then
+			return false
+		end
+		local done_info = {done_info}
+		if done_info ~= "" and has_alife_info(done_info) then
+			return false
+		end
 		local tm = task_manager and task_manager.get_task_manager()
 		if tm and tm.task_info[linked] then return false end
 	end

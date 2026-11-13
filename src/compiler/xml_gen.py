@@ -241,7 +241,12 @@ class XmlGenerator:
         lines = [f'\t<dialog id="{dialog_id}">']
 
         # Уровень диалога: инфопоршни и одно Lua-условие на все прочие типы.
+        # Для стартовых диалогов role="take*" Lua-условие обязательно: именно
+        # _can_take блокирует повторное взятие завершённого квеста.
         info_tags, needs_condition = self._split_dialog_conditions(dialog)
+        role = str(getattr(dialog, "role", "") or "")
+        if role.startswith("take"):
+            needs_condition = True
         if needs_condition:
             lines.append(
                 f"\t\t<precondition>dialogs.{dialog_id}_can_take</precondition>"
@@ -268,6 +273,11 @@ class XmlGenerator:
         ``HasInfo``/``DontHasInfo`` имеют штатные XML-теги (стандарт, 2.1,
         п. 5). Остальные типы условий не представимы тегами и выносятся в
         функцию ``dialogs.<dialog_id>_can_take``.
+
+        Дополнительно для диалогов ``role="take"``/``take_*`` Lua-условие
+        требуется всегда, даже если все условия заданы info-тегами: в
+        ``_can_take`` генератор добавляет проверку ``complete_info``/``done_info``
+        связанного квеста, чтобы закрытый квест нельзя было взять повторно.
 
         Args:
             dialog (Dialog): Модель диалога.

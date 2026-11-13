@@ -25,9 +25,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.compiler.lua_gen import LuaGenerator  # noqa: E402
+from src.compiler.xml_gen import XmlGenerator  # noqa: E402
 from src.core.models import (  # noqa: E402
     CompleteTask,
     Dialog,
+    DontHasInfo,
     GiveInfo,
     GiveItem,
     GiveMoney,
@@ -462,6 +464,70 @@ class TestTraderMechanicsAndSquadTracking(unittest.TestCase):
         self.assertNotIn("pda_tip(spec.item", script)
         self.assertNotIn("pda_tip(section", script)
         self.assertNotIn("pda_tip(quest.item", script)
+
+    def test_completed_quest_cannot_be_taken_again(self) -> None:
+        """После выдачи complete_info стартовый диалог закрыт навсегда."""
+        quest = Quest(
+            id="once_quest",
+            npc_id="esc_mayor",
+            stages={0: Stage(id=0)},
+            complete_info="once_done",
+            taken_info="once_started",
+        )
+        dialog = Dialog(
+            id="once_take",
+            task_id=quest.id,
+            role="take",
+            preconditions=[DontHasInfo(info="once_started")],
+            phrases={
+                0: Phrase(
+                    id=0,
+                    text_ru="Есть работа?",
+                    text_en="Got a job?",
+                )
+            },
+        )
+        project = ModProject(
+            name="Once",
+            quests={quest.id: quest},
+            dialogs={dialog.id: dialog},
+        )
+
+        lua = LuaGenerator().generate_quests_script(
+            project,
+            script_name="once_quests",
+            mod_prefix="once",
+        )
+        xml = XmlGenerator().generate_dialogs_xml(project.dialogs)
+
+        # role="take" обязан ссылаться на _can_take даже при info-условиях.
+        self.assertIn(
+            "<precondition>dialogs.once_take_can_take</precondition>",
+            xml,
+        )
+
+        can_take = lua[
+            lua.index("local function once_take_can_take"):
+            lua.index("local function once_take_can_turn_in")
+        ]
+        self.assertIn('local complete_info = "once_done"', can_take)
+        self.assertIn("has_alife_info(complete_info)", can_take)
+        self.assertIn('local done_info = ""', can_take)
+
+        reward = lua[
+            lua.index("local function once_quest_reward"):
+            lua.index("local function once_quest_cleanup")
+        ]
+        self.assertIn('complete_info = "once_done"', lua)
+        self.assertIn("db.actor:give_info_portion(quest.complete_info)", reward)
+        self.assertNotIn("disable_info_portion", reward)
+
+        cleanup = lua[
+            lua.index("local function once_quest_cleanup"):
+            lua.index("local function once_quest_accept")
+        ]
+        self.assertIn('taken_info = "once_started"', lua)
+        self.assertIn("db.actor:disable_info_portion(quest.taken_info)", cleanup)
 
     def test_resolve_alife_object_searches_squad_section(self) -> None:
         """Секция сквада находится через SIMBOARD и перебор ``alife()``."""
