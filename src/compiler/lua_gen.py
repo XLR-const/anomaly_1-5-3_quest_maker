@@ -36,6 +36,7 @@ from src.core.models import (
     SpawnSquad,
     TakeItem,
     TakeMoney,
+    phrase_action_mode,
 )
 from src.logger import get_logger
 
@@ -122,6 +123,8 @@ local function get_smart(name)
 end
 
 -- Resolves a stage target: smart name, numeric server id or story id.
+-- Story names are resolved through get_story_object_id(): the engine's
+-- story_object lookup expects a numeric story id, not a string name.
 local function resolve_target(target)
 	if target == nil or target == "" then return nil end
 	local smart = get_smart(target)
@@ -131,8 +134,16 @@ local function resolve_target(target)
 		local obj = alife_object(numeric_id)
 		return obj and obj.id or nil
 	end
-	local ok, story_obj = pcall(function() return alife():story_object(target) end)
-	return (ok and story_obj and story_obj.id) or nil
+	if get_story_object_id then
+		local ok, story_id = pcall(function()
+			return get_story_object_id(target)
+		end)
+		if ok and story_id and story_id ~= 0 then
+			local obj = alife_object(story_id)
+			return obj and obj.id or story_id
+		end
+	end
+	return nil
 end
 
 -- Stable pstor key; never equals task_id (task_manager clears that key).
@@ -193,16 +204,26 @@ local function resolve_alife_object(target)
 	local numeric = tonumber(target)
 	if numeric then return alife_object(numeric) end
 
-	local ok, obj = pcall(function() return alife():story_object(target) end)
-	if ok and obj then return obj end
-
+	if get_story_object then
+		local object_ok, story_obj = pcall(function()
+			return get_story_object(target)
+		end)
+		if object_ok and story_obj then return story_obj end
+	end
 	if get_story_squad then
-		local squad_ok, squad = pcall(get_story_squad, target)
+		local squad_ok, squad = pcall(function()
+			return get_story_squad(target)
+		end)
 		if squad_ok and squad then return squad end
 	end
-	if get_story_object then
-		local object_ok, story_obj = pcall(get_story_object, target)
-		if object_ok and story_obj then return story_obj end
+	if get_story_object_id then
+		local id_ok, story_id = pcall(function()
+			return get_story_object_id(target)
+		end)
+		if id_ok and story_id and story_id ~= 0 then
+			local obj = alife_object(story_id)
+			if obj then return obj end
+		end
 	end
 
 	local found = nil
@@ -506,15 +527,28 @@ local function give_task(task_id, npc)
 	end
 	if tm.task_info[task_id] then return end
 
+	-- Normalize the speaker to an actor-alife object first; dialogs.who_is_npc
+	-- also handles the case when the engine passes a non-NPC object.
+	local speaker = npc
+	if dialogs and dialogs.who_is_npc then
+		local ok, value = pcall(dialogs.who_is_npc, db.actor, npc)
+		if ok and value then speaker = value end
+	end
+
 	local giver_id = nil
-	if npc then giver_id = npc:id() end
+	if speaker then
+		local ok, value = pcall(function() return speaker:id() end)
+		if ok then giver_id = value end
+	end
 	if not giver_id then
 		local quest = QUESTS[task_id]
 		if quest and quest.npc ~= "" then
 			giver_id = resolve_target(quest.npc)
 		end
 	end
-	if not giver_id then giver_id = 0 end
+	-- 0 is truthy in Lua: passing it makes task_manager treat the actor as
+	-- the giver and breaks the quest marker. Pass nil instead.
+	if giver_id == 0 then giver_id = nil end
 	tm:give_task(task_id, giver_id)
 end
 
@@ -530,12 +564,11 @@ end
 local function reached_giver(q, tsk)
 	if not (q and db.actor) then return false end
 	local giver = nil
-	if tsk and tsk.task_giver_id then
+	if tsk and tsk.task_giver_id and tsk.task_giver_id ~= 0 then
 		giver = alife_object(tsk.task_giver_id)
 	end
 	if not giver and q.npc ~= "" then
-		local ok, story_obj = pcall(function() return alife():story_object(q.npc) end)
-		giver = ok and story_obj or nil
+		giver = resolve_alife_object(q.npc)
 	end
 	if not (giver and giver.position) then return false end
 	local ok, distance = pcall(function()
@@ -1130,7 +1163,9 @@ local function {quest_id}_target(task_id, field, p, tsk)
 		local squad = resolve_alife_object(target_squad)
 		return squad and squad.id or nil
 	end
-	if tsk and tsk.task_giver_id then return tsk.task_giver_id end
+	if tsk and tsk.task_giver_id and tsk.task_giver_id ~= 0 then
+		return tsk.task_giver_id
+	end
 	return resolve_target(quest.npc)
 end"""
 
@@ -1446,19 +1481,22 @@ end"""
                     )
                 )
 
-            lua_actions = [
-                action
-                for action in phrase.actions
-                if not isinstance(action, (GiveInfo, GiveTask, CompleteTask))
-            ]
-            if lua_actions:
+            # Один <action> на реплику: если действий несколько, все они
+            # (включая give_task/complete_task) исполняются этой функцией
+            # строго в порядке объявления в phrase.actions.
+            if phrase_action_mode(phrase.actions) == "combined":
+                lua_actions = [
+                    action
+                    for action in phrase.actions
+                    if not isinstance(action, GiveInfo)
+                ]
                 specs = self._to_lua(
                     [self._action_spec(action) for action in lua_actions],
                     indent=1,
                 )
                 blocks.append(
                     f"""\
--- Phrase {phrase_id} action.
+-- Phrase {phrase_id} action: merged actions of the phrase.
 local function {prefix}_action(actor, npc, p)
 	run_actions({specs}, actor or db.actor, npc)
 end"""

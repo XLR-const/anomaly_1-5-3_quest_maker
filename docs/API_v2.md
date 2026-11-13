@@ -255,8 +255,27 @@ RequiredId: TypeAlias = Annotated[
 | `TakeItem` | `"take_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Семантический алиас `RemoveItem`: та же реализация `take_item`; ровно одно уведомление `news_manager.relocate_item(..., "out", ...)` при `removed > 0`. |
 | `GiveMoney` | `"give_money"` | `amount: int` (`ge=0`) | Lua `give_money(...)`: `actor:give_money(amount)` и одно уведомление `news_manager.relocate_money(actor, "in", amount)`. |
 | `TakeMoney` | `"take_money"` | `amount: int` (`ge=0`) | Lua `take_money(...)`: списание с ограничением по текущему балансу, без ухода в минус. |
-| `GiveTask` | `"give_task"` | `task_id: RequiredId` | В XML — `<action>dialogs.<текущий_dialog_id>_accept</action>`; в Lua — `give_task`. |
-| `CompleteTask` | `"complete_task"` | `task_id: RequiredId` | В XML — `<action>dialogs.<текущий_dialog_id>_turn_in</action>`; в Lua — `complete_task`. |
+| `GiveTask` | `"give_task"` | `task_id: RequiredId` | Единственное действие реплики — `<action>dialogs.<текущий_dialog_id>_accept</action>`; в Lua — `give_task`. В комбинации с другими действиями сливается в единую `dialogs.<dialog_id>_phrase_<n>_action`. |
+| `CompleteTask` | `"complete_task"` | `task_id: RequiredId` | Единственное действие реплики — `<action>dialogs.<текущий_dialog_id>_turn_in</action>`; в Lua — `complete_task`. В комбинации с другими действиями сливается в единую `dialogs.<dialog_id>_phrase_<n>_action`. |
+
+> **Ровно один `<action>` на реплику.** Движок X-Ray/OpenXRay хранит
+> **одно** действие на `<phrase>` и молча отбрасывает второй и последующие
+> теги `<action>`. Поэтому компилятор обязан сгенерировать не более одного
+> такого тега:
+>
+> - только `GiveInfo` → `<action>` не нужен (остаются нативные `<give_info>`);
+> - одиночный `GiveTask` → `<action>dialogs.<dialog_id>_accept</action>`;
+> - одиночный `CompleteTask` → `<action>dialogs.<dialog_id>_turn_in</action>`;
+> - любая другая комбинация (включая `GiveTask`/`CompleteTask` вместе с
+>   `GiveMoney`, `GiveItem`, `RemoveItem`, `TakeItem`, `TakeMoney`,
+>   `RemoveInfo`, `SpawnSquad`, `SetTarget`) → **одна** функция
+>   `dialogs.<dialog_id>_phrase_<n>_action`, внутри которой все Lua-действия
+>   исполняются строго в порядке объявления в `Phrase.actions`.
+>
+> `GiveInfo` всегда остаётся нативным тегом `<give_info>` и в слиянии не
+> участвует. Порядок тегов в реплике: `<text>` → `<next>` →
+> `<precondition>` → `<has_info>`/`<dont_has_info>` → `<give_info>` →
+> `<action>`.
 
 Примеры:
 
@@ -310,11 +329,13 @@ actions = [
 > `GiveItem` всегда получает уже разрешённую секцию (`wpn_val_modern_kobra`), а
 > не алиас из БД, поэтому в КПК отображается переведённое название предмета.
 
-> **Семантика `GiveTask`/`CompleteTask` в XML:** действие всегда ссылается на
-> **текущий диалог**, в реплике которого оно объявлено:
-> `dialogs.<dialog_id>_accept` или `dialogs.<dialog_id>_turn_in`. Само имя
-> квеста берётся из связи `Dialog.task_id` (или обратной связи
-> `Quest.dialog_id`/`Quest.dialog_ids`).
+> **Семантика `GiveTask`/`CompleteTask` в XML:** если действие в реплике
+> единственное, оно ссылается на **текущий диалог**:
+> `dialogs.<dialog_id>_accept` или `dialogs.<dialog_id>_turn_in`. Если рядом
+> есть другие Lua-действия, отдельного тега для задачи нет: `GiveTask` и
+> `CompleteTask` становятся элементами массива `run_actions` единой функции
+> `dialogs.<dialog_id>_phrase_<n>_action`. Имя квеста берётся из связи
+> `Dialog.task_id` (или обратной связи `Quest.dialog_id`/`Quest.dialog_ids`).
 
 ## 2.3. Условия (`Condition`)
 
@@ -526,11 +547,28 @@ class Stage(BaseModel):
 ```text
 1. Если имя есть в SIMBOARD.smarts_by_names -> возвращается smart.id.
 2. Если строка — число -> alife_object(number).id.
-3. Иначе -> alife():story_object(name).id.
+3. Иначе -> get_story_object_id(name); полученный числовой story-id
+   проверяется через alife_object(story_id).id.
+4. Если ничего не найдено -> nil.
 ```
 
-Если `target_alias` пуст, `target_functor` возвращает `task_giver_id` (серверный
-ID квестодателя) — это удобно для этапа «вернуться к NPC».
+`get_story_object_id(name)` — штатный способ Anomaly 1.5.3 превратить
+строковое имя story-объекта в числовой ID. Движковый поиск story-объекта
+принимает **только числовой** story-id; передача строки возвращает `nil`,
+поэтому имя обязано сначала пройти через `get_story_object_id(name)`.
+
+Если `target_alias` пуст, `target_functor` резолвит цель в таком порядке:
+
+```text
+1. tsk.task_giver_id, если он задан и ~= 0.
+2. get_story_object_id(Quest.npc_id) (через resolve_target).
+3. nil, если квестодатель не найден.
+```
+
+`0` в Lua является truthy, поэтому проверка `~= 0` обязательна: иначе
+`task_manager` принимает актора за квестодателя и рисует жёлтую метку на
+игроке вместо NPC. Возврат `nil` также означает «цель неизвестна» — маркер
+не должен вешаться на актора.
 
 `on_start_actions` выполняются Lua-функцией `_status` при первом обнаружении
 текущего этапа. Факт выполнения сохраняется в pstor, поэтому действия не
@@ -563,12 +601,17 @@ quest = Quest(
 `target_squad_id` принимает:
 
 - числовой server ID (`"12345"`) — `alife_object(id)`;
-- story ID — `alife():story_object(name)`;
+- строковое story-имя — `get_story_object(name)` /
+  `get_story_squad(name)` либо `get_story_object_id(name)` +
+  `alife_object(story_id)`;
 - секцию/алиас отряда из `SIMBOARD.squads` (при наличии) или БД.
 
 Рантайм-проверка использует проверенные вызовы эталона:
-`resolve_alife_object` → `alife_object`/`story_object`/`SIMBOARD.squads`, а
-признак смерти — `squad:npc_count() <= 0` под `pcall`.
+`resolve_alife_object` → `alife_object`/`get_story_object`/
+`get_story_squad`/`get_story_object_id`/`SIMBOARD.squads`, а признак смерти —
+`squad:npc_count() <= 0` под `pcall`. Строковое имя всегда резолвится через
+`get_story_object_id(name)`; числовой story-id допустим только после такого
+резолва.
 
 > **Защита от преждевременного завершения.** Этап не завершится, пока отряд
 > хотя бы раз не был обнаружен живым. Факт обнаружения хранится в pstor-ключе
@@ -670,9 +713,24 @@ class Quest(BaseModel):
 | `available_info` | `str \| None` | `None` | Зарезервировано для внешних скриптов/UI; ядро только сохраняет значение в таблице `QUESTS`. |
 | `done_info` | `str \| None` | `None` | Зарезервировано для внешних скриптов/UI; ядро только сохраняет значение в таблице `QUESTS`. |
 
-> **Не дублируйте награды.** Если вы задали `reward_money`, `reward_item_alias`
-> или `complete_info`, не добавляйте те же `GiveMoney`/`GiveItem`/`GiveInfo` в
-> диалоговые `actions`, иначе награда выдастся дважды.
+> **Награда сдачи — только через `Quest.reward_*` или `on_complete_actions`.**
+> Если вы задали `reward_money`, `reward_item_alias` или `complete_info`, не
+> добавляйте те же `GiveMoney`/`GiveItem`/`GiveInfo` в диалоговые `actions`,
+> иначе награда выдастся дважды.
+>
+> Если `reward_money`/`reward_item_alias` **пусты**, награда в `actions`
+> реплики, где есть `CompleteTask`, не поддерживается: движок исполняет только
+> один `<action>` на реплику, а `CompleteTask` завершает задачу раньше
+> остальных эффектов. В результате игрок не получает ни денег, ни предмета.
+> Надёжные пути:
+>
+> - `Quest.reward_money` / `Quest.reward_item_alias` (эффект `_reward`);
+> - `Quest.on_complete_actions` (Lua после завершения задачи);
+> - `Quest.complete_info` для поршня завершения.
+>
+> Компилятор (`ModBuilder.build_project`) выводит предупреждение в лог, если
+> видит `GiveMoney`/`GiveItem` рядом с `CompleteTask` при пустых
+> `reward_money`/`reward_item_alias`.
 
 > **Автоматическая сдача vs диалоговая сдача.** Если задан
 > `return_to_giver_stage`, квест завершится автоматически при приближении к
@@ -925,10 +983,15 @@ output/<slug>/
    - `<action>dialogs.<flat_function_name></action>`
 8. `HasInfo`/`DontHasInfo`/`GiveInfo` используют штатные теги:
    `<has_info>`, `<dont_has_info>`, `<give_info>`.
-9. `GiveTask`/`CompleteTask` в реплике ссылаются на **текущий диалог**:
-   `dialogs.<dialog_id>_accept` и `dialogs.<dialog_id>_turn_in`.
-10. Никакого захардкоженного `hello_dialog`: ID всегда приходит из модели.
-11. `Phrase(id=0)` всегда принадлежит Игроку; чётные ID — Игрок, нечётные —
+9. `GiveTask`/`CompleteTask`, если они единственные Lua-действия реплики,
+   ссылаются на **текущий диалог**: `dialogs.<dialog_id>_accept` и
+   `dialogs.<dialog_id>_turn_in`.
+10. **Ровно один `<action>` на реплику.** Если действий несколько, все они
+    (включая `GiveTask`/`CompleteTask`) исполняются единой функцией
+    `dialogs.<dialog_id>_phrase_<n>_action` строго в порядке объявления.
+    Второй тег `<action>` движок отбрасывает.
+11. Никакого захардкоженного `hello_dialog`: ID всегда приходит из модели.
+12. `Phrase(id=0)` всегда принадлежит Игроку; чётные ID — Игрок, нечётные —
     NPC. Не начинайте `<actor_dialog>` с реплики NPC.
 
 Пример сгенерированного файла:
@@ -954,9 +1017,9 @@ output/<slug>/
             <phrase id="2">
                 <!-- Игрок -->
                 <text>deadcity_dushman_take_phrase_2_text</text>
+                <next>3</next>
                 <give_info>deadcity_dushman_pda_started</give_info>
                 <action>dialogs.deadcity_dushman_take_accept</action>
-                <next>3</next>
             </phrase>
             <phrase id="3">
                 <!-- NPC -->
@@ -985,11 +1048,12 @@ output/<slug>/
             <phrase id="2">
                 <!-- Игрок -->
                 <text>deadcity_dushman_turnin_phrase_2_text</text>
+                <next>3</next>
                 <precondition>dialogs.deadcity_dushman_turnin_phrase_2_precondition</precondition>
                 <give_info>deadcity_dushman_pda_done</give_info>
-                <action>dialogs.deadcity_dushman_turnin_turn_in</action>
+                <!-- Один <action>: RemoveItem + GiveMoney + GiveItem + CompleteTask
+                     исполняются внутри единой Lua-функции. -->
                 <action>dialogs.deadcity_dushman_turnin_phrase_2_action</action>
-                <next>3</next>
             </phrase>
             <phrase id="3">
                 <!-- NPC -->
@@ -1109,11 +1173,16 @@ register()
 - `Stage.on_start_actions` — в `<quest_id>_status` ровно один раз за этап.
 - `Phrase.actions`:
   - `GiveInfo` → прямой XML-тег `<give_info>`;
-  - `GiveTask` → XML `<action>dialogs.<dialog_id>_accept</action>`;
-  - `CompleteTask` → XML `<action>dialogs.<dialog_id>_turn_in</action>`;
-  - все остальные (`SpawnSquad`, `GiveMoney`, `TakeMoney`, `GiveItem`,
-    `RemoveItem`, `TakeItem`, `RemoveInfo`, `SetTarget`) → Lua-функция
-    `dialogs.<dialog_id>_phrase_<n>_action`.
+  - одиночный `GiveTask` → XML `<action>dialogs.<dialog_id>_accept</action>`;
+  - одиночный `CompleteTask` → XML
+    `<action>dialogs.<dialog_id>_turn_in</action>`;
+  - любая комбинация действий (включая `GiveTask`/`CompleteTask` рядом с
+    `SpawnSquad`, `GiveMoney`, `TakeMoney`, `GiveItem`, `RemoveItem`,
+    `TakeItem`, `RemoveInfo`, `SetTarget`) → **одна** Lua-функция
+    `dialogs.<dialog_id>_phrase_<n>_action`, которая вызывает `run_actions`
+    со всеми действиями в порядке объявления. В XML при этом ровно один
+    `<action>`.
+  - Второй `<action>` в реплике недопустим: движок его игнорирует.
 
 > **Строки подсказок.** `_reward` и `_cleanup` вызывают `pda_tip` со строковыми
 > ID `<quest_id>_msg_reward` и `<quest_id>_msg_fail`. Базовый генератор
@@ -1351,7 +1420,10 @@ python examples/deadcity_dushman_demo.py
 - выдачу поршня старта и задачи через GiveTask;
 - SpawnSquad на этапе квеста;
 - проверку квестового предмета в preconditions диалога сдачи;
-- выдачу награды в actions: RemoveItem + GiveMoney + GiveItem + GiveInfo;
+- сдачу через RemoveItem + GiveInfo + CompleteTask в одной реплике
+  (единый `<action>`);
+- награду через Quest.reward_money / Quest.reward_item_alias, а не через
+  GiveMoney/GiveItem в actions;
 - сборку мода через ModBuilder.
 
 Запуск из корня проекта:
@@ -1368,8 +1440,6 @@ from src.core.models import (
     Dialog,
     DontHasInfo,
     GiveInfo,
-    GiveItem,
-    GiveMoney,
     GiveTask,
     HasItem,
     ModProject,
@@ -1444,6 +1514,10 @@ def create_dushman_project() -> ModProject:
         is_storyline=True,
         icon="ui_inGame2_Put_v_pripyat",
         prior=60,
+        # Награда выдаётся эффектом _reward после завершения задачи.
+        reward_money=REWARD_MONEY,
+        reward_item_alias=REWARD_WEAPON,
+        reward_item_count=1,
         stages={
             0: Stage(
                 id=0,
@@ -1553,10 +1627,10 @@ def create_dushman_project() -> ModProject:
                 text_en="Here. I have the PDA.",
                 # Ветка сдачи доступна только при наличии предмета.
                 preconditions=[HasItem(item_alias=QUEST_ITEM)],
+                # GiveInfo — нативный <give_info>; остальные действия
+                # сливаются в одну dialogs.<dialog>_phrase_2_action.
                 actions=[
                     RemoveItem(item_alias=QUEST_ITEM, count=1),
-                    GiveMoney(amount=REWARD_MONEY),
-                    GiveItem(item_alias=REWARD_WEAPON, count=1),
                     GiveInfo(info=DONE_INFO),
                     CompleteTask(task_id=QUEST_ID),
                 ],
@@ -1644,8 +1718,9 @@ output/dead_city_dushmans_debt/gamedata/
    - переходы оформлены как `<next>1</next>`, `<next>2</next>`;
    - в диалоге сдачи есть
      `<precondition>dialogs.deadcity_dushman_turnin_phrase_2_precondition</precondition>`;
-   - есть `<action>dialogs.deadcity_dushman_turnin_turn_in</action>` и
-     `<action>dialogs.deadcity_dushman_turnin_phrase_2_action</action>`.
+   - в реплике сдачи ровно **один** `<action>`:
+     `<action>dialogs.deadcity_dushman_turnin_phrase_2_action</action>`
+     (RemoveItem + GiveInfo + CompleteTask внутри одной Lua-функции).
 4. В `<slug>_quests.script`:
    - есть `local QUESTS = { ... }`;
    - функции имеют сигнатуру `(actor, npc, p)`;

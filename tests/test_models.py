@@ -26,12 +26,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.core.models import (  # noqa: E402
     Action,
+    CompleteTask,
     Condition,
     Dialog,
     DontHasInfo,
     GiveInfo,
     GiveItem,
     GiveMoney,
+    GiveTask,
     HasInfo,
     HasItem,
     HasMoney,
@@ -43,6 +45,8 @@ from src.core.models import (  # noqa: E402
     Stage,
     TakeItem,
     TakeMoney,
+    find_phrase_reward_conflicts,
+    phrase_action_mode,
 )
 
 #: Эталонный русский текст реплики для проверки Unicode при Round-trip.
@@ -597,6 +601,67 @@ class TestTraderActionsAndConditions(unittest.TestCase):
         self.assertEqual(
             stage.target_squad_id, "esc_3_16_military_trader_squad"
         )
+
+
+class TestPhraseActionModes(unittest.TestCase):
+    """Проверка слияния действий реплики в один ``<action>``."""
+
+    def test_single_actions_keep_dedicated_effects(self) -> None:
+        """Одиночные ``GiveTask``/``CompleteTask`` идут в ``_accept``/``_turn_in``."""
+        self.assertEqual(
+            phrase_action_mode([GiveTask(task_id="q")]), "accept"
+        )
+        self.assertEqual(
+            phrase_action_mode([CompleteTask(task_id="q")]), "turn_in"
+        )
+        self.assertIsNone(phrase_action_mode([GiveInfo(info="i")]))
+        self.assertIsNone(phrase_action_mode([]))
+
+    def test_mixed_actions_require_combined_function(self) -> None:
+        """Награда рядом с ``CompleteTask`` требует единой ``_action``."""
+        mode = phrase_action_mode(
+            [
+                GiveItem(item_alias="itm_pda_common"),
+                CompleteTask(task_id="q"),
+            ]
+        )
+        self.assertEqual(mode, "combined")
+
+    def test_reward_conflict_is_reported(self) -> None:
+        """Реплика сдачи с наградой и пустым ``reward_*`` даёт предупреждение."""
+        quest = Quest(
+            id="reward_quest",
+            npc_id="esc_mayor",
+            stages={0: Stage(id=0)},
+        )
+        dialog = Dialog(
+            id="reward_dialog",
+            task_id=quest.id,
+            phrases={
+                0: Phrase(
+                    id=0,
+                    actions=[
+                        GiveMoney(amount=10000),
+                        GiveItem(item_alias="wpn_vssk"),
+                        CompleteTask(task_id=quest.id),
+                    ],
+                )
+            },
+        )
+        project = ModProject(
+            name="Reward",
+            quests={quest.id: quest},
+            dialogs={dialog.id: dialog},
+        )
+
+        conflicts = find_phrase_reward_conflicts(project)
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("reward_dialog", conflicts[0])
+        self.assertIn("GiveMoney", conflicts[0])
+        self.assertIn("GiveItem", conflicts[0])
+
+        quest.reward_money = 10000
+        self.assertEqual(find_phrase_reward_conflicts(project), [])
 
 
 if __name__ == "__main__":

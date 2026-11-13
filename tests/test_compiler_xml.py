@@ -224,14 +224,58 @@ class TestXmlGeneratorDialogs(unittest.TestCase):
         ]
         self.assertEqual(
             actions_1,
-            [
-                f"dialogs.{DIALOG_ID}_accept",
-                f"dialogs.{DIALOG_ID}_phrase_1_action",
-            ],
+            [f"dialogs.{DIALOG_ID}_phrase_1_action"],
         )
         self.assertEqual(
             phrase_1.findtext("precondition"),
             f"dialogs.{DIALOG_ID}_phrase_1_precondition",
+        )
+
+    def test_phrase_has_at_most_one_action(self) -> None:
+        """Движок читает один ``<action>``: второй тег недопустим."""
+        for dialog in self.root.findall("dialog"):
+            for phrase in dialog.findall("./phrase_list/phrase"):
+                with self.subTest(
+                    phrase=f"{dialog.get('id')}/{phrase.get('id')}"
+                ):
+                    self.assertLessEqual(len(phrase.findall("action")), 1)
+
+    def test_single_give_task_keeps_accept_effect(self) -> None:
+        """Одиночный ``GiveTask`` остаётся ``dialogs.<id>_accept``."""
+        project = _make_project()
+        project.dialogs[DICT_KEY].phrases[1].actions = [
+            GiveTask(task_id=QUEST_ID)
+        ]
+        root = ET.fromstring(
+            XmlGenerator().generate_dialogs_xml(project.dialogs)
+        )
+        phrase_1 = _find_phrase(_find_dialog(root, DIALOG_ID), "1")
+        self.assertEqual(
+            [tag.text for tag in phrase_1.findall("action")],
+            [f"dialogs.{DIALOG_ID}_accept"],
+        )
+
+    def test_give_info_stays_native_and_precedes_action(self) -> None:
+        """``GiveInfo`` остаётся тегом и идёт перед единственным действием."""
+        project = _make_project()
+        project.dialogs[DICT_KEY].phrases[1].actions = [
+            GiveInfo(info="mymod_extra"),
+            GiveTask(task_id=QUEST_ID),
+            GiveItem(item_alias="mymod_reward", count=1),
+        ]
+        root = ET.fromstring(
+            XmlGenerator().generate_dialogs_xml(project.dialogs)
+        )
+        phrase_1 = _find_phrase(_find_dialog(root, DIALOG_ID), "1")
+        self.assertEqual(phrase_1.findtext("give_info"), "mymod_extra")
+        self.assertEqual(
+            [tag.text for tag in phrase_1.findall("action")],
+            [f"dialogs.{DIALOG_ID}_phrase_1_action"],
+        )
+        tags = [child.tag for child in phrase_1]
+        self.assertLess(
+            tags.index("give_info"),
+            tags.index("action"),
         )
 
     def test_complete_task_uses_turn_in_effect(self) -> None:

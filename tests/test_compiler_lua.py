@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 import sys
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -274,6 +275,60 @@ class TestLuaGeneratorStructure(unittest.TestCase):
         self.assertNotIn(f"function {SCRIPT_NAME}.", self.script)
         self.assertNotIn("function mymod_quests.", self.script)
         self.assertNotIn(f"{MOD_PREFIX}.{QUEST_ID}", self.script)
+
+    def test_phrase_action_merges_task_and_rewards_in_order(self) -> None:
+        """Единая ``_action`` исполняет реплику в порядке объявления."""
+        start = self.script.index(
+            f"local function {DIALOG_ID}_phrase_1_action"
+        )
+        end = self.script.index("end", start)
+        block = self.script[start:end]
+
+        self.assertIn('kind = "give_item"', block)
+        self.assertIn('kind = "complete_task"', block)
+        self.assertLess(
+            block.index('kind = "give_item"'),
+            block.index('kind = "complete_task"'),
+        )
+
+    def test_xml_has_single_action_per_phrase(self) -> None:
+        """Сгенерированный XML не содержит двух ``<action>`` в реплике."""
+        xml = XmlGenerator().generate_dialogs_xml(self.project.dialogs)
+        root = ET.fromstring(xml)
+        for dialog in root.findall("dialog"):
+            for phrase in dialog.findall("./phrase_list/phrase"):
+                with self.subTest(
+                    phrase=f"{dialog.get('id')}/{phrase.get('id')}"
+                ):
+                    self.assertLessEqual(len(phrase.findall("action")), 1)
+
+    def test_resolve_target_uses_get_story_object_id(self) -> None:
+        """Строковый story-id резолвится через ``get_story_object_id``."""
+        self.assertIn("get_story_object_id(target)", self.script)
+        self.assertIn("if get_story_object_id then", self.script)
+        self.assertNotIn("alife():story_object", self.script)
+
+    def test_give_task_never_writes_zero_giver_id(self) -> None:
+        """``give_task`` не передаёт ``0``: в Lua он truthy и ломает маркер."""
+        self.assertNotIn("giver_id = 0", self.script)
+        self.assertIn(
+            "if giver_id == 0 then giver_id = nil end", self.script
+        )
+        self.assertIn(
+            "pcall(dialogs.who_is_npc, db.actor, npc)", self.script
+        )
+        self.assertIn("resolve_target(quest.npc)", self.script)
+
+    def test_target_functor_ignores_zero_giver(self) -> None:
+        """Этап возврата проверяет ``task_giver_id ~= 0`` перед возвратом."""
+        start = self.script.index(f"local function {QUEST_ID}_target")
+        end = self.script.index(f"local function {QUEST_ID}_descr")
+        target_block = self.script[start:end]
+        self.assertIn(
+            "if tsk and tsk.task_giver_id and tsk.task_giver_id ~= 0 then",
+            target_block,
+        )
+        self.assertIn("return resolve_target(quest.npc)", target_block)
 
 
 class TestLuaGeneratorBehaviour(unittest.TestCase):
@@ -537,7 +592,7 @@ class TestTraderMechanicsAndSquadTracking(unittest.TestCase):
 
         for fragment in (
             "if get_story_squad then",
-            "pcall(get_story_squad, target)",
+            "return get_story_squad(target)",
             "if get_story_object then",
             "if SIMBOARD and SIMBOARD.squads then",
             "squad:section_name() == target",

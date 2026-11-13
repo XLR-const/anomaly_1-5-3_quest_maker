@@ -9,8 +9,7 @@ def pack_entire_project(project_root: Path, output_file: Path):
         "output", "_unpacked", "manual_mod", "data"
     }
     ignore_files = {
-        "anomaly_db.sqlite", "manual_mod_snapshot.txt", 
-        "compiler_snapshot.txt", "entire_project_snapshot.txt"
+        "anomaly_db.sqlite"
     }
     # Разрешенные расширения для текстового анализа
     allowed_extensions = {".py", ".md", ".json", ".ltx", ".xml", ".script"}

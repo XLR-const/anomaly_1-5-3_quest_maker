@@ -17,11 +17,10 @@ from typing import TYPE_CHECKING, Any
 
 from src.compiler.encoding import escape_xml_text
 from src.core.models import (
-    CompleteTask,
     DontHasInfo,
     GiveInfo,
-    GiveTask,
     HasInfo,
+    phrase_action_mode,
 )
 from src.logger import get_logger
 
@@ -306,6 +305,11 @@ class XmlGenerator:
         ``<text>`` → ``<next>`` → ``<precondition>`` → info-теги →
         ``<give_info>`` → ``<action>``.
 
+        В реплике генерируется **не более одного** ``<action>``: движок
+        X-Ray/OpenXRay хранит одно действие на реплику и отбрасывает все
+        последующие теги. Комбинация действий сводится к единой функции
+        ``dialogs.<dialog_id>_phrase_<n>_action``.
+
         Args:
             dialog_id (str): Канонический id диалога.
             phrase_id (Any): Ключ фразы в карте диалога.
@@ -361,27 +365,30 @@ class XmlGenerator:
                 f"\t\t\t\t<{tag}>{escape_xml_text(value)}</{tag}>"
             )
 
-        give_info: list[str] = []
-        actions_xml: list[str] = []
-        needs_action = False
-        for action in actions:
-            if isinstance(action, GiveInfo):
-                give_info.append(action.info)
-            elif isinstance(action, GiveTask):
-                actions_xml.append(f"dialogs.{dialog_id}_accept")
-            elif isinstance(action, CompleteTask):
-                actions_xml.append(f"dialogs.{dialog_id}_turn_in")
-            else:
-                needs_action = True
+        give_info = [
+            action.info for action in actions if isinstance(action, GiveInfo)
+        ]
 
         for info_id in give_info:
             lines.append(
                 f"\t\t\t\t<give_info>{escape_xml_text(info_id)}</give_info>"
             )
-        if needs_action:
-            actions_xml.append(f"dialogs.{prefix}_action")
-        for action_name in actions_xml:
-            lines.append(f"\t\t\t\t<action>{action_name}</action>")
+
+        # Движок исполняет только первый <action>; генератор обязан
+        # сгенерировать ровно один тег на реплику (см. phrase_action_mode).
+        action_mode = phrase_action_mode(actions)
+        if action_mode == "accept":
+            lines.append(
+                f"\t\t\t\t<action>dialogs.{dialog_id}_accept</action>"
+            )
+        elif action_mode == "turn_in":
+            lines.append(
+                f"\t\t\t\t<action>dialogs.{dialog_id}_turn_in</action>"
+            )
+        elif action_mode == "combined":
+            lines.append(
+                f"\t\t\t\t<action>dialogs.{prefix}_action</action>"
+            )
 
         lines.append("\t\t\t</phrase>")
         return "\n".join(lines)

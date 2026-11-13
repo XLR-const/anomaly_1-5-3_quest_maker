@@ -35,6 +35,7 @@ from src.compiler.encoding import (
 from src.compiler.ltx_gen import LtxGenerator
 from src.compiler.lua_gen import LuaGenerator
 from src.compiler.xml_gen import XmlGenerator
+from src.core.models import find_phrase_reward_conflicts
 from src.logger import get_logger
 
 if TYPE_CHECKING:
@@ -279,6 +280,15 @@ class ModBuilder:
                 raise TypeError(
                     f"quests и dialogs должны быть dict, получены "
                     f"{type(quests).__name__} и {type(dialogs).__name__}."
+                )
+
+            reward_conflicts = find_phrase_reward_conflicts(project)
+            for conflict in reward_conflicts:
+                logger.warning(
+                    "Награда может быть потеряна: %s. Перенесите её в "
+                    "Quest.reward_money/reward_item_alias или "
+                    "Quest.on_complete_actions.",
+                    conflict,
                 )
 
             slug = _slugify(name)

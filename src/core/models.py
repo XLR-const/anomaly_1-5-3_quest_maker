@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Annotated, Any, Literal, Self, TypeAlias, Union
 
 import yaml
@@ -338,6 +339,45 @@ Action: TypeAlias = Annotated[
     ],
     Field(discriminator="type"),
 ]
+
+
+def phrase_action_mode(actions: Iterable[BaseAction]) -> str | None:
+    """Определяет, какой ровно один ``<action>`` нужен реплике.
+
+    Движок X-Ray/OpenXRay исполняет только **один** тег ``<action>`` на
+    ``<phrase>``; все последующие теги молча отбрасываются. Поэтому
+    генераторы обязаны сводить действия реплики к одному тегу:
+
+    * ``"accept"`` — единственное действие ``GiveTask``; XML ссылается на
+      ``dialogs.<dialog_id>_accept``;
+    * ``"turn_in"`` — единственное действие ``CompleteTask``; XML ссылается
+      на ``dialogs.<dialog_id>_turn_in``;
+    * ``"combined"`` — любая другая комбинация Lua-действий (включая
+      ``GiveTask``/``CompleteTask`` вместе с наградами); XML ссылается на
+      единую функцию ``dialogs.<dialog_id>_phrase_<n>_action``;
+    * ``None`` — Lua-действий нет (остались только ``GiveInfo``).
+
+    ``GiveInfo`` не считается Lua-действием: он остаётся нативным
+    XML-тегом ``<give_info>`` и не участвует в слиянии.
+
+    Args:
+        actions (Iterable[BaseAction]): Действия реплики в порядке объявления.
+
+    Returns:
+        str | None: ``"accept"``, ``"turn_in"``, ``"combined"`` или ``None``.
+    """
+    lua_actions = [
+        action for action in actions if not isinstance(action, GiveInfo)
+    ]
+    if not lua_actions:
+        return None
+    if len(lua_actions) == 1:
+        only = lua_actions[0]
+        if isinstance(only, GiveTask):
+            return "accept"
+        if isinstance(only, CompleteTask):
+            return "turn_in"
+    return "combined"
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +890,79 @@ class ModProject(BaseModel):
         return cls.model_validate(data)
 
 
+# ---------------------------------------------------------------------------
+# Перекрёстные проверки проекта
+# ---------------------------------------------------------------------------
+
+
+def find_phrase_reward_conflicts(project: ModProject) -> list[str]:
+    """Находит рискованную выдачу награды прямо в реплике сдачи.
+
+    Если в одной реплике есть ``CompleteTask`` и одновременно ``GiveMoney``
+    или ``GiveItem``, а у связанного квеста пусты
+    ``Quest.reward_money``/``Quest.reward_item_alias``, награда может быть
+    потеряна: движок исполняет только один ``<action>`` и/или
+    ``CompleteTask`` завершает задачу раньше остальных эффектов. Надёжный
+    путь — перенести награду в ``Quest.reward_money``/
+    ``Quest.reward_item_alias`` либо в ``Quest.on_complete_actions``.
+
+    Функция не меняет проект и не бросает исключений: она возвращает
+    человекочитаемые описания конфликтов для предупреждения в лог сборки.
+
+    Args:
+        project (ModProject): Проект мода.
+
+    Returns:
+        list[str]: Описания реплик с потенциально потерянной наградой.
+    """
+    conflicts: list[str] = []
+    quests = getattr(project, "quests", {}) or {}
+    dialogs = getattr(project, "dialogs", {}) or {}
+
+    for dialog in dialogs.values():
+        dialog_id = (
+            getattr(dialog, "dialog_id", None)
+            or getattr(dialog, "id", None)
+            or "<unknown>"
+        )
+        quest = quests.get(getattr(dialog, "task_id", None) or "")
+        if quest is None:
+            for candidate in quests.values():
+                if dialog_id in (
+                    getattr(candidate, "dialog_id", None),
+                    *getattr(candidate, "dialog_ids", []),
+                ):
+                    quest = candidate
+                    break
+        if quest is None:
+            continue
+        if (
+            getattr(quest, "reward_money", None)
+            or getattr(quest, "reward_item_alias", None)
+        ):
+            continue
+
+        for phrase_id, phrase in sorted(
+            (getattr(dialog, "phrases", {}) or {}).items()
+        ):
+            actions = list(getattr(phrase, "actions", []) or [])
+            if not any(isinstance(a, CompleteTask) for a in actions):
+                continue
+            inline = [
+                type(action).__name__
+                for action in actions
+                if isinstance(action, (GiveMoney, GiveItem))
+            ]
+            if inline:
+                conflicts.append(
+                    f"диалог '{dialog_id}', реплика {phrase_id}: "
+                    f"{', '.join(sorted(set(inline)))} вместе с "
+                    "CompleteTask, а Quest.reward_money/"
+                    "reward_item_alias пусты"
+                )
+    return conflicts
+
+
 __all__ = [
     "Action",
     "BaseAction",
@@ -858,6 +971,7 @@ __all__ = [
     "Condition",
     "Dialog",
     "DontHasInfo",
+    "find_phrase_reward_conflicts",
     "GiveInfo",
     "GiveItem",
     "GiveMoney",
@@ -867,6 +981,7 @@ __all__ = [
     "ModProject",
     "OptionalId",
     "Phrase",
+    "phrase_action_mode",
     "Quest",
     "RemoveInfo",
     "RemoveItem",
