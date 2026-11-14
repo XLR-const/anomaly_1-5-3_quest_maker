@@ -281,6 +281,12 @@ class ModBuilder:
                     f"quests и dialogs должны быть dict, получены "
                     f"{type(quests).__name__} и {type(dialogs).__name__}."
                 )
+            squads = getattr(project, "squads", None) or {}
+            if not isinstance(squads, dict):
+                raise TypeError(
+                    "squads должен быть dict, получен "
+                    f"{type(squads).__name__}."
+                )
 
             reward_conflicts = find_phrase_reward_conflicts(project)
             for conflict in reward_conflicts:
@@ -300,6 +306,7 @@ class ModBuilder:
             lua = LuaGenerator(db_client=self.db_client)
 
             tasks_content = ltx.generate_tasks_ltx(quests)
+            squads_content = ltx.generate_squads_ltx(squads)
             dialogs_content = xml.generate_dialogs_xml(dialogs)
             string_tables = xml.generate_string_tables(project)
             script_content = lua.generate_quests_script(
@@ -329,6 +336,19 @@ class ModBuilder:
                 project_dir / "gamedata" / "scripts"
                 / f"{slug}_quests.script": script_content,
             }
+
+            if squads:
+                squad_dir = (
+                    project_dir
+                    / "gamedata"
+                    / "configs"
+                    / "misc"
+                    / "squad_descr"
+                )
+                squad_dir.mkdir(parents=True, exist_ok=True)
+                files[squad_dir / f"squad_descr_{slug}.ltx"] = (
+                    squads_content
+                )
 
             bindings = self._collect_dialog_bindings(project)
             patched_descriptions = self._patch_character_desc_files(

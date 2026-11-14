@@ -11,13 +11,11 @@
        с подкреплением или одиночная диверсия).
 
 Ограничение доступа (фракция ``army`` + режим Warfare):
-    В публичном union условий ядра нет проверки фракции актора. Единственный
-    документированный механизм — ``Quest.available_info``: ядро сохраняет
-    значение в таблице ``QUESTS``, а внешний фракционный/Warfare-скрипт
-    выдаёт этот поршень бойцу группировки ``army`` и проверяет ``IsWarfare()``.
-    Оба квеста помечены поршнем ``mymod_army_warfare_access``.
-    Дополнительно оба квеста используют ``WarfareCapture``, поэтому ядро
-    помечает их ``world = true``, и их ``_status`` работает только в Warfare.
+    Оба квеста используют встроенные гейты ``Quest.requires_faction="army"``
+    и ``Quest.requires_warfare=True``: связанные диалоги выдачи закрываются
+    для чужой фракции и вне Warfare, а ``_status``/``_start`` не выполняются
+    без Warfare. ``available_info`` остаётся внешним маркером для UI/скриптов
+    и сгенерированным кодом не проверяется.
 
 Запуск из корня проекта:
     python examples/build_golden_test.py
@@ -38,6 +36,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from src.compiler.builder import ModBuilder
 from src.core.models import (
     CompleteTask,
+    CustomSquad,
     Dialog,
     DontHasInfo,
     GiveInfo,
@@ -102,6 +101,7 @@ Q2_SOLO_INFO = "mymod_q2_solo"
 Q2_ASSAULT_REWARD = 15000
 Q2_SOLO_REWARD = 30000
 QUEST_ITEM_PDA = "itm_pda_common"
+Q2_CUSTOM_SQUAD = "mymod_atp_bandit_leader_squad"
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +135,11 @@ def create_first_quest() -> Quest:
         available_info=ARMY_WARFARE_INFO,
         taken_info=Q1_STARTED,
         complete_info=Q1_DONE,
+        # Награда выдаётся эффектом _reward после task_manager:set_task_completed.
+        reward_money=Q1_REWARD_MONEY,
+        reward_item_alias=Q1_REWARD_WEAPON,
+        requires_faction="army",
+        requires_warfare=True,
         stages={
             0: Stage(
                 id=0,
@@ -287,8 +292,8 @@ def create_first_quest_dialogs() -> list[Dialog]:
                     "Dismissed."
                 ),
                 actions=[
-                    GiveMoney(amount=Q1_REWARD_MONEY),
-                    GiveItem(item_alias=Q1_REWARD_WEAPON, count=1),
+                    # Награда (деньги + ВССК) выдаётся в Quest._reward.
+                    # В реплике остаётся ровно одно действие — CompleteTask.
                     CompleteTask(task_id=Q1_ID),
                 ],
             ),
@@ -331,6 +336,11 @@ def create_second_quest() -> Quest:
         available_info=ARMY_WARFARE_INFO,
         taken_info=Q2_STARTED,
         complete_info=Q2_DONE,
+        # Поршни варианта снимаются в _reward и _cleanup: повторное взятие
+        # квеста не тащит старый вариант «штурм/соло».
+        cleanup_infos=[Q2_ASSAULT_INFO, Q2_SOLO_INFO],
+        requires_faction="army",
+        requires_warfare=True,
         stages={
             0: Stage(
                 id=0,
@@ -620,6 +630,13 @@ def create_golden_shield_project() -> ModProject:
             second_quest.id: second_quest,
         },
         dialogs={dialog.id: dialog for dialog in dialogs},
+        squads={
+            Q2_CUSTOM_SQUAD: CustomSquad(
+                id=Q2_CUSTOM_SQUAD,
+                faction="bandit",
+                npc=["sim_default_bandit_4"],
+            )
+        },
     )
 
 

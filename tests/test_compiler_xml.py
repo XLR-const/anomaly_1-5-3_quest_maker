@@ -231,6 +231,70 @@ class TestXmlGeneratorDialogs(unittest.TestCase):
             f"dialogs.{DIALOG_ID}_phrase_1_precondition",
         )
 
+    def test_turn_in_dialog_gets_can_turn_in_precondition(self) -> None:
+        """Диалог сдачи закрывается по стадии через ``_can_turn_in``."""
+        project = _make_project()
+        turnin_id = "mymod_xml_dialog_turnin"
+        project.dialogs["turnin"] = Dialog(
+            id=turnin_id,
+            npc_id="esc_mayor",
+            npc_location="escape",
+            task_id=QUEST_ID,
+            role="turnin",
+            preconditions=[
+                HasInfo(info="mymod_ready"),
+                DontHasInfo(info="mymod_done"),
+            ],
+            phrases={
+                0: Phrase(
+                    id=0,
+                    text_ru="Докладываю.",
+                    text_en="Reporting.",
+                )
+            },
+        )
+        root = ET.fromstring(
+            XmlGenerator().generate_dialogs_xml(project.dialogs)
+        )
+        dialog = _find_dialog(root, turnin_id)
+
+        self.assertEqual(
+            dialog.findtext("precondition"),
+            f"dialogs.{turnin_id}_can_turn_in",
+        )
+        self.assertEqual(dialog.findtext("has_info"), "mymod_ready")
+        self.assertEqual(dialog.findtext("dont_has_info"), "mymod_done")
+
+    def test_turn_in_with_manual_non_info_condition_uses_can_take(self) -> None:
+        """Ручное не-info условие оставляет общий ``_can_take``."""
+        project = _make_project()
+        turnin_id = "mymod_xml_dialog_turnin"
+        project.dialogs["turnin"] = Dialog(
+            id=turnin_id,
+            task_id=QUEST_ID,
+            role="turn_in",
+            preconditions=[
+                HasItem(item_alias="itm_pda_common"),
+                DontHasInfo(info="mymod_done"),
+            ],
+            phrases={
+                0: Phrase(
+                    id=0,
+                    text_ru="Вот ПДА.",
+                    text_en="Here is the PDA.",
+                )
+            },
+        )
+        root = ET.fromstring(
+            XmlGenerator().generate_dialogs_xml(project.dialogs)
+        )
+        dialog = _find_dialog(root, turnin_id)
+
+        self.assertEqual(
+            dialog.findtext("precondition"),
+            f"dialogs.{turnin_id}_can_take",
+        )
+
     def test_phrase_has_at_most_one_action(self) -> None:
         """Движок читает один ``<action>``: второй тег недопустим."""
         for dialog in self.root.findall("dialog"):
@@ -361,6 +425,8 @@ class TestXmlGeneratorStringTables(unittest.TestCase):
         expected = {
             f"{QUEST_ID}_title",
             f"{QUEST_ID}_descr",
+            f"{QUEST_ID}_msg_reward",
+            f"{QUEST_ID}_msg_fail",
             f"{QUEST_ID}_stage_0_title",
             f"{QUEST_ID}_stage_0_descr",
             f"{QUEST_ID}_stage_0_msg",
@@ -401,6 +467,51 @@ class TestXmlGeneratorStringTables(unittest.TestCase):
         self.assertIn("Квест &amp; проверка", xml)
         self.assertIn("Описание &lt;квеста&gt;", xml)
         self.assertNotIn("Квест & проверка", xml)
+
+    def test_reward_and_fail_messages_have_defaults(self) -> None:
+        """Без кастомных полей генерируются осмысленные подсказки."""
+        rus = self._string_map("rus")
+        eng = self._string_map("eng")
+
+        self.assertEqual(
+            rus[f"{QUEST_ID}_msg_reward"],
+            "Задание выполнено: Квест & проверка.",
+        )
+        self.assertEqual(
+            eng[f"{QUEST_ID}_msg_reward"],
+            "Task completed: Quest & check.",
+        )
+        self.assertEqual(
+            rus[f"{QUEST_ID}_msg_fail"],
+            "Задание провалено: Квест & проверка.",
+        )
+        self.assertEqual(
+            eng[f"{QUEST_ID}_msg_fail"],
+            "Task failed: Quest & check.",
+        )
+
+    def test_custom_reward_and_fail_messages_override_defaults(self) -> None:
+        """Поля ``Quest.msg_*`` имеют приоритет над автогенерацией."""
+        quest = self.project.quests[QUEST_ID]
+        quest.msg_reward_ru = "Награда получена."
+        quest.msg_reward_en = "Reward received."
+        quest.msg_fail_ru = "Квест провален."
+        quest.msg_fail_en = "Quest failed."
+
+        tables = XmlGenerator().generate_string_tables(self.project)
+        rus = {
+            element.get("id", ""): element.findtext("text", "")
+            for element in ET.fromstring(tables["rus"]).findall("string")
+        }
+        eng = {
+            element.get("id", ""): element.findtext("text", "")
+            for element in ET.fromstring(tables["eng"]).findall("string")
+        }
+
+        self.assertEqual(rus[f"{QUEST_ID}_msg_reward"], "Награда получена.")
+        self.assertEqual(eng[f"{QUEST_ID}_msg_reward"], "Reward received.")
+        self.assertEqual(rus[f"{QUEST_ID}_msg_fail"], "Квест провален.")
+        self.assertEqual(eng[f"{QUEST_ID}_msg_fail"], "Quest failed.")
 
     def test_generator_does_not_render_character_desc(self) -> None:
         """Генератор не создаёт ``character_desc_<mod>.xml``."""

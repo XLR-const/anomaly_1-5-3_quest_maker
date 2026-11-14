@@ -31,7 +31,7 @@ from src.compiler.encoding import (  # noqa: E402
     write_file_cp1251,
 )
 from src.compiler.ltx_gen import LtxGenerator  # noqa: E402
-from src.core.models import Quest, Stage  # noqa: E402
+from src.core.models import CustomSquad, Quest, Stage  # noqa: E402
 
 VALID_QUEST_ID = "mymod_test_quest"
 BROKEN_QUEST_ID = "mymod_broken_quest"
@@ -286,6 +286,60 @@ class TestLtxGenerator(unittest.TestCase):
         """Неверный тип карты квестов даёт ``TypeError``."""
         with self.assertRaises(TypeError):
             self.generator.generate_tasks_ltx([])  # type: ignore[arg-type]
+
+
+class TestSquadDescrGenerator(unittest.TestCase):
+    """Проверка генерации ``squad_descr_<slug>.ltx``."""
+
+    def setUp(self) -> None:
+        """Создаёт генератор перед каждым тестом."""
+        self.generator = LtxGenerator()
+
+    def test_generates_online_offline_group_section(self) -> None:
+        """Секция повторяет эталон ``online_offline_group``."""
+        squads = {
+            "mymod_atp_bandit_leader_squad": CustomSquad(
+                id="mymod_atp_bandit_leader_squad",
+                faction="bandit",
+                npc=["sim_default_bandit_4"],
+            )
+        }
+        content = self.generator.generate_squads_ltx(squads)
+
+        self.assertIn(
+            "[mymod_atp_bandit_leader_squad]:online_offline_group", content
+        )
+        self.assertRegex(content, r"(?m)^faction = bandit$")
+        self.assertRegex(content, r"(?m)^npc     = sim_default_bandit_4$")
+        self.assertTrue(content.endswith("\n"))
+
+    def test_optional_fields_and_multiple_npcs(self) -> None:
+        """``target_smart``/``story_id`` и несколько NPC попадают в секцию."""
+        squads = {
+            "mymod_squad": CustomSquad(
+                id="mymod_squad",
+                faction="army",
+                npc=["sim_default_army_1", "sim_default_army_2"],
+                target_smart="esc_smart_terrain_7_11",
+                story_id="mymod_story",
+            )
+        }
+        content = self.generator.generate_squads_ltx(squads)
+
+        self.assertIn(
+            "npc     = sim_default_army_1, sim_default_army_2", content
+        )
+        self.assertIn("target_smart = esc_smart_terrain_7_11", content)
+        self.assertIn("story_id = mymod_story", content)
+
+    def test_empty_map_returns_empty_string(self) -> None:
+        """При пустой карте файл не генерируется (пустая строка)."""
+        self.assertEqual(self.generator.generate_squads_ltx({}), "")
+
+    def test_rejects_non_dict_input(self) -> None:
+        """Неверный тип карты отрядов даёт ``TypeError``."""
+        with self.assertRaises(TypeError):
+            self.generator.generate_squads_ltx([])  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

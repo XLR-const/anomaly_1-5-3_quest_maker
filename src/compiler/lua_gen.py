@@ -115,6 +115,18 @@ local function is_warfare()
 	return (IsWarfare and IsWarfare()) or false
 end
 
+-- Returns true when the actor belongs to the requested technical faction.
+-- Mirrors the reference is_actor_army(): warfare.actor_faction first, then
+-- the true community (works outside Warfare as well).
+local function is_actor_faction(faction)
+	if not faction or faction == "" then return false end
+	if warfare and warfare.actor_faction == faction then
+		return true
+	end
+	local ok, comm = pcall(function() return get_actor_true_community() end)
+	return (ok and comm == faction) or false
+end
+
 -- Resolves a SIMBOARD smart-terrain by its technical name.
 local function get_smart(name)
 	if not name or name == "" then return nil end
@@ -332,6 +344,26 @@ local function unmark_quest_squads(q)
 			unmark_task_squad(vget(stage_key(q, stage, "ally" .. i), 0))
 		end
 	end
+	-- Dynamic squads spawned by SpawnSquad in a dialog phrase or quest action.
+	local dyn_count = vget(q.key_prefix .. "_dyn_squad_cnt", 0) or 0
+	for i = 1, dyn_count do
+		unmark_task_squad(
+			vget(q.key_prefix .. "_dyn_squad_" .. tostring(i), 0)
+		)
+	end
+end
+
+-- Remembers a squad spawned by a dialog/quest action so that _status can
+-- freeze it and _reward/_cleanup can release it from the offline simulation.
+local function register_dyn_squad(quest_id, squad)
+	if not (quest_id and quest_id ~= "" and squad and squad.id) then
+		return
+	end
+	local quest = QUESTS[quest_id]
+	if not quest then return end
+	local idx = (vget(quest.key_prefix .. "_dyn_squad_cnt", 0) or 0) + 1
+	vset(quest.key_prefix .. "_dyn_squad_cnt", idx)
+	vset(quest.key_prefix .. "_dyn_squad_" .. tostring(idx), squad.id)
 end
 
 -- Spawns a squad and pins it to a target smart (Warfare-safe).
@@ -371,9 +403,11 @@ local function freeze_squad(id)
 	if not id or id == 0 then return end
 	local squad = alife_object(id)
 	if not squad then return end
-	squad.stay_time = game.get_game_time()
-	pcall(function() squad.force_online = true end)
-	mark_task_squad(squad)
+	if squad.current_action == 1 then
+		squad.stay_time = game.get_game_time()
+		pcall(function() squad.force_online = true end)
+		mark_task_squad(squad)
+	end
 end
 
 -- Spawns every squad configured for one stage (idempotent).
@@ -402,6 +436,15 @@ local function freeze_stage_for(q, stage, data)
 	freeze_squad(vget(stage_key(q, stage, "enemy"), 0))
 	for i = 1, (data.capture.ally_count or 0) do
 		freeze_squad(vget(stage_key(q, stage, "ally" .. i), 0))
+	end
+end
+
+-- Freezes every dynamically spawned squad of the quest (dialog SpawnSquad).
+local function freeze_dyn_squads(q)
+	if not q then return end
+	local dyn_count = vget(q.key_prefix .. "_dyn_squad_cnt", 0) or 0
+	for i = 1, dyn_count do
+		freeze_squad(vget(q.key_prefix .. "_dyn_squad_" .. tostring(i), 0))
 	end
 end
 
@@ -608,7 +651,7 @@ local function eval_conditions(list, actor)
 end
 
 -- Executes a list of serialized action specs in order.
-local function run_actions(actions, actor, npc)
+local function run_actions(actions, actor, npc, quest_id)
 	if not actions then return end
 	for _, spec in ipairs(actions) do
 		local kind = spec.kind
@@ -624,7 +667,10 @@ local function run_actions(actions, actor, npc)
 			give_item(spec.item, spec.count, actor or db.actor)
 		elseif kind == "remove_item" or kind == "take_item" then
 			take_item(spec.item, spec.count, actor or db.actor)
-		elseif kind == "spawn_squad" or kind == "set_target" then
+		elseif kind == "spawn_squad" then
+			local squad = spawn_task_squad(spec.smart, spec.squad, spec.smart)
+			register_dyn_squad(quest_id, squad)
+		elseif kind == "set_target" then
 			spawn_task_squad(spec.smart, spec.squad, spec.smart)
 		elseif kind == "give_task" then
 			give_task(spec.task, npc)
@@ -845,6 +891,10 @@ class LuaGenerator:
             section = row.get("id") or row.get("section")
             if isinstance(section, str) and section.strip():
                 return section.strip()
+        logger.warning(
+            "Алиас/секция предмета %r не найдена в БД; используется как есть.",
+            value,
+        )
         return value
 
     def _resolve_squad_section(self, squad_id: str | None) -> str:
@@ -875,6 +925,10 @@ class LuaGenerator:
             section = row.get("id") or row.get("section")
             if isinstance(section, str) and section.strip():
                 return section.strip()
+        logger.warning(
+            "Алиас/секция отряда %r не найдена в БД; используется как есть.",
+            value,
+        )
         return value
 
     def _condition_spec(self, condition: "Condition") -> dict[str, Any]:
@@ -999,6 +1053,17 @@ class LuaGenerator:
                     "ally": stage.warfare_capture.ally_squad_alias or "",
                     "ally_count": stage.warfare_capture.ally_count,
                 }
+            # GiveItem из on_start_actions выдаётся идемпотентно: _status
+            # повторяет выдачу каждый тик, если предмет потерян. Остальные
+            # действия по-прежнему выполняются один раз (ключ "started").
+            start_actions: list[dict[str, Any]] = []
+            item_actions: list[dict[str, Any]] = []
+            for action in stage.on_start_actions:
+                spec = self._action_spec(action)
+                if isinstance(action, GiveItem):
+                    item_actions.append(spec)
+                else:
+                    start_actions.append(spec)
             stages[stage_id] = {
                 "target": stage.target_alias or "",
                 "target_squad": self._resolve_squad_section(
@@ -1007,10 +1072,8 @@ class LuaGenerator:
                 "descr": f"{quest_id}_stage_{stage_id}_descr",
                 "msg": f"{quest_id}_stage_{stage_id}_msg",
                 "capture": capture,
-                "start_actions": [
-                    self._action_spec(action)
-                    for action in stage.on_start_actions
-                ],
+                "start_actions": start_actions,
+                "item_actions": item_actions,
                 "complete": [
                     self._condition_spec(condition)
                     for condition in (rules.get("complete") or [])
@@ -1034,8 +1097,11 @@ class LuaGenerator:
             "msg_fail": f"{quest_id}_msg_fail",
             "taken_info": quest.taken_info or "",
             "complete_info": quest.complete_info or "",
+            "cleanup_infos": list(getattr(quest, "cleanup_infos", []) or []),
             "available_info": quest.available_info or "",
             "done_info": quest.done_info or "",
+            "requires_faction": quest.requires_faction or "",
+            "requires_warfare": bool(quest.requires_warfare),
             "storyline": bool(quest.is_storyline),
             "icon": quest.icon or DEFAULT_ICON,
             "prior": quest.prior if quest.prior is not None else DEFAULT_PRIOR,
@@ -1187,7 +1253,9 @@ local function {quest_id}_status(tsk, task_id)
 	if task_id and task_id ~= {q} then return nil end
 	local quest = QUESTS[{q}]
 	if not quest then return nil end
-	if quest.world and not is_warfare() then return nil end
+	if (quest.world or quest.requires_warfare) and not is_warfare() then
+		return nil
+	end
 
 	local now = time_global()
 	if tsk.__quests_next and now < tsk.__quests_next then return nil end
@@ -1201,11 +1269,22 @@ local function {quest_id}_status(tsk, task_id)
 	local start_key = stage_key(quest, stage, "started")
 	if vget(start_key, 0) == 0 then
 		vset(start_key, 1)
-		run_actions(stage_data.start_actions, db.actor, nil)
+		run_actions(stage_data.start_actions, db.actor, nil, {q})
+	end
+
+	-- Quest items from on_start_actions are idempotent: if the actor lost
+	-- the item (dropped it, died), give it back on the next status tick.
+	if quest.complete_info == "" or not has_alife_info(quest.complete_info) then
+		for _, item_spec in ipairs(stage_data.item_actions or {{}}) do
+			if actor_item_count(item_spec.item, db.actor) < (item_spec.count or 1) then
+				give_item(item_spec.item, item_spec.count, db.actor)
+			end
+		end
 	end
 
 	spawn_stage_for(quest, stage, stage_data)
 	freeze_stage_for(quest, stage, stage_data)
+	freeze_dyn_squads(quest)
 
 	if stage_data.fail and #stage_data.fail > 0 then
 		if eval_conditions(stage_data.fail, db.actor) then
@@ -1238,6 +1317,9 @@ end"""
 local function {quest_id}_start(actor, npc, p)
 	local quest = QUESTS[{q}]
 	if not (db.actor and quest) then return end
+	if (quest.world or quest.requires_warfare) and not is_warfare() then
+		return nil
+	end
 
 	for stage, stage_data in pairs(quest.stages) do
 		vset(stage_key(quest, stage, "spawn"), 0)
@@ -1250,11 +1332,12 @@ local function {quest_id}_start(actor, npc, p)
 		end
 	end
 	vset(quest.key_prefix .. "_said", 0)
+	vset(quest.key_prefix .. "_dyn_squad_cnt", 0)
 
 	if quest.taken_info ~= "" then
 		db.actor:give_info_portion(quest.taken_info)
 	end
-	run_actions(quest.init_actions, actor or db.actor, npc)
+	run_actions(quest.init_actions, actor or db.actor, npc, {q})
 	sound_task()
 	printf("[__SCRIPT_NAME__] %s started", {q})
 end"""
@@ -1275,7 +1358,10 @@ local function {quest_id}_reward(actor, npc, p)
 		db.actor:give_info_portion(quest.complete_info)
 	end
 
-	run_actions(quest.complete_actions, actor or db.actor, npc)
+	run_actions(quest.complete_actions, actor or db.actor, npc, {q})
+	for _, info in ipairs(quest.cleanup_infos or {{}}) do
+		db.actor:disable_info_portion(info)
+	end
 	unmark_quest_squads(quest)
 	sound_task()
 	pda_tip(quest.msg_reward)
@@ -1289,9 +1375,12 @@ local function {quest_id}_cleanup(actor, npc, p)
 	if not quest then return end
 
 	unmark_quest_squads(quest)
-	run_actions(quest.fail_actions, actor or db.actor, npc)
+	run_actions(quest.fail_actions, actor or db.actor, npc, {q})
 	if db.actor and quest.taken_info ~= "" then
 		db.actor:disable_info_portion(quest.taken_info)
+	end
+	for _, info in ipairs(quest.cleanup_infos or {{}}) do
+		db.actor:disable_info_portion(info)
 	end
 	pda_tip(quest.msg_fail)
 	printf("[__SCRIPT_NAME__] %s cleaned up", {q})
@@ -1345,9 +1434,8 @@ end"""
             '\t\t\treturn "complete"\n'
             "\t\tend\n"
             "\t\ttsk.stage = stage + 1\n"
-            '\t\tlocal next_data = quest.stages[tsk.stage]\n'
             "\t\tannounce(quest.key_prefix .. \"_said\", tsk.stage,\n"
-            "\t\t\t(next_data and next_data.msg) or \"\")\n"
+            "\t\t\tstage_data.msg or \"\")\n"
             "\t\treturn nil\n"
         )
 
@@ -1377,9 +1465,12 @@ end"""
         keys: list[tuple[str, str, str]] = []
         blocks: list[str] = []
 
+        # HasInfo/DontHasInfo уже вынесены в нативные XML-теги диалога.
+        # Повторять их в _can_take нельзя (P1-9): это дублирует условие.
         condition_specs = [
             self._condition_spec(condition)
             for condition in dialog.preconditions
+            if not isinstance(condition, (HasInfo, DontHasInfo))
         ]
         conditions_lua = self._to_lua(condition_specs, indent=1)
         linked = self._lua_string(linked_quest_id or "")
@@ -1390,6 +1481,12 @@ end"""
             str(linked_data.get("complete_info") or "")
         )
         done_info = self._lua_string(str(linked_data.get("done_info") or ""))
+        requires_faction = self._lua_string(
+            str(linked_data.get("requires_faction") or "")
+        )
+        requires_warfare = (
+            "true" if linked_data.get("requires_warfare") else "false"
+        )
 
         can_take = f"""\
 -- Dialog availability: all dialog-level conditions plus "task not given".
@@ -1397,6 +1494,14 @@ end"""
 local function {dialog_id}_can_take(actor, npc, p)
 	local linked = {linked}
 	if linked ~= "" then
+		local requires_warfare = {requires_warfare}
+		if requires_warfare and not is_warfare() then
+			return false
+		end
+		local requires_faction = {requires_faction}
+		if requires_faction ~= "" and not is_actor_faction(requires_faction) then
+			return false
+		end
 		local complete_info = {complete_info}
 		if complete_info ~= "" and has_alife_info(complete_info) then
 			return false
@@ -1498,7 +1603,7 @@ end"""
                     f"""\
 -- Phrase {phrase_id} action: merged actions of the phrase.
 local function {prefix}_action(actor, npc, p)
-	run_actions({specs}, actor or db.actor, npc)
+	run_actions({specs}, actor or db.actor, npc, {linked})
 end"""
                 )
                 keys.append(

@@ -36,6 +36,7 @@ from src.compiler.builder import (  # noqa: E402
 )
 from src.core.models import (  # noqa: E402
     CompleteTask,
+    CustomSquad,
     Dialog,
     GiveTask,
     ModProject,
@@ -398,6 +399,39 @@ class TestModBuilderIntegration(unittest.TestCase):
         self.assertNotIn("readme.txt", all_names)
         self.assertNotIn("install.txt", all_names)
         self.assertFalse((self.project_dir / "INSTALL.txt").exists())
+
+    def test_squad_descr_is_written_only_when_squads_exist(self) -> None:
+        """``squad_descr_<slug>.ltx`` создаётся только при непустых squads."""
+        squad_path = (
+            self.project_dir / "gamedata" / "configs" / "misc"
+            / "squad_descr" / f"squad_descr_{PROJECT_SLUG}.ltx"
+        )
+
+        self.assertTrue(self.builder.build_project(self.project))
+        self.assertFalse(squad_path.exists())
+
+        self.project.squads["mymod_atp_bandit_leader_squad"] = CustomSquad(
+            id="mymod_atp_bandit_leader_squad",
+            faction="bandit",
+            npc=["sim_default_bandit_4"],
+        )
+        self.assertTrue(self.builder.build_project(self.project))
+        self.assertTrue(squad_path.is_file())
+
+        raw = squad_path.read_bytes()
+        self.assertFalse(raw.startswith(codecs.BOM_UTF8))
+        text = raw.decode("cp1251")
+        self.assertIn(
+            "[mymod_atp_bandit_leader_squad]:online_offline_group", text
+        )
+        self.assertIn("faction = bandit", text)
+        self.assertIn("npc     = sim_default_bandit_4", text)
+        # system.ltx не должен упоминать squad_descr: файл подхватывается
+        # ванильным глобом squad_descr.ltx автоматически.
+        system_text = (
+            self.project_dir / "gamedata" / "configs" / "system.ltx"
+        ).read_bytes().decode("cp1251")
+        self.assertNotIn("squad_descr", system_text)
 
     def test_generated_files_contain_project_data(self) -> None:
         """Сгенерированные файлы содержат данные квеста и диалогов."""

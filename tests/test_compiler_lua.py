@@ -41,6 +41,7 @@ from src.core.models import (  # noqa: E402
     ModProject,
     Phrase,
     Quest,
+    SpawnSquad,
     Stage,
     TakeItem,
     TakeMoney,
@@ -575,7 +576,12 @@ class TestTraderMechanicsAndSquadTracking(unittest.TestCase):
         ]
         self.assertIn('complete_info = "once_done"', lua)
         self.assertIn("db.actor:give_info_portion(quest.complete_info)", reward)
-        self.assertNotIn("disable_info_portion", reward)
+        self.assertNotIn(
+            "disable_info_portion(quest.taken_info)", reward
+        )
+        self.assertNotIn(
+            "disable_info_portion(quest.complete_info)", reward
+        )
 
         cleanup = lua[
             lua.index("local function once_quest_cleanup"):
@@ -696,6 +702,412 @@ class TestTraderMechanicsAndSquadTracking(unittest.TestCase):
         self.assertIn(
             'target_squad = "esc_3_16_military_trader_squad"', script
         )
+
+
+class TestFactionWarfareGates(unittest.TestCase):
+    """Проверка faction/Warfare-гейтов в диалоге и функциях квеста."""
+
+    @staticmethod
+    def _make_project() -> ModProject:
+        """Создаёт квест с обоими гейтами и связанный диалог выдачи."""
+        quest = Quest(
+            id="gated_quest",
+            npc_id="esc_mayor",
+            dialog_id="gated_take",
+            requires_faction="army",
+            requires_warfare=True,
+            stages={0: Stage(id=0)},
+        )
+        dialog = Dialog(
+            id="gated_take",
+            task_id="gated_quest",
+            role="take",
+            phrases={
+                0: Phrase(id=0, text_ru="Есть работа?", text_en="Got a job?")
+            },
+        )
+        return ModProject(
+            name="Gated",
+            quests={quest.id: quest},
+            dialogs={dialog.id: dialog},
+        )
+
+    @staticmethod
+    def _block(script: str, start: str, end: str) -> str:
+        """Возвращает фрагмент скрипта между двумя маркерами."""
+        start_index = script.index(start)
+        return script[start_index : script.index(end, start_index)]
+
+    def test_can_take_checks_faction_and_warfare(self) -> None:
+        """``_can_take`` закрывает диалог вне Warfare и без нужной фракции."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_project(),
+            script_name="gated_quests",
+            mod_prefix="gated",
+        )
+        can_take = self._block(
+            script,
+            "local function gated_take_can_take",
+            "local function gated_take_can_turn_in",
+        )
+
+        self.assertIn("local requires_warfare = true", can_take)
+        self.assertIn(
+            "if requires_warfare and not is_warfare() then", can_take
+        )
+        self.assertIn('local requires_faction = "army"', can_take)
+        self.assertIn(
+            'if requires_faction ~= "" and not '
+            "is_actor_faction(requires_faction) then",
+            can_take,
+        )
+        self.assertIn("local function is_actor_faction(faction)", script)
+        self.assertIn("warfare.actor_faction == faction", script)
+        self.assertIn("get_actor_true_community()", script)
+
+    def test_start_and_status_stop_outside_warfare(self) -> None:
+        """``_start``/``_status`` учитывают ``requires_warfare`` как ``world``."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_project(),
+            script_name="gated_quests",
+            mod_prefix="gated",
+        )
+        status = self._block(
+            script,
+            "local function gated_quest_status",
+            "local function gated_quest_start",
+        )
+        start = self._block(
+            script,
+            "local function gated_quest_start",
+            "local function gated_quest_reward",
+        )
+        guard = (
+            "if (quest.world or quest.requires_warfare) and "
+            "not is_warfare() then"
+        )
+
+        self.assertIn(guard, status)
+        self.assertIn(guard, start)
+        self.assertIn('requires_warfare = true', script)
+        self.assertIn('requires_faction = "army"', script)
+
+
+class TestFreezeSquadGuard(unittest.TestCase):
+    """Проверка возврата guard ``current_action == 1`` в ``freeze_squad``."""
+
+    def test_freeze_squad_waits_for_arrival(self) -> None:
+        """``stay_time`` выставляется только отряду, дошедшему до цели."""
+        script = LuaGenerator().generate_quests_script(_make_project())
+        block = script[
+            script.index("local function freeze_squad(id)"):
+            script.index("local function spawn_stage_for")
+        ]
+
+        guard = block.index("if squad.current_action == 1 then")
+        stay_time = block.index("squad.stay_time = game.get_game_time()")
+        self.assertLess(guard, stay_time)
+        self.assertIn("mark_task_squad(squad)", block[guard:])
+        self.assertIn("squad.force_online = true", block[guard:])
+
+
+class TestDynamicSquadTracking(unittest.TestCase):
+    """Проверка учёта отрядов из ``SpawnSquad`` в репликах и действиях."""
+
+    @staticmethod
+    def _make_project() -> ModProject:
+        """Создаёт квест и диалог, которые спавнят отряды через SpawnSquad."""
+        quest = Quest(
+            id="dyn_quest",
+            npc_id="esc_mayor",
+            dialog_id="dyn_take",
+            stages={
+                0: Stage(
+                    id=0,
+                    on_start_actions=[
+                        SpawnSquad(
+                            squad_alias="army_sim_squad_advanced",
+                            smart_alias="esc_smart",
+                        )
+                    ],
+                )
+            },
+        )
+        dialog = Dialog(
+            id="dyn_take",
+            task_id="dyn_quest",
+            role="take",
+            phrases={
+                0: Phrase(
+                    id=0,
+                    text_ru="Штурм",
+                    text_en="Assault",
+                    actions=[
+                        SpawnSquad(
+                            squad_alias="army_sim_squad_advanced",
+                            smart_alias="esc_smart",
+                        )
+                    ],
+                )
+            },
+        )
+        return ModProject(
+            name="Dynamic",
+            quests={quest.id: quest},
+            dialogs={dialog.id: dialog},
+        )
+
+    @staticmethod
+    def _block(script: str, start: str, end: str) -> str:
+        """Возвращает фрагмент скрипта между двумя маркерами."""
+        start_index = script.index(start)
+        return script[start_index : script.index(end, start_index)]
+
+    def test_dialog_and_quest_spawns_register_squads(self) -> None:
+        """``run_actions`` получает id квеста, а spawn сохраняет squad.id."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_project(),
+            script_name="dyn_quests",
+            mod_prefix="dyn",
+        )
+        phrase_action = self._block(
+            script,
+            "local function dyn_take_phrase_0_action",
+            "local function register()",
+        )
+        status = self._block(
+            script,
+            "local function dyn_quest_status",
+            "local function dyn_quest_start",
+        )
+
+        self.assertIn('"dyn_quest")', phrase_action)
+        self.assertIn(
+            'run_actions(stage_data.start_actions, db.actor, nil, "dyn_quest")',
+            status,
+        )
+        self.assertIn(
+            "local function register_dyn_squad(quest_id, squad)", script
+        )
+        self.assertIn(
+            "local squad = spawn_task_squad(spec.smart, spec.squad, spec.smart)",
+            script,
+        )
+        self.assertIn("register_dyn_squad(quest_id, squad)", script)
+        self.assertIn('quest.key_prefix .. "_dyn_squad_cnt"', script)
+        self.assertIn(
+            'vset(quest.key_prefix .. "_dyn_squad_" .. tostring(idx), squad.id)',
+            script,
+        )
+
+    def test_start_resets_dynamic_counter(self) -> None:
+        """``_start`` обнуляет счётчик динамических отрядов."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_project(),
+            script_name="dyn_quests",
+            mod_prefix="dyn",
+        )
+        start = self._block(
+            script,
+            "local function dyn_quest_start",
+            "local function dyn_quest_reward",
+        )
+
+        self.assertIn(
+            'vset(quest.key_prefix .. "_dyn_squad_cnt", 0)', start
+        )
+
+    def test_status_freezes_and_cleanup_releases_dynamic_squads(self) -> None:
+        """``_status`` морозит, а ``unmark_quest_squads`` освобождает отряды."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_project(),
+            script_name="dyn_quests",
+            mod_prefix="dyn",
+        )
+        status = self._block(
+            script,
+            "local function dyn_quest_status",
+            "local function dyn_quest_start",
+        )
+        freeze_dyn = self._block(
+            script,
+            "local function freeze_dyn_squads(q)",
+            "local function stage_cleared",
+        )
+        unmark = self._block(
+            script,
+            "local function unmark_quest_squads(q)",
+            "local function register_dyn_squad",
+        )
+
+        self.assertIn("freeze_dyn_squads(quest)", status)
+        self.assertIn(
+            'vget(q.key_prefix .. "_dyn_squad_cnt", 0) or 0', freeze_dyn
+        )
+        self.assertIn(
+            'vget(q.key_prefix .. "_dyn_squad_" .. tostring(i), 0)',
+            freeze_dyn,
+        )
+        self.assertIn(
+            'vget(q.key_prefix .. "_dyn_squad_" .. tostring(i), 0)', unmark
+        )
+        self.assertIn("unmark_task_squad(", unmark)
+
+
+class TestIteration3Mechanics(unittest.TestCase):
+    """P1-3…P1-9: идемпотентные предметы, cleanup_infos, announce, can_take."""
+
+    @staticmethod
+    def _make_project() -> ModProject:
+        """Квест с GiveItem в этапе, вариантами и info-условием диалога."""
+        quest = Quest(
+            id="iter3_quest",
+            npc_id="esc_mayor",
+            dialog_id="iter3_take",
+            taken_info="iter3_started",
+            complete_info="iter3_done",
+            cleanup_infos=["iter3_assault", "iter3_solo"],
+            stages={
+                0: Stage(
+                    id=0,
+                    on_start_actions=[
+                        GiveItem(item_alias="itm_pda_common", count=1),
+                        GiveInfo(info="iter3_ready"),
+                    ],
+                ),
+                1: Stage(
+                    id=1,
+                    on_start_actions=[
+                        GiveItem(item_alias="itm_pda_common", count=2),
+                    ],
+                ),
+            },
+        )
+        dialog = Dialog(
+            id="iter3_take",
+            task_id="iter3_quest",
+            role="take",
+            preconditions=[
+                DontHasInfo(info="iter3_started"),
+                HasItem(item_alias="itm_pda_common"),
+            ],
+            phrases={
+                0: Phrase(
+                    id=0,
+                    text_ru="Есть работа?",
+                    text_en="Any work?",
+                )
+            },
+        )
+        return ModProject(
+            name="Iteration 3",
+            quests={quest.id: quest},
+            dialogs={dialog.id: dialog},
+        )
+
+    @staticmethod
+    def _block(script: str, start: str, end: str) -> str:
+        """Возвращает фрагмент скрипта между двумя маркерами."""
+        start_index = script.index(start)
+        return script[start_index : script.index(end, start_index)]
+
+    def setUp(self) -> None:
+        """Генерирует скрипт и выделяет основные блоки."""
+        self.script = LuaGenerator().generate_quests_script(
+            self._make_project(),
+            script_name="iter3_quests",
+            mod_prefix="iter3",
+        )
+        self.quests = self._block(
+            self.script, "local QUESTS = ", "-- Generic helpers"
+        )
+        self.status = self._block(
+            self.script,
+            "local function iter3_quest_status",
+            "local function iter3_quest_start",
+        )
+        self.reward = self._block(
+            self.script,
+            "local function iter3_quest_reward",
+            "local function iter3_quest_cleanup",
+        )
+        self.cleanup = self._block(
+            self.script,
+            "local function iter3_quest_cleanup",
+            "local function iter3_quest_accept",
+        )
+        self.can_take = self._block(
+            self.script,
+            "local function iter3_take_can_take",
+            "local function iter3_take_can_turn_in",
+        )
+
+    def test_give_item_is_split_into_idempotent_item_actions(self) -> None:
+        """``GiveItem`` не входит в одноразовые ``start_actions``."""
+        stage0 = self._block(self.quests, "[0] = {", "[1] = {")
+        start_part = self._block(stage0, "start_actions =", "item_actions =")
+        item_part = self._block(stage0, "item_actions =", "complete =")
+
+        self.assertNotIn('kind = "give_item"', start_part)
+        self.assertIn('kind = "give_item"', item_part)
+        self.assertIn('info = "iter3_ready"', start_part)
+
+    def test_status_regives_missing_quest_item_every_tick(self) -> None:
+        """Каждый тик ``_status`` проверяет инвентарь и возвращает предмет."""
+        self.assertIn(
+            "run_actions(stage_data.start_actions, db.actor, nil, "
+            '"iter3_quest")',
+            self.status,
+        )
+        self.assertIn("for _, item_spec in ipairs(stage_data.item_actions or {}) do", self.status)
+        self.assertIn(
+            "if actor_item_count(item_spec.item, db.actor) < "
+            "(item_spec.count or 1) then",
+            self.status,
+        )
+        self.assertIn(
+            "give_item(item_spec.item, item_spec.count, db.actor)",
+            self.status,
+        )
+        self.assertIn(
+            "if quest.complete_info == \"\" or "
+            "not has_alife_info(quest.complete_info) then",
+            self.status,
+        )
+
+    def test_cleanup_infos_are_saved_and_removed_on_reward_and_fail(self) -> None:
+        """``cleanup_infos`` попадают в QUESTS и снимаются в обоих эффектах."""
+        self.assertIn('"iter3_assault"', self.quests)
+        self.assertIn('"iter3_solo"', self.quests)
+
+        for block in (self.reward, self.cleanup):
+            with self.subTest(block=block[:40]):
+                self.assertIn(
+                    "for _, info in ipairs(quest.cleanup_infos or {}) do",
+                    block,
+                )
+                self.assertIn(
+                    "db.actor:disable_info_portion(info)", block
+                )
+
+    def test_reward_does_not_remove_taken_or_complete_info(self) -> None:
+        """Успешное завершение не снимает ``taken_info``/``complete_info``."""
+        self.assertNotIn("disable_info_portion(quest.taken_info)", self.reward)
+        self.assertNotIn(
+            "disable_info_portion(quest.complete_info)", self.reward
+        )
+
+    def test_announce_uses_finished_stage_message(self) -> None:
+        """Сообщение берётся у завершённого этапа, а не у следующего."""
+        self.assertIn('stage_data.msg or ""', self.status)
+        self.assertNotIn("next_data", self.script)
+
+    def test_can_take_does_not_duplicate_info_conditions(self) -> None:
+        """Info-условия остаются XML-тегами и не повторяются в Lua."""
+        self.assertNotIn('info = "iter3_started"', self.can_take)
+        self.assertNotIn('kind = "has_info"', self.can_take)
+        self.assertNotIn('kind = "dont_has_info"', self.can_take)
+        self.assertIn('kind = "has_item"', self.can_take)
 
 
 if __name__ == "__main__":

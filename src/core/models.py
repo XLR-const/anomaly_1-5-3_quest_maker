@@ -657,6 +657,34 @@ class Quest(BaseModel):
     title_en: str = Field(default="", description="Английское название квеста.")
     descr_ru: str = Field(default="", description="Русское описание квеста.")
     descr_en: str = Field(default="", description="Английское описание квеста.")
+    msg_reward_ru: str | None = Field(
+        default=None,
+        description=(
+            "Русский текст PDA-подсказки при завершении квеста. Если не "
+            "задан, генерируется 'Задание выполнено: <title_ru>.'"
+        ),
+    )
+    msg_reward_en: str | None = Field(
+        default=None,
+        description=(
+            "Английский текст PDA-подсказки при завершении квеста. Если не "
+            "задан, генерируется 'Task completed: <title_en>.'"
+        ),
+    )
+    msg_fail_ru: str | None = Field(
+        default=None,
+        description=(
+            "Русский текст PDA-подсказки при провале/отмене квеста. Если не "
+            "задан, генерируется 'Задание провалено: <title_ru>.'"
+        ),
+    )
+    msg_fail_en: str | None = Field(
+        default=None,
+        description=(
+            "Английский текст PDA-подсказки при провале/отмене квеста. Если "
+            "не задан, генерируется 'Task failed: <title_en>.'"
+        ),
+    )
     is_storyline: bool = Field(default=True, description="Признак сюжетности.")
     icon: str | None = Field(default=None, description="Иконка PDA (ui_inGame2_...).")
     prior: int | None = Field(default=None, ge=0, description="Приоритет в PDA.")
@@ -695,6 +723,14 @@ class Quest(BaseModel):
         default=None,
         description="Инфопоршень, выдаваемый при выдаче квеста.",
     )
+    cleanup_infos: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Инфопоршни, которые снимаются в конце _reward и в _cleanup. "
+            "Используется для взаимоисключающих вариантов (assault/solo) и "
+            "прочих временных маркеров; taken_info/complete_info не входят."
+        ),
+    )
     return_to_giver_stage: int | None = Field(
         default=None,
         description="Этап, на котором игрок должен вернуться к квестодателю.",
@@ -706,6 +742,22 @@ class Quest(BaseModel):
     )
     available_info: str | None = Field(default=None)
     done_info: str | None = Field(default=None)
+    requires_faction: str | None = Field(
+        default=None,
+        description=(
+            "Техническое имя фракции игрока (например, 'army'), при которой "
+            "квест доступен. Проверяется в <dialog_id>_can_take через "
+            "is_actor_faction()."
+        ),
+    )
+    requires_warfare: bool = Field(
+        default=False,
+        description=(
+            "Если True — квест доступен и работает только в режиме Warfare: "
+            "_can_take проверяет is_warfare(), а _start/_status не выполняются "
+            "вне Warfare (наравне с world)."
+        ),
+    )
 
     @field_validator("id", mode="before")
     @classmethod
@@ -779,6 +831,43 @@ class Quest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class CustomSquad(BaseModel):
+    """Кастомная секция отряда для ``squad_descr_<slug>.ltx``.
+
+    Движок автоматически подключает любой файл
+    ``gamedata/configs/misc/squad_descr/squad_descr_*.ltx`` через глоб в
+    ванильном ``squad_descr.ltx``, поэтому ``system.ltx`` патчить не нужно.
+
+    Секция ``[<id>]:online_offline_group`` позволяет объявить уникальный
+    квестовый отряд, который симуляция Warfare не создаёт сама.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    id: RequiredId = Field(
+        description=(
+            "Имя секции отряда, например 'mymod_atp_bandit_leader_squad'."
+        )
+    )
+    faction: str = Field(
+        description="Фракция отряда, например 'bandit' или 'army'."
+    )
+    npc: list[str] = Field(
+        min_length=1,
+        description=(
+            "Непустой список секций NPC, например ['sim_default_bandit_4']."
+        ),
+    )
+    target_smart: str | None = Field(
+        default=None,
+        description="Опциональный target_smart секции отряда.",
+    )
+    story_id: str | None = Field(
+        default=None,
+        description="Опциональный story_id секции отряда.",
+    )
+
+
 class ModProject(BaseModel):
     """Корневой проект мода: имя, зависимости, квесты и диалоги.
 
@@ -802,6 +891,14 @@ class ModProject(BaseModel):
     dialogs: dict[str, Dialog] = Field(
         default_factory=dict,
         description="Карта диалогов: ключ может отличаться от Dialog.id.",
+    )
+    squads: dict[str, CustomSquad] = Field(
+        default_factory=dict,
+        description=(
+            "Кастомные секции отрядов: ключ обязан совпадать с "
+            "CustomSquad.id. При непустой карте сборщик создаёт "
+            "squad_descr_<slug>.ltx."
+        ),
     )
 
     @model_validator(mode="after")
@@ -838,6 +935,12 @@ class ModProject(BaseModel):
                 raise ValueError(
                     f"Диалог '{dialog.id}' ссылается на отсутствующий "
                     f"квест '{dialog.task_id}'."
+                )
+        for squad_key, squad in self.squads.items():
+            if squad_key != squad.id:
+                raise ValueError(
+                    f"Ключ карты отрядов '{squad_key}' не совпадает "
+                    f"с CustomSquad.id='{squad.id}'."
                 )
         return self
 
@@ -969,6 +1072,7 @@ __all__ = [
     "BaseCondition",
     "CompleteTask",
     "Condition",
+    "CustomSquad",
     "Dialog",
     "DontHasInfo",
     "find_phrase_reward_conflicts",

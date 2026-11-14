@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from src.logger import get_logger
 
 if TYPE_CHECKING:
-    from src.core.models import Quest
+    from src.core.models import CustomSquad, Quest
 
 logger = get_logger("compiler.ltx_gen")
 
@@ -102,6 +102,78 @@ class LtxGenerator:
             skipped,
         )
         return content
+
+    def generate_squads_ltx(self, squads: dict[str, "CustomSquad"]) -> str:
+        """Генерирует ``squad_descr_<slug>.ltx`` с кастомными отрядами.
+
+        Движок автоматически подхватывает любой файл
+        ``gamedata/configs/misc/squad_descr/squad_descr_*.ltx`` через глоб в
+        ванильном ``squad_descr.ltx``, поэтому ``system.ltx`` патчить не
+        нужно.
+
+        Каждая модель превращается в секцию
+        ``[<squad_id>]:online_offline_group`` с обязательными полями
+        ``faction``/``npc`` и необязательными ``target_smart``/``story_id``.
+
+        Args:
+            squads (dict[str, CustomSquad]):
+                Карта кастомных отрядов. Ключ обязан совпадать с
+                ``CustomSquad.id``.
+
+        Returns:
+            str: Секции LTX, разделённые пустой строкой, с завершающим
+            переводом строки; пустая строка, если отрядов нет.
+
+        Raises:
+            TypeError: Если ``squads`` не является словарём.
+        """
+        if not isinstance(squads, dict):
+            raise TypeError(
+                "Аргумент squads должен быть словарём кастомных отрядов, "
+                f"а получен {type(squads).__name__}."
+            )
+        if not squads:
+            return ""
+
+        sections: list[str] = []
+        for squad_id, squad in squads.items():
+            if not isinstance(squad_id, str) or not squad_id.strip():
+                logger.warning(
+                    "Кастомный отряд с некорректным ключом %r пропущен.",
+                    squad_id,
+                )
+                continue
+
+            faction = str(getattr(squad, "faction", "") or "").strip()
+            npc_values = [
+                str(value).strip()
+                for value in (getattr(squad, "npc", None) or [])
+                if str(value).strip()
+            ]
+            if not faction or not npc_values:
+                logger.warning(
+                    "Кастомный отряд '%s' пропущен: faction/npc не заданы.",
+                    squad_id,
+                )
+                continue
+
+            lines = [
+                f"[{squad_id.strip()}]:online_offline_group",
+                f"faction = {faction}",
+                f"npc     = {', '.join(npc_values)}",
+            ]
+            target_smart = getattr(squad, "target_smart", None)
+            if isinstance(target_smart, str) and target_smart.strip():
+                lines.append(f"target_smart = {target_smart.strip()}")
+            story_id = getattr(squad, "story_id", None)
+            if isinstance(story_id, str) and story_id.strip():
+                lines.append(f"story_id = {story_id.strip()}")
+            sections.append("\n".join(lines))
+
+        if not sections:
+            return ""
+        logger.info("Сформирован squad_descr_<slug>.ltx: секций=%d.", len(sections))
+        return "\n\n".join(sections) + "\n"
 
     def _build_quest_section(self, quest_id: str, quest: "Quest") -> str:
         """Собирает одну секцию ``[<quest_id>]``.

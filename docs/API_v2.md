@@ -310,8 +310,11 @@ actions = [
 > **Алиасы и секции.** Поля `item_alias` в `GiveItem`/`RemoveItem`/`TakeItem`
 > и `item_alias` в `HasItem` принимают как прямую секцию (`itm_pda_common`,
 > `wpn_ak105`), так и алиас из `data/anomaly_db.sqlite`. Если генератор получил
-> `db_client`, алиас разрешается в секцию на этапе компиляции; без БД или при
-> ошибке запроса строка используется как есть и сборка не падает.
+> `db_client`, алиас разрешается в секцию на этапе компиляции, а при
+> отсутствии записи в БД выводится **warning** (строка используется как есть,
+> сборка не падает). Без БД или при ошибке запроса строка также используется
+> как есть. Warning важен: несуществующая секция иначе даёт молчаливый no-op
+> в игре (`give_item` только пишет `printe` в лог).
 
 > **Уведомления при изъятии предмета.** `TakeItem`/`RemoveItem` удаляют
 > предметы напрямую через `actor:iterate_inventory` и `alife_release`. Сообщение
@@ -450,7 +453,7 @@ class Dialog(BaseModel):
 | `npc_id` | `OptionalId` | `None` | Точный `<specific_character id="...">` из `character_desc_<level>.xml`. |
 | `npc_location` | `str \| None` | `None` | Имя локации (`deadcity`, `escape`, `zaton`, ...). Выбирает `character_desc_<level>.xml`. |
 | `task_id` | `OptionalId` | `None` | ID связанного квеста (`Quest.id`) для `GiveTask`/`CompleteTask` и `_can_take`/`_can_turn_in`. |
-| `role` | `str \| None` | `None` | Роль: `take`, `take_assault`, `take_solo`, `turnin`, `turn_in`, `branch`. Влияет на порядок вставки `<actor_dialog>`. Для `take`/`take_*` диалог всегда получает `<precondition>dialogs.<dialog_id>_can_take</precondition>`, который блокирует повторное взятие после выдачи `complete_info`. |
+| `role` | `str \| None` | `None` | Роль: `take`, `take_assault`, `take_solo`, `turnin`, `turn_in`, `branch`. Влияет на порядок вставки `<actor_dialog>`. Для `take`/`take_*` диалог всегда получает `<precondition>dialogs.<dialog_id>_can_take</precondition>`, который блокирует повторное взятие после выдачи `complete_info`. Для `turnin`/`turn_in` с заданным `task_id` и без ручных не-info условий диалог получает `<precondition>dialogs.<dialog_id>_can_turn_in</precondition>`: доступ проверяется по стадии задачи (`tsk.stage >= Quest.return_to_giver_stage`), а не по поршню из `on_start_actions`. |
 | `preconditions` | `list[Condition]` | `[]` | Условия доступности всего диалога. |
 | `phrases` | `dict[int, Phrase]` | `{}` | Карта реплик. Ключ обязан совпадать с `Phrase.id`. |
 
@@ -482,6 +485,14 @@ branch          -> 4
 неизвестная     -> 99
 ```
 
+> **Без дублирования info-условий.** `HasInfo`/`DontHasInfo` уровня диалога
+> генератор выносит в нативные теги `<has_info>`/`<dont_has_info>` и **не**
+> повторяет их внутри `_can_take`. В Lua попадают только не-info условия
+> (`HasItem`, `HasMoney`, `SmartOwner`) и встроенные проверки
+> `complete_info`/`done_info`/`task_info`/фракции/Warfare. Это правило
+> действует и для диалога сдачи: если у него есть ручное не-info условие,
+> используется общий `_can_take`; иначе — `_can_turn_in` по стадии задачи.
+
 ## 2.6. `WarfareCapture` — опциональный сценарий захвата смарта
 
 ```python
@@ -504,14 +515,47 @@ class WarfareCapture(BaseModel):
 Если `Stage.warfare_capture` задан, Lua-генератор включает автоматическую логику:
 
 - `spawn_stage_for` спавнит вражеский отряд (и союзников) один раз за этап;
-- `freeze_stage_for` замораживает отряды на точке;
+- `freeze_stage_for` замораживает отряды на точке: `freeze_squad` выставляет
+  `stay_time` только отряду с `squad.current_action == 1` (то есть уже
+  дошедшему до цели), затем `force_online` и `mark_task_squad`;
 - `stage_cleared` проверяет, что вражеский отряд уничтожен, а смарт захвачен
-  (`smart.owning_faction == "army"` или `smart.defense_count <= 0`).
+  (`smart.owning_faction == "army"` или `smart.defense_count <= 0`);
+- `unmark_quest_squads` при завершении/провале снимает отряды с
+  `sim_offline_combat.task_squads`.
+
+### Автоматический учёт отрядов из `SpawnSquad`
+
+Отряды, заспавненные действием `SpawnSquad` в реплике диалога или в
+`on_start_actions`/`on_init_actions`, учитываются автоматически, даже если они
+не объявлены в `WarfareCapture`:
+
+1. `run_actions(actions, actor, npc, quest_id)` получает id связанного квеста
+   (для диалога — `Dialog.task_id` или обратная ссылка `Quest.dialog_id`/
+   `Quest.dialog_ids`; для функций квеста — собственный `quest_id`).
+2. `register_dyn_squad(quest_id, squad)` увеличивает счётчик
+   `<prefix>_<quest_id>_dyn_squad_cnt` и сохраняет `squad.id` в
+   `<prefix>_<quest_id>_dyn_squad_<n>` (pstor).
+3. `<quest_id>_start` сбрасывает `..._dyn_squad_cnt = 0` при повторной выдаче.
+4. `<quest_id>_status` каждый тик вызывает `freeze_dyn_squads(quest)`, который
+   морозит все зарегистрированные отряды через `freeze_squad`.
+5. `<quest_id>_reward`/`<quest_id>_cleanup` вызывают `unmark_quest_squads`,
+   который освобождает и `capture`-отряды, и все динамические
+   `..._dyn_squad_<n>` из `sim_offline_combat.task_squads`.
+
+Поэтому `SpawnSquad` в реплике больше не создаёт «неуправляемый» отряд: он
+попадает в pstor, замораживается на точке и освобождается вместе с квестом.
+
+> **Рекомендация.** Если отряд должен участвовать в проверке зачистки
+> (`stage_cleared`), объявляйте его через
+> `WarfareCapture.enemy_squad_alias`/`ally_squad_alias`: только эти отряды
+> входят в `capture.ally_count` и проверяются как цель этапа. `SpawnSquad` в
+> реплике удобен для подкрепления и сопровождения.
 
 > **Ограничение рантайма:** при наличии `warfare_capture` квест помечается как
 > `world = true`, и его `_status` не работает вне режима Warfare
 > (`IsWarfare() == false`). Для обычных сюжетных квестов не задавайте
-> `warfare_capture`.
+> `warfare_capture`. Явный `Quest.requires_warfare=True` действует так же,
+> даже без `warfare_capture`.
 
 ## 2.7. `Stage` — один этап квеста
 
@@ -571,8 +615,21 @@ class Stage(BaseModel):
 не должен вешаться на актора.
 
 `on_start_actions` выполняются Lua-функцией `_status` при первом обнаружении
-текущего этапа. Факт выполнения сохраняется в pstor, поэтому действия не
-повторяются после загрузки сохранения.
+текущего этапа. Факт выполнения сохраняется в pstor-ключе
+`<...>_v_<stage>_started`, поэтому действия не повторяются после загрузки
+сохранения. Исключение — `GiveItem`: такой предмет выдаётся **идемпотентно**
+на каждом тике `_status`, пока его количество в инвентаре меньше заданного
+`count` (например, выброшенный ПДА возвращается). Это не касается
+`taken_info`/`complete_info`: они управляются только `_start`/`_reward`/
+`_cleanup`.
+
+> **Важно при `world = true`/`requires_warfare`.** Вне Warfare `_status` не
+> тикает (возвращает `nil`), поэтому `on_start_actions` не выполнятся вовсе.
+> Критичные поршни (например, `*_ready`) выпускайте в
+> `Quest.on_init_actions`, а не в `Stage.on_start_actions`. Идемпотентный
+> `GiveItem` в `on_start_actions` тоже не сработает, пока Warfare не
+> включён; если предмет обязателен для не-Warfare сценария, используйте
+> `Quest.on_init_actions` или отдельный этап без `warfare_capture`.
 
 ### Автоматическое отслеживание ликвидации отряда (`target_squad_id`)
 
@@ -637,6 +694,10 @@ class Quest(BaseModel):
     title_en: str = ""
     descr_ru: str = ""
     descr_en: str = ""
+    msg_reward_ru: str | None = None
+    msg_reward_en: str | None = None
+    msg_fail_ru: str | None = None
+    msg_fail_en: str | None = None
     is_storyline: bool = True
     icon: str | None = None
     prior: int | None = None
@@ -650,10 +711,13 @@ class Quest(BaseModel):
     reward_item_count: int = 1
     complete_info: str | None = None
     taken_info: str | None = None
+    cleanup_infos: list[str] = []
     return_to_giver_stage: int | None = None
     return_distance: float = 40.0
     available_info: str | None = None
     done_info: str | None = None
+    requires_faction: str | None = None
+    requires_warfare: bool = False
 ```
 
 ### Идентификаторы и связи
@@ -673,6 +737,8 @@ class Quest(BaseModel):
 |---|---|---|---|
 | `title_ru` / `title_en` | `str` | `""` | Название квеста в PDA. |
 | `descr_ru` / `descr_en` | `str` | `""` | Описание квеста в PDA. |
+| `msg_reward_ru` / `msg_reward_en` | `str \| None` | `None` | Тексты PDA-подсказки при завершении. `None` → автогенерация «Задание выполнено: <title>.» / «Task completed: <title>.». |
+| `msg_fail_ru` / `msg_fail_en` | `str \| None` | `None` | Тексты PDA-подсказки при провале/отмене. `None` → автогенерация «Задание провалено: <title>.» / «Task failed: <title>.». |
 | `is_storyline` | `bool` | `True` | Попадает в LTX как `storyline = true/false`. |
 | `icon` | `str \| None` | `None` | Иконка PDA. По умолчанию `ui_inGame2_Put_v_pripyat`. |
 | `prior` | `int \| None` (`ge=0`) | `None` | Приоритет в PDA. По умолчанию `60`. |
@@ -692,6 +758,7 @@ class Quest(BaseModel):
 ```text
 каждый тик (с троттлингом):
   выполнить on_start_actions текущего этапа ровно один раз
+  повторно выдать GiveItem из on_start_actions, если предмета меньше count
   заспавнить/заморозить отряды warfare_capture, если задано
   если transfer_conditions[stage]["fail"] истинно -> "fail"
   если warfare_capture этап зачищён -> следующий этап или "complete"
@@ -708,10 +775,57 @@ class Quest(BaseModel):
 | `reward_item_count` | `int` (`ge=1`) | `1` | Количество предметов награды. |
 | `complete_info` | `str \| None` | `None` | Поршень, выдаваемый в `_reward`. |
 | `taken_info` | `str \| None` | `None` | Поршень, выдаваемый в `_start`. Снимается только в `_cleanup` (провал/отмена); при успешном завершении сохраняется. |
+| `cleanup_infos` | `list[str]` | `[]` | Поршни, снимаемые в конце `_reward` и в `_cleanup`. Предназначены для взаимоисключающих вариантов (`assault`/`solo`) и временных маркеров; `taken_info`/`complete_info` в список включать не нужно. |
 | `return_to_giver_stage` | `int \| None` | `None` | Этап, на котором игрок должен вернуться к квестодателю. |
 | `return_distance` | `float` (`ge=0`) | `40.0` | Радиус «подошёл к квестодателю» в метрах. |
-| `available_info` | `str \| None` | `None` | Зарезервировано для внешних скриптов/UI; ядро только сохраняет значение в таблице `QUESTS`. |
+| `available_info` | `str \| None` | `None` | Маркер доступности для внешних скриптов/UI. Ядро только сохраняет значение в `QUESTS` и **не проверяет** его в сгенерированном коде. Для встроенного гейта используйте `requires_faction`/`requires_warfare` (см. ниже). |
 | `done_info` | `str \| None` | `None` | Зарезервировано для внешних скриптов/UI; ядро только сохраняет значение в таблице `QUESTS`. |
+| `requires_faction` | `str \| None` | `None` | Техническое имя фракции игрока (например, `"army"`). Встроенный гейт: `<dialog_id>_can_take` вызывает `is_actor_faction(...)` и закрывает диалог для чужой фракции. |
+| `requires_warfare` | `bool` | `False` | Встроенный гейт Warfare: `<dialog_id>_can_take` требует `is_warfare()`; `<quest_id>_start`/`<quest_id>_status` не выполняются вне Warfare (`if (quest.world or quest.requires_warfare) and not is_warfare() then return nil end`). |
+
+### Гейты доступа: `requires_faction` и `requires_warfare`
+
+В отличие от `available_info`/`done_info`, которые остаются **маркерами для
+внешних скриптов** и не проверяются сгенерированным кодом, поля
+`requires_faction` и `requires_warfare` — это первоклассные встроенные гейты:
+
+```python
+class Quest(BaseModel):
+    ...
+    requires_faction: str | None = None   # например, "army"
+    requires_warfare: bool = False
+```
+
+Генератор добавляет в `<dialog_id>_can_take` связанного диалога:
+
+```lua
+if requires_warfare and not is_warfare() then return false end
+if requires_faction ~= "" and not is_actor_faction(requires_faction) then
+	return false
+end
+```
+
+`is_actor_faction(faction)` повторяет эталонный `is_actor_army()`:
+
+```lua
+local function is_actor_faction(faction)
+	if not faction or faction == "" then return false end
+	if warfare and warfare.actor_faction == faction then
+		return true
+	end
+	local ok, comm = pcall(function() return get_actor_true_community() end)
+	return (ok and comm == faction) or false
+end
+```
+
+Проверка сначала смотрит на `warfare.actor_faction` (режим Warfare), затем —
+на `get_actor_true_community()` (работает и вне Warfare). Если нужен доступ
+только в Warfare, задайте `requires_warfare=True` **и** `requires_faction`;
+если нужен доступ любой фракции — только `requires_warfare`.
+
+`requires_warfare` также блокирует `_start`/`_status` наравне с `world`:
+квест не будет «висеть» вне Warfare, а его эффекты не выполнятся без
+включённого режима.
 
 > **Награда сдачи — только через `Quest.reward_*` или `on_complete_actions`.**
 > Если вы задали `reward_money`, `reward_item_alias` или `complete_info`, не
@@ -756,6 +870,7 @@ class ModProject(BaseModel):
     required_mods: list[str] = []
     quests: dict[str, Quest] = {}
     dialogs: dict[str, Dialog] = {}
+    squads: dict[str, CustomSquad] = {}
 ```
 
 | Поле | Тип | По умолчанию | Назначение |
@@ -764,13 +879,15 @@ class ModProject(BaseModel):
 | `required_mods` | `list[str]` | `[]` | Декларативный список зависимостей. Ядро его не проверяет. |
 | `quests` | `dict[str, Quest]` | `{}` | Карта квестов. Ключ обязан совпадать с `Quest.id`. |
 | `dialogs` | `dict[str, Dialog]` | `{}` | Карта диалогов. Ключ может отличаться от `Dialog.id`; канонический ID всегда берётся из модели. |
+| `squads` | `dict[str, CustomSquad]` | `{}` | Карта кастомных секций отрядов. Ключ обязан совпадать с `CustomSquad.id`. При непустой карте сборщик пишет `squad_descr_<slug>.ltx`. |
 
 Валидатор `ModProject._validate_cross_references` проверяет:
 
 - ключ `quests` совпадает с `Quest.id`;
 - каждый `Quest.dialog_id` и каждый элемент `Quest.dialog_ids` существует в
   `dialogs`;
-- каждый `Dialog.task_id` существует в `quests`.
+- каждый `Dialog.task_id` существует в `quests`;
+- ключ `squads` совпадает с `CustomSquad.id`.
 
 Методы сериализации:
 
@@ -852,6 +969,65 @@ dialog_id = "deadcity_dushman_take"
 > **Жёсткое правило:** не угадывайте профиль NPC. Если диалог должен быть
 > доступен у конкретного NPC, всегда задавайте и `npc_id`, и `npc_location`.
 > `dialog_id` — это ровно то значение, которое попадёт в `<actor_dialog>`.
+
+## 2.11. `CustomSquad` — кастомные секции отрядов
+
+```python
+class CustomSquad(BaseModel):
+    model_config = _MODEL_CONFIG
+
+    id: RequiredId
+    faction: str
+    npc: list[str]                  # непустой список секций NPC
+    target_smart: str | None = None
+    story_id: str | None = None
+```
+
+| Поле | Тип | По умолчанию | Назначение |
+|---|---|---|---|
+| `id` | `RequiredId` | обязательное | Имя LTX-секции, например `mymod_atp_bandit_leader_squad`. Ключ в `ModProject.squads` обязан совпадать. |
+| `faction` | `str` | обязательное | Фракция отряда, например `bandit` или `army`. |
+| `npc` | `list[str]` | обязательное | Непустой список секций NPC, например `["sim_default_bandit_4"]`. |
+| `target_smart` | `str \| None` | `None` | Необязательный `target_smart` секции. |
+| `story_id` | `str \| None` | `None` | Необязательный `story_id` секции. |
+
+Пример проекта:
+
+```python
+from src.core.models import CustomSquad, ModProject
+
+project = ModProject(
+    name="My Mod",
+    squads={
+        "mymod_atp_bandit_leader_squad": CustomSquad(
+            id="mymod_atp_bandit_leader_squad",
+            faction="bandit",
+            npc=["sim_default_bandit_4"],
+        )
+    },
+)
+```
+
+Если `project.squads` не пуст, `ModBuilder.build_project` создаёт каталог
+`gamedata/configs/misc/squad_descr` и записывает файл
+`gamedata/configs/misc/squad_descr/squad_descr_<slug>.ltx` в cp1251 **без
+BOM**:
+
+```ltx
+[mymod_atp_bandit_leader_squad]:online_offline_group
+faction = bandit
+npc     = sim_default_bandit_4
+```
+
+Если заданы `target_smart`/`story_id`, они добавляются отдельными строками.
+При пустом `project.squads` файл **не создаётся**.
+
+> **`system.ltx` патчить не нужно.** Ванильный
+> `gamedata/configs/misc/squad_descr/squad_descr.ltx` подключает все файлы
+> `squad_descr_*.ltx` через глоб, поэтому новый файл загружается движком
+> автоматически. Секция `:online_offline_group` позволяет объявить уникальный
+> квестовый отряд, который симуляция Warfare не создаёт сама (в отличие от
+> «common»-секций).
 
 ---
 
@@ -986,12 +1162,18 @@ output/<slug>/
 9. `GiveTask`/`CompleteTask`, если они единственные Lua-действия реплики,
    ссылаются на **текущий диалог**: `dialogs.<dialog_id>_accept` и
    `dialogs.<dialog_id>_turn_in`.
-10. **Ровно один `<action>` на реплику.** Если действий несколько, все они
+10. Диалог `role="turnin"`/`"turn_in"` с заданным `task_id` и без ручных
+    не-info условий получает
+    `<precondition>dialogs.<dialog_id>_can_turn_in</precondition>`. Функция
+    проверяет `tsk.stage >= Quest.return_to_giver_stage` и наличие задачи,
+    поэтому сдача работает после save/load даже без тика `_status`. Поршень
+    `*_ready` из `on_start_actions` для этого не используется.
+11. **Ровно один `<action>` на реплику.** Если действий несколько, все они
     (включая `GiveTask`/`CompleteTask`) исполняются единой функцией
     `dialogs.<dialog_id>_phrase_<n>_action` строго в порядке объявления.
     Второй тег `<action>` движок отбрасывает.
-11. Никакого захардкоженного `hello_dialog`: ID всегда приходит из модели.
-12. `Phrase(id=0)` всегда принадлежит Игроку; чётные ID — Игрок, нечётные —
+12. Никакого захардкоженного `hello_dialog`: ID всегда приходит из модели.
+13. `Phrase(id=0)` всегда принадлежит Игроку; чётные ID — Игрок, нечётные —
     NPC. Не начинайте `<actor_dialog>` с реплики NPC.
 
 Пример сгенерированного файла:
@@ -1166,11 +1348,16 @@ register()
 
 - `Quest.on_init_actions` — в `<quest_id>_start`, после выдачи `taken_info`.
 - `Quest.on_complete_actions` — в `<quest_id>_reward`, после `reward_money`/
-  `reward_item_alias`/`complete_info`. `taken_info` при успехе **не снимается**:
-  это защищает стартовый диалог от повторного открытия.
+  `reward_item_alias`/`complete_info`. `taken_info` и `complete_info` при
+  успехе **не снимаются**: это защищает стартовый диалог от повторного
+  открытия. Поршни из `Quest.cleanup_infos` снимаются в конце `_reward`.
 - `Quest.on_fail_actions` — в `<quest_id>_cleanup`; здесь `taken_info`
-  снимается, потому что квест можно взять заново.
-- `Stage.on_start_actions` — в `<quest_id>_status` ровно один раз за этап.
+  снимается, потому что квест можно взять заново, а затем снимаются все
+  `Quest.cleanup_infos`.
+- `Stage.on_start_actions` — в `<quest_id>_status` ровно один раз за этап
+  (ключ `<...>_v_<stage>_started`). `GiveItem` выносится в отдельный список
+  `item_actions` и выдаётся идемпотентно на каждом тике, пока предмета в
+  инвентаре меньше `count`.
 - `Phrase.actions`:
   - `GiveInfo` → прямой XML-тег `<give_info>`;
   - одиночный `GiveTask` → XML `<action>dialogs.<dialog_id>_accept</action>`;
@@ -1184,12 +1371,17 @@ register()
     `<action>`.
   - Второй `<action>` в реплике недопустим: движок его игнорирует.
 
-> **Строки подсказок.** `_reward` и `_cleanup` вызывают `pda_tip` со строковыми
-> ID `<quest_id>_msg_reward` и `<quest_id>_msg_fail`. Базовый генератор
-> `st_<slug>.xml` создаёт `_title`, `_descr` и `_stage_<n>_*`; если вы хотите
-> кастомные подсказки завершения/провала, добавьте `_msg_reward`/`_msg_fail` в
-> свою таблицу строк. `pda_tip` проверяет перевод через `game.translate_string`
-> и не выводит строку, если перевода нет, — сырые ID не попадают в левый бар КПК.
+> **Строки подсказок `_msg_reward`/`_msg_fail`.** Генератор
+> `st_<slug>.xml` **всегда** создаёт строки `<quest_id>_msg_reward` и
+> `<quest_id>_msg_fail`, на которые ссылаются `_reward`/`_cleanup`
+> (`pda_tip`). По умолчанию используются тексты
+> «Задание выполнено: <title_ru>.» / «Task completed: <title_en>.» и
+> «Задание провалено: <title_ru>.» / «Task failed: <title_en>.». Чтобы
+> показать свои формулировки, задайте `Quest.msg_reward_ru/en` и
+> `Quest.msg_fail_ru/en`. `pda_tip` дополнительно проверяет перевод через
+> `game.translate_string` и не выводит строку, если перевода нет, — сырые ID
+> не попадают в левый бар КПК. Отсутствие строки больше не является тихим
+> no-op: она генерируется всегда.
 
 ### Pstor и отряды
 
@@ -1235,11 +1427,35 @@ on_cancel             = %=my_quest_cleanup()%
    обязательны.
 4. Награды (`reward_money`, `reward_item_alias`) в LTX не попадают — они
    выдаются из Lua-эффекта `_reward`.
-5. `stage_complete` равен количеству этапов.
+5. `stage_complete` равен количеству этапов. Финальный этап «сдача» должен
+   существовать явно, даже если сдача идёт через диалог: это даёт корректный
+   маркер цели и `stage_complete`, а также позволяет `_can_turn_in` проверить
+   `tsk.stage`.
 6. Если задан `npc_id`/`giver_npc_id`, добавляется
    `condlist_0 = {!task_giver_alive(<quest_id>)} fail`.
 7. Файл `task_manager.ltx` не патчится: он сам подхватывает `tm_*.ltx` через
    `#include`.
+
+Пример явного этапа сдачи (3 этапа, `stage_complete = 3`):
+
+```python
+stages={
+    0: Stage(id=0, target_alias="esc_smart_terrain_2_12"),
+    1: Stage(id=1, target_alias="esc_smart_terrain_5_7"),
+    # Финальный этап «вернуться» существует явно. Сдача идёт диалогом:
+    # return_to_giver_stage не задаётся, а _can_turn_in проверяет tsk.stage.
+    2: Stage(id=2, target_alias=""),
+}
+```
+
+```ltx
+[mymod_av_quest]
+stage_complete        = 3
+```
+
+Если финальный этап убрать, `stage_complete` станет `2`, а `_can_turn_in`
+будет считать сдачу доступной на этапе захвата — маркер и проверка стадии
+разъедутся.
 
 ## 3.6. Кодировка, BOM и переносы строк
 

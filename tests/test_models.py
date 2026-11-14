@@ -28,6 +28,7 @@ from src.core.models import (  # noqa: E402
     Action,
     CompleteTask,
     Condition,
+    CustomSquad,
     Dialog,
     DontHasInfo,
     GiveInfo,
@@ -391,6 +392,34 @@ class TestQuestValidation(unittest.TestCase):
         self.assertIn("[0, 1]", str(context.exception))
         self.assertIn("[0, 2]", str(context.exception))
 
+    def test_cleanup_infos_defaults_to_empty_list(self) -> None:
+        """``cleanup_infos`` по умолчанию пуст и не разделяется между квестами."""
+        first = _make_quest([0])
+        second = _make_quest([0])
+
+        self.assertEqual(first.cleanup_infos, [])
+        first.cleanup_infos.append("mymod_variant_assault")
+        self.assertEqual(second.cleanup_infos, [])
+
+    def test_cleanup_infos_and_messages_survive_json_roundtrip(self) -> None:
+        """Вариантные поршни и тексты подсказок сохраняются в JSON."""
+        quest = _make_quest([0])
+        quest.cleanup_infos = ["mymod_assault", "mymod_solo"]
+        quest.msg_reward_ru = "Награда выдана."
+        quest.msg_reward_en = "Reward granted."
+        quest.msg_fail_ru = "Задание провалено."
+        quest.msg_fail_en = "Task failed."
+
+        restored = Quest.model_validate_json(quest.model_dump_json())
+
+        self.assertEqual(
+            restored.cleanup_infos, ["mymod_assault", "mymod_solo"]
+        )
+        self.assertEqual(restored.msg_reward_ru, "Награда выдана.")
+        self.assertEqual(restored.msg_reward_en, "Reward granted.")
+        self.assertEqual(restored.msg_fail_ru, "Задание провалено.")
+        self.assertEqual(restored.msg_fail_en, "Task failed.")
+
 
 # ---------------------------------------------------------------------------
 # Round-trip проекта мода
@@ -601,6 +630,63 @@ class TestTraderActionsAndConditions(unittest.TestCase):
         self.assertEqual(
             stage.target_squad_id, "esc_3_16_military_trader_squad"
         )
+
+
+class TestFactionWarfareGatesAndCustomSquads(unittest.TestCase):
+    """Проверка гейтов квеста и модели кастомного отряда."""
+
+    def test_quest_requires_faction_and_warfare_roundtrip(self) -> None:
+        """Новые поля квеста сохраняются в JSON и имеют безопасные defaults."""
+        default_quest = Quest(id="plain", stages={0: Stage(id=0)})
+        self.assertIsNone(default_quest.requires_faction)
+        self.assertFalse(default_quest.requires_warfare)
+
+        quest = Quest(
+            id="gated",
+            requires_faction="army",
+            requires_warfare=True,
+            stages={0: Stage(id=0)},
+        )
+        restored = Quest.model_validate_json(quest.model_dump_json())
+
+        self.assertEqual(restored.requires_faction, "army")
+        self.assertTrue(restored.requires_warfare)
+
+    def test_custom_squad_is_validated(self) -> None:
+        """CustomSquad принимает поля эталона и требует непустой npc."""
+        squad = CustomSquad(
+            id="mymod_atp_bandit_leader_squad",
+            faction="bandit",
+            npc=["sim_default_bandit_4"],
+            target_smart="esc_smart_terrain_7_11",
+            story_id="mymod_bandit_leader",
+        )
+        self.assertEqual(squad.faction, "bandit")
+        self.assertEqual(squad.npc, ["sim_default_bandit_4"])
+        self.assertEqual(squad.target_smart, "esc_smart_terrain_7_11")
+        self.assertEqual(squad.story_id, "mymod_bandit_leader")
+
+        with self.assertRaises(ValidationError):
+            CustomSquad(id="empty", faction="bandit", npc=[])
+
+    def test_project_squad_key_must_match_id(self) -> None:
+        """Ключ карты squads обязан совпадать с CustomSquad.id."""
+        squad = CustomSquad(
+            id="mymod_bandit_leader",
+            faction="bandit",
+            npc=["sim_default_bandit_4"],
+        )
+        project = ModProject(
+            name="Squads",
+            squads={squad.id: squad},
+        )
+        self.assertIs(project.squads[squad.id], squad)
+
+        restored = ModProject.from_json(project.to_json())
+        self.assertEqual(restored.squads[squad.id].faction, "bandit")
+
+        with self.assertRaises(ValidationError):
+            ModProject(name="Squads", squads={"wrong_key": squad})
 
 
 class TestPhraseActionModes(unittest.TestCase):

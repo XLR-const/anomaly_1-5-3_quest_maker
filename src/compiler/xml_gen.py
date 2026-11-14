@@ -109,6 +109,36 @@ class XmlGenerator:
         for quest_id, quest in (project.quests or {}).items():
             add(f"{quest_id}_title", quest.title_ru, quest.title_en)
             add(f"{quest_id}_descr", quest.descr_ru, quest.descr_en)
+            add(
+                f"{quest_id}_msg_reward",
+                self._quest_message(
+                    quest.msg_reward_ru,
+                    quest.title_ru,
+                    "Задание выполнено: {title}.",
+                    "Задание выполнено.",
+                ),
+                self._quest_message(
+                    quest.msg_reward_en,
+                    quest.title_en,
+                    "Task completed: {title}.",
+                    "Task completed.",
+                ),
+            )
+            add(
+                f"{quest_id}_msg_fail",
+                self._quest_message(
+                    quest.msg_fail_ru,
+                    quest.title_ru,
+                    "Задание провалено: {title}.",
+                    "Задание провалено.",
+                ),
+                self._quest_message(
+                    quest.msg_fail_en,
+                    quest.title_en,
+                    "Task failed: {title}.",
+                    "Task failed.",
+                ),
+            )
             for stage_id, stage in sorted(quest.stages.items()):
                 prefix = f"{quest_id}_stage_{stage_id}"
                 add(f"{prefix}_title", stage.title_ru, stage.title_en)
@@ -124,6 +154,29 @@ class XmlGenerator:
                     phrase.text_en,
                 )
         return entries
+
+    @staticmethod
+    def _quest_message(
+        custom: str | None,
+        title: str,
+        template: str,
+        fallback: str,
+    ) -> str:
+        """Возвращает кастомный или сгенерированный текст PDA-подсказки.
+
+        Args:
+            custom (str | None): Значение поля ``Quest.msg_*``.
+            title (str): Заголовок квеста для подстановки.
+            template (str): Шаблон с ``{title}``.
+            fallback (str): Текст, если заголовок пуст.
+
+        Returns:
+            str: Готовая строка ``st_<mod>.xml``.
+        """
+        if custom:
+            return custom
+        cleaned = (title or "").strip()
+        return template.format(title=cleaned) if cleaned else fallback
 
     def _build_string_table(
         self, entries: list[StringEntry], language: str
@@ -243,12 +296,23 @@ class XmlGenerator:
         # Для стартовых диалогов role="take*" Lua-условие обязательно: именно
         # _can_take блокирует повторное взятие завершённого квеста.
         info_tags, needs_condition = self._split_dialog_conditions(dialog)
-        role = str(getattr(dialog, "role", "") or "")
+        role = str(getattr(dialog, "role", "") or "").strip().lower()
         if role.startswith("take"):
             needs_condition = True
+
+        # Диалог сдачи закрывается проверкой стадии задачи, а не поршнем из
+        # on_start_actions: _can_turn_in читает tsk.stage и работает после
+        # save/load даже без тика _status. Ручные не-info условия имеют
+        # приоритет: тогда используется общий _can_take.
+        precondition: str | None = None
         if needs_condition:
+            precondition = "can_take"
+        elif role in ("turnin", "turn_in") and getattr(dialog, "task_id", None):
+            precondition = "can_turn_in"
+        if precondition:
             lines.append(
-                f"\t\t<precondition>dialogs.{dialog_id}_can_take</precondition>"
+                f"\t\t<precondition>dialogs.{dialog_id}_{precondition}"
+                "</precondition>"
             )
         for tag, value in info_tags:
             lines.append(f"\t\t<{tag}>{escape_xml_text(value)}</{tag}>")
