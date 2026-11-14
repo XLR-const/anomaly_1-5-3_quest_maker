@@ -1111,6 +1111,22 @@ class TestIteration3Mechanics(unittest.TestCase):
         self.assertIn('stage_data.msg or ""', self.status)
         self.assertNotIn("next_data", self.script)
 
+    def test_start_shows_new_task_tip(self) -> None:
+        """``_start`` показывает уведомление КПК о взятом задании."""
+        self.assertIn('msg_start = "iter3_quest_msg_start"', self.quests)
+
+        start = self._block(
+            self.script,
+            "local function iter3_quest_start",
+            "local function iter3_quest_reward",
+        )
+        self.assertIn("sound_task()", start)
+        self.assertIn("pda_tip(quest.msg_start)", start)
+        self.assertLess(
+            start.index("sound_task()"),
+            start.index("pda_tip(quest.msg_start)"),
+        )
+
     def test_can_take_does_not_duplicate_info_conditions(self) -> None:
         """Info-условия остаются XML-тегами и не повторяются в Lua."""
         self.assertNotIn('info = "iter3_started"', self.can_take)

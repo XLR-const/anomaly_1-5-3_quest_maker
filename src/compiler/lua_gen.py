@@ -1107,6 +1107,7 @@ class LuaGenerator:
             "descr": f"{quest_id}_descr",
             "msg_reward": f"{quest_id}_msg_reward",
             "msg_fail": f"{quest_id}_msg_fail",
+            "msg_start": f"{quest_id}_msg_start",
             "taken_info": quest.taken_info or "",
             "complete_info": quest.complete_info or "",
             "cleanup_infos": list(getattr(quest, "cleanup_infos", []) or []),
@@ -1354,6 +1355,7 @@ local function {quest_id}_start(actor, npc, p)
 	end
 	run_actions(quest.init_actions, actor or db.actor, npc, {q})
 	sound_task()
+	pda_tip(quest.msg_start)
 	printf("[__SCRIPT_NAME__] %s started", {q})
 end"""
 

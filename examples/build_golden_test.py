@@ -145,6 +145,12 @@ def create_first_quest() -> Quest:
                 id=0,
                 title_ru="Захватить Деревню новичков",
                 title_en="Capture the Rookie Village",
+                msg_complete_ru=(
+                    "Деревня новичков захвачена. Следующая цель — Элеватор."
+                ),
+                msg_complete_en=(
+                    "The Rookie Village is captured. Next target: the Elevator."
+                ),
                 descr_ru=(
                     "Возглавьте две штурмовые группы и выбейте одиночек "
                     "из Деревни новичков."
@@ -165,6 +171,12 @@ def create_first_quest() -> Quest:
                 id=1,
                 title_ru="Захватить Элеватор",
                 title_en="Capture the Elevator",
+                msg_complete_ru=(
+                    "Элеватор под контролем. Возвращайтесь к майору Журову."
+                ),
+                msg_complete_en=(
+                    "The Elevator is under control. Report back to Major Zhurov."
+                ),
                 descr_ru=(
                     "Перебросьте штурмовые группы к Элеватору и зачистите "
                     "его от бандитов."
@@ -192,6 +204,12 @@ def create_first_quest() -> Quest:
                 descr_en=(
                     "Report the capture of the Rookie Village and the "
                     "Elevator to Major Zhurov at the southern checkpoint."
+                ),
+                msg_complete_ru=(
+                    "Южный периметр закрыт. Майор Журов доволен."
+                ),
+                msg_complete_en=(
+                    "The southern perimeter is sealed. Major Zhurov is pleased."
                 ),
                 target_alias="",
                 on_start_actions=[GiveInfo(info=Q1_READY)],
@@ -346,6 +364,14 @@ def create_second_quest() -> Quest:
                 id=0,
                 title_ru="Захватить АТП",
                 title_en="Capture the ATP",
+                msg_complete_ru=(
+                    "АТП зачищено, трофейные данные у вас. "
+                    "Возвращайтесь к майору Журову."
+                ),
+                msg_complete_en=(
+                    "The ATP is cleared and you have the trophy data. "
+                    "Report back to Major Zhurov."
+                ),
                 descr_ru=(
                     "Зачистите АТП от бандитов и заберите трофейные данные "
                     "с их ПДА."
@@ -373,6 +399,12 @@ def create_second_quest() -> Quest:
                 descr_en=(
                     "Bring the trophy PDA to Major Zhurov at the southern "
                     "checkpoint."
+                ),
+                msg_complete_ru=(
+                    "Данные переданы майору Журову. Задание выполнено."
+                ),
+                msg_complete_en=(
+                    "The data was handed to Major Zhurov. Task complete."
                 ),
                 target_alias="",
                 # Этап начинается ровно в момент зачистки АТП: здесь игрок

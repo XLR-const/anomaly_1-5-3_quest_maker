@@ -425,6 +425,7 @@ class TestXmlGeneratorStringTables(unittest.TestCase):
         expected = {
             f"{QUEST_ID}_title",
             f"{QUEST_ID}_descr",
+            f"{QUEST_ID}_msg_start",
             f"{QUEST_ID}_msg_reward",
             f"{QUEST_ID}_msg_fail",
             f"{QUEST_ID}_stage_0_title",
@@ -512,6 +513,59 @@ class TestXmlGeneratorStringTables(unittest.TestCase):
         self.assertEqual(eng[f"{QUEST_ID}_msg_reward"], "Reward received.")
         self.assertEqual(rus[f"{QUEST_ID}_msg_fail"], "Квест провален.")
         self.assertEqual(eng[f"{QUEST_ID}_msg_fail"], "Quest failed.")
+
+    def test_start_message_is_generated_for_each_quest(self) -> None:
+        """Строка ``_msg_start`` информирует о взятии нового задания."""
+        rus = self._string_map("rus")
+        eng = self._string_map("eng")
+
+        self.assertEqual(
+            rus[f"{QUEST_ID}_msg_start"],
+            "Новое задание: Квест & проверка.",
+        )
+        self.assertEqual(
+            eng[f"{QUEST_ID}_msg_start"],
+            "New task: Quest & check.",
+        )
+
+    def test_stage_completion_message_has_sensible_default(self) -> None:
+        """Без ``Stage.msg_complete_*`` генерируется сообщение о завершении."""
+        rus = self._string_map("rus")
+        eng = self._string_map("eng")
+
+        self.assertEqual(
+            rus[f"{QUEST_ID}_stage_0_msg"],
+            "Этап выполнен: Этап 0.",
+        )
+        self.assertEqual(
+            eng[f"{QUEST_ID}_stage_0_msg"],
+            "Stage completed: Stage 0.",
+        )
+
+    def test_custom_stage_completion_message_overrides_default(self) -> None:
+        """Поля ``Stage.msg_complete_*`` имеют приоритет над шаблоном."""
+        quest = self.project.quests[QUEST_ID]
+        quest.stages[0].msg_complete_ru = "Деревня захвачена."
+        quest.stages[0].msg_complete_en = "The village is captured."
+
+        tables = XmlGenerator().generate_string_tables(self.project)
+        rus = {
+            element.get("id", ""): element.findtext("text", "")
+            for element in ET.fromstring(tables["rus"]).findall("string")
+        }
+        eng = {
+            element.get("id", ""): element.findtext("text", "")
+            for element in ET.fromstring(tables["eng"]).findall("string")
+        }
+
+        self.assertEqual(rus[f"{QUEST_ID}_stage_0_msg"], "Деревня захвачена.")
+        self.assertEqual(
+            eng[f"{QUEST_ID}_stage_0_msg"], "The village is captured."
+        )
+        self.assertEqual(
+            rus[f"{QUEST_ID}_stage_1_msg"],
+            "Этап выполнен: Этап 1.",
+        )
 
     def test_generator_does_not_render_character_desc(self) -> None:
         """Генератор не создаёт ``character_desc_<mod>.xml``."""

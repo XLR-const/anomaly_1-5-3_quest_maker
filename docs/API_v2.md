@@ -566,6 +566,8 @@ class Stage(BaseModel):
     id: int
     title_ru: str = ""
     title_en: str = ""
+    msg_complete_ru: str | None = None
+    msg_complete_en: str | None = None
     descr_ru: str = ""
     descr_en: str = ""
     target_alias: str = ""
@@ -579,6 +581,8 @@ class Stage(BaseModel):
 | `id` | `int` (`ge=0`) | обязательное | Номер этапа. Ключ в `Quest.stages` обязан совпадать. |
 | `title_ru` | `str` | `""` | Русский заголовок этапа. |
 | `title_en` | `str` | `""` | Английский заголовок этапа. |
+| `msg_complete_ru` | `str \| None` | `None` | Текст уведомления КПК при **завершении** этапа. `None` → «Этап выполнен: <title_ru>.». |
+| `msg_complete_en` | `str \| None` | `None` | То же для английского языка; `None` → «Stage completed: <title_en>.». |
 | `descr_ru` | `str` | `""` | Русское описание этапа. |
 | `descr_en` | `str` | `""` | Английское описание этапа. |
 | `target_alias` | `str` | `""` | Цель маркера: имя смарта, числовой server ID или story ID. |
@@ -1371,17 +1375,20 @@ register()
     `<action>`.
   - Второй `<action>` в реплике недопустим: движок его игнорирует.
 
-> **Строки подсказок `_msg_reward`/`_msg_fail`.** Генератор
-> `st_<slug>.xml` **всегда** создаёт строки `<quest_id>_msg_reward` и
-> `<quest_id>_msg_fail`, на которые ссылаются `_reward`/`_cleanup`
-> (`pda_tip`). По умолчанию используются тексты
-> «Задание выполнено: <title_ru>.» / «Task completed: <title_en>.» и
-> «Задание провалено: <title_ru>.» / «Task failed: <title_en>.». Чтобы
-> показать свои формулировки, задайте `Quest.msg_reward_ru/en` и
-> `Quest.msg_fail_ru/en`. `pda_tip` дополнительно проверяет перевод через
-> `game.translate_string` и не выводит строку, если перевода нет, — сырые ID
-> не попадают в левый бар КПК. Отсутствие строки больше не является тихим
-> no-op: она генерируется всегда.
+> **Строки подсказок `_msg_start`, `_msg_reward`, `_msg_fail` и
+> `_stage_<n>_msg`.** Генератор `st_<slug>.xml` **всегда** создаёт:
+> `<quest_id>_msg_start` («Новое задание: <title_ru>.» / «New task:
+> <title_en>.») для `pda_tip` в `<quest_id>_start`;
+> `<quest_id>_msg_reward` и `<quest_id>_msg_fail` для `_reward`/`_cleanup`;
+> `<quest_id>_stage_<n>_msg` — сообщение о **завершении** этапа. Для
+> последнего используется `Stage.msg_complete_ru/en`, а если они не заданы —
+> «Этап выполнен: <title_ru>.» / «Stage completed: <title_en>.». Так игрок
+> видит результат выполненного этапа, а не заголовок следующего. Свои
+> формулировки задаются через `Quest.msg_reward_ru/en`,
+> `Quest.msg_fail_ru/en` и `Stage.msg_complete_ru/en`. `pda_tip`
+> дополнительно проверяет перевод через `game.translate_string` и не выводит
+> строку, если перевода нет, — сырые ID не попадают в левый бар КПК.
+> Отсутствие строки больше не является тихим no-op: она генерируется всегда.
 
 ### Pstor и отряды
 
@@ -2029,6 +2036,9 @@ from src.core.models import (
                                       <quest_id>_turn_in
   строки:                             <quest_id>_title,
                                       <quest_id>_descr,
+                                      <quest_id>_msg_start,
+                                      <quest_id>_msg_reward,
+                                      <quest_id>_msg_fail,
                                       <quest_id>_stage_<n>_title,
                                       <quest_id>_stage_<n>_descr,
                                       <quest_id>_stage_<n>_msg
@@ -2073,7 +2083,8 @@ Lua-скрипт генерируется автоматически.
 
 **Где менять тексты?**
 В моделях: `Quest.title_ru/en`, `Quest.descr_ru/en`,
-`Stage.title_ru/en`, `Stage.descr_ru/en`, `Phrase.text_ru/en`.
+`Stage.title_ru/en`, `Stage.msg_complete_ru/en`, `Stage.descr_ru/en`,
+`Phrase.text_ru/en`.
 Генератор сам создаст `st_<slug>.xml` для `rus` и `eng`.
 
 **Что делать, если сборка вернула `False`?**

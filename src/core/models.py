@@ -590,6 +590,20 @@ class Stage(BaseModel):
     id: int = Field(ge=0, description="Номер этапа (0..N-1).")
     title_ru: str = Field(default="", description="Русский заголовок этапа.")
     title_en: str = Field(default="", description="Английский заголовок этапа.")
+    msg_complete_ru: str | None = Field(
+        default=None,
+        description=(
+            "Текст уведомления КПК при завершении этапа. Если не задан, "
+            "генерируется 'Этап выполнен: <title_ru>.'"
+        ),
+    )
+    msg_complete_en: str | None = Field(
+        default=None,
+        description=(
+            "PDA notification text shown when the stage is completed. "
+            "Defaults to 'Stage completed: <title_en>.'"
+        ),
+    )
     descr_ru: str = Field(default="", description="Русское описание этапа.")
     descr_en: str = Field(default="", description="Английское описание этапа.")
     target_alias: str = Field(

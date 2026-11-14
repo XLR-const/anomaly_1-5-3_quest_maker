@@ -110,6 +110,11 @@ class XmlGenerator:
             add(f"{quest_id}_title", quest.title_ru, quest.title_en)
             add(f"{quest_id}_descr", quest.descr_ru, quest.descr_en)
             add(
+                f"{quest_id}_msg_start",
+                f"Новое задание: {quest.title_ru}.",
+                f"New task: {quest.title_en}.",
+            )
+            add(
                 f"{quest_id}_msg_reward",
                 self._quest_message(
                     quest.msg_reward_ru,
@@ -143,7 +148,13 @@ class XmlGenerator:
                 prefix = f"{quest_id}_stage_{stage_id}"
                 add(f"{prefix}_title", stage.title_ru, stage.title_en)
                 add(f"{prefix}_descr", stage.descr_ru, stage.descr_en)
-                add(f"{prefix}_msg", stage.title_ru, stage.title_en)
+                add(
+                    f"{prefix}_msg",
+                    stage.msg_complete_ru
+                    or f"Этап выполнен: {stage.title_ru}.",
+                    stage.msg_complete_en
+                    or f"Stage completed: {stage.title_en}.",
+                )
 
         for dialog in (project.dialogs or {}).values():
             dialog_id = self._dialog_output_id(dialog)

@@ -420,6 +420,28 @@ class TestQuestValidation(unittest.TestCase):
         self.assertEqual(restored.msg_fail_ru, "Задание провалено.")
         self.assertEqual(restored.msg_fail_en, "Task failed.")
 
+    def test_stage_completion_messages_default_to_none(self) -> None:
+        """``Stage.msg_complete_*`` необязательны и по умолчанию не заданы."""
+        stage = _make_stage(0)
+
+        self.assertIsNone(stage.msg_complete_ru)
+        self.assertIsNone(stage.msg_complete_en)
+
+    def test_stage_completion_messages_survive_json_roundtrip(self) -> None:
+        """Кастомные сообщения этапа сохраняются в JSON."""
+        quest = _make_quest([0])
+        quest.stages[0].msg_complete_ru = "Деревня захвачена."
+        quest.stages[0].msg_complete_en = "The village is captured."
+
+        restored = Quest.model_validate_json(quest.model_dump_json())
+
+        self.assertEqual(
+            restored.stages[0].msg_complete_ru, "Деревня захвачена."
+        )
+        self.assertEqual(
+            restored.stages[0].msg_complete_en, "The village is captured."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Round-trip проекта мода
