@@ -562,7 +562,10 @@ local function take_item(section, count, actor)
 end
 
 -- Gives a task from task_manager exactly once.
-local function give_task(task_id, npc)
+-- The quest giver comes from dialogs.who_is_npc(actor, npc); if the engine
+-- passes a non-NPC speaker, the real (actor, npc) pair is used, and a name
+-- configured in Quest.npc_id is resolved as the final fallback.
+local function give_task(task_id, actor, npc)
 	local tm = task_manager and task_manager.get_task_manager()
 	if not tm then
 		printe("[__SCRIPT_NAME__] ! task_manager is nil")
@@ -570,28 +573,37 @@ local function give_task(task_id, npc)
 	end
 	if tm.task_info[task_id] then return end
 
-	-- Normalize the speaker to an actor-alife object first; dialogs.who_is_npc
-	-- also handles the case when the engine passes a non-NPC object.
-	local speaker = npc
-	if dialogs and dialogs.who_is_npc then
-		local ok, value = pcall(dialogs.who_is_npc, db.actor, npc)
-		if ok and value then speaker = value end
+	local giver = (dialogs and dialogs.who_is_npc and dialogs.who_is_npc(actor, npc)) or nil
+	if not giver then
+		local actor_id = db.actor and db.actor:id()
+		if npc and npc.id and npc:id() ~= actor_id then
+			giver = npc
+		elseif actor and actor.id and actor:id() ~= actor_id then
+			giver = actor
+		end
 	end
 
 	local giver_id = nil
-	if speaker then
-		local ok, value = pcall(function() return speaker:id() end)
-		if ok then giver_id = value end
+	if giver and giver.id then
+		local id = giver:id()
+		if id and id ~= 0 then
+			giver_id = id
+		end
 	end
+
 	if not giver_id then
 		local quest = QUESTS[task_id]
 		if quest and quest.npc ~= "" then
 			giver_id = resolve_target(quest.npc)
+			if not giver_id then
+				local obj = resolve_alife_object(quest.npc)
+				if obj and obj.id and obj.id ~= 0 then
+					giver_id = obj.id
+				end
+			end
 		end
 	end
-	-- 0 is truthy in Lua: passing it makes task_manager treat the actor as
-	-- the giver and breaks the quest marker. Pass nil instead.
-	if giver_id == 0 then giver_id = nil end
+
 	tm:give_task(task_id, giver_id)
 end
 
@@ -673,7 +685,7 @@ local function run_actions(actions, actor, npc, quest_id)
 		elseif kind == "set_target" then
 			spawn_task_squad(spec.smart, spec.squad, spec.smart)
 		elseif kind == "give_task" then
-			give_task(spec.task, npc)
+			give_task(spec.task, actor, npc)
 		elseif kind == "complete_task" then
 			complete_task(spec.task)
 		end
@@ -1232,7 +1244,10 @@ local function {quest_id}_target(task_id, field, p, tsk)
 	if tsk and tsk.task_giver_id and tsk.task_giver_id ~= 0 then
 		return tsk.task_giver_id
 	end
-	return resolve_target(quest.npc)
+	local target_id = resolve_target(quest.npc)
+	if target_id then return target_id end
+	local target_obj = resolve_alife_object(quest.npc)
+	return (target_obj and target_obj.id) or nil
 end"""
 
         descr = f"""\
@@ -1389,7 +1404,7 @@ end"""
         accept = f"""\
 -- Dialog effect: gives the task exactly once.
 local function {quest_id}_accept(actor, npc, p)
-	give_task({q}, npc)
+	give_task({q}, actor, npc)
 end"""
 
         turn_in = f"""\
@@ -1536,7 +1551,7 @@ end"""
 -- Dialog effect: gives the linked task.
 local function {dialog_id}_accept(actor, npc, p)
 	local linked = {linked}
-	if linked ~= "" then give_task(linked, npc) end
+	if linked ~= "" then give_task(linked, actor, npc) end
 end"""
 
         turn_in = f"""\

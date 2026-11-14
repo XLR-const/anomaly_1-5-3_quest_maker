@@ -310,15 +310,18 @@ class TestLuaGeneratorStructure(unittest.TestCase):
         self.assertNotIn("alife():story_object", self.script)
 
     def test_give_task_never_writes_zero_giver_id(self) -> None:
-        """``give_task`` не передаёт ``0``: в Lua он truthy и ломает маркер."""
+        """``give_task`` берёт NPC через ``who_is_npc`` и не передаёт ``0``."""
+        self.assertIn(
+            "local function give_task(task_id, actor, npc)", self.script
+        )
         self.assertNotIn("giver_id = 0", self.script)
         self.assertIn(
-            "if giver_id == 0 then giver_id = nil end", self.script
-        )
-        self.assertIn(
-            "pcall(dialogs.who_is_npc, db.actor, npc)", self.script
+            "dialogs.who_is_npc(actor, npc)", self.script
         )
         self.assertIn("resolve_target(quest.npc)", self.script)
+        self.assertIn("resolve_alife_object(quest.npc)", self.script)
+        self.assertIn("give_task(spec.task, actor, npc)", self.script)
+        self.assertIn("give_task(linked, actor, npc)", self.script)
 
     def test_target_functor_ignores_zero_giver(self) -> None:
         """Этап возврата проверяет ``task_giver_id ~= 0`` перед возвратом."""
@@ -329,7 +332,13 @@ class TestLuaGeneratorStructure(unittest.TestCase):
             "if tsk and tsk.task_giver_id and tsk.task_giver_id ~= 0 then",
             target_block,
         )
-        self.assertIn("return resolve_target(quest.npc)", target_block)
+        self.assertIn("local target_id = resolve_target(quest.npc)", target_block)
+        self.assertIn(
+            "local target_obj = resolve_alife_object(quest.npc)", target_block
+        )
+        self.assertIn(
+            "return (target_obj and target_obj.id) or nil", target_block
+        )
 
 
 class TestLuaGeneratorBehaviour(unittest.TestCase):
