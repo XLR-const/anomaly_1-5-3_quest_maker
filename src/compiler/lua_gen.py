@@ -1348,7 +1348,6 @@ local function {quest_id}_start(actor, npc, p)
 		end
 	end
 	vset(quest.key_prefix .. "_said", 0)
-	vset(quest.key_prefix .. "_dyn_squad_cnt", 0)
 
 	if quest.taken_info ~= "" then
 		db.actor:give_info_portion(quest.taken_info)
@@ -1380,6 +1379,7 @@ local function {quest_id}_reward(actor, npc, p)
 		db.actor:disable_info_portion(info)
 	end
 	unmark_quest_squads(quest)
+	vset(quest.key_prefix .. "_dyn_squad_cnt", 0)
 	sound_task()
 	pda_tip(quest.msg_reward)
 	printf("[__SCRIPT_NAME__] %s reward given", {q})
@@ -1392,6 +1392,7 @@ local function {quest_id}_cleanup(actor, npc, p)
 	if not quest then return end
 
 	unmark_quest_squads(quest)
+	vset(quest.key_prefix .. "_dyn_squad_cnt", 0)
 	run_actions(quest.fail_actions, actor or db.actor, npc, {q})
 	if db.actor and quest.taken_info ~= "" then
 		db.actor:disable_info_portion(quest.taken_info)

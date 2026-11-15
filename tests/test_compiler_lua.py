@@ -855,7 +855,8 @@ class TestDynamicSquadTracking(unittest.TestCase):
                         SpawnSquad(
                             squad_alias="army_sim_squad_advanced",
                             smart_alias="esc_smart",
-                        )
+                        ),
+                        GiveTask(task_id="dyn_quest"),
                     ],
                 )
             },
@@ -908,9 +909,19 @@ class TestDynamicSquadTracking(unittest.TestCase):
             'vset(quest.key_prefix .. "_dyn_squad_" .. tostring(idx), squad.id)',
             script,
         )
+        # Реплика сначала спавнит отряды, затем выдаёт задание через GiveTask.
+        self.assertLess(
+            phrase_action.index('kind = "spawn_squad"'),
+            phrase_action.index('kind = "give_task"'),
+        )
 
-    def test_start_resets_dynamic_counter(self) -> None:
-        """``_start`` обнуляет счётчик динамических отрядов."""
+    def test_dynamic_counter_resets_after_squads_are_unmarked(self) -> None:
+        """Счётчик обнуляется в ``_reward``/``_cleanup``, а не в ``_start``.
+
+        Иначе ``SpawnSquad`` из реплики диалога (до ``GiveTask``) увеличивает
+        счётчик, а ``_start`` тут же затирает его нулём и динамические отряды
+        теряются для ``freeze_dyn_squads`` и ``unmark_quest_squads``.
+        """
         script = LuaGenerator().generate_quests_script(
             self._make_project(),
             script_name="dyn_quests",
@@ -921,10 +932,28 @@ class TestDynamicSquadTracking(unittest.TestCase):
             "local function dyn_quest_start",
             "local function dyn_quest_reward",
         )
-
-        self.assertIn(
-            'vset(quest.key_prefix .. "_dyn_squad_cnt", 0)', start
+        reward = self._block(
+            script,
+            "local function dyn_quest_reward",
+            "local function dyn_quest_cleanup",
         )
+        cleanup = self._block(
+            script,
+            "local function dyn_quest_cleanup",
+            "local function dyn_quest_accept",
+        )
+        reset = 'vset(quest.key_prefix .. "_dyn_squad_cnt", 0)'
+
+        self.assertNotIn(reset, start)
+
+        for effect, block in (("reward", reward), ("cleanup", cleanup)):
+            with self.subTest(effect=effect):
+                self.assertIn("unmark_quest_squads(quest)", block)
+                self.assertIn(reset, block)
+                self.assertLess(
+                    block.index("unmark_quest_squads(quest)"),
+                    block.index(reset),
+                )
 
     def test_status_freezes_and_cleanup_releases_dynamic_squads(self) -> None:
         """``_status`` морозит, а ``unmark_quest_squads`` освобождает отряды."""

@@ -130,8 +130,9 @@ def create_first_quest() -> Quest:
             "cleared: first the Rookie Village, then the Elevator. Operate "
             "together with army assault groups."
         ),
-        is_storyline=True,
+        is_storyline=False,
         prior=60,
+        icon="ui_inGame2_Nochnaya_ohota",
         available_info=ARMY_WARFARE_INFO,
         taken_info=Q1_STARTED,
         complete_info=Q1_DONE,
@@ -349,14 +350,18 @@ def create_second_quest() -> Quest:
             "Bandits have dug in at the ATP. Major Zhurov offers a choice: "
             "an assault with two squads or a solo sabotage for double pay."
         ),
-        is_storyline=True,
-        prior=61,
+        is_storyline=False,
+        prior=60,
+        icon="ui_inGame2_Osobiy_zakaz",
         available_info=ARMY_WARFARE_INFO,
         taken_info=Q2_STARTED,
         complete_info=Q2_DONE,
         # Поршни варианта снимаются в _reward и _cleanup: повторное взятие
         # квеста не тащит старый вариант «штурм/соло».
         cleanup_infos=[Q2_ASSAULT_INFO, Q2_SOLO_INFO],
+        # Трофейный ПДА изымается и при провале/отмене задания, чтобы он не
+        # оставался в инвентаре игрока после закрытия квеста.
+        on_fail_actions=[TakeItem(item_alias=QUEST_ITEM_PDA, count=1)],
         requires_faction="army",
         requires_warfare=True,
         stages={
