@@ -535,12 +535,17 @@ class WarfareCapture(BaseModel):
 2. `register_dyn_squad(quest_id, squad)` увеличивает счётчик
    `<prefix>_<quest_id>_dyn_squad_cnt` и сохраняет `squad.id` в
    `<prefix>_<quest_id>_dyn_squad_<n>` (pstor).
-3. `<quest_id>_start` сбрасывает `..._dyn_squad_cnt = 0` при повторной выдаче.
+3. `<quest_id>_start` **не** сбрасывает `..._dyn_squad_cnt`: отряды могут
+   быть заспавнены в реплике диалога **до** `give_task`, и сброс счётчика в
+   `_start` обнулил бы уже зарегистрированные отряды. Счётчик сбрасывается в
+   `0` в `<quest_id>_reward` и `<quest_id>_cleanup` строго после вызова
+   `unmark_quest_squads`.
 4. `<quest_id>_status` каждый тик вызывает `freeze_dyn_squads(quest)`, который
    морозит все зарегистрированные отряды через `freeze_squad`.
 5. `<quest_id>_reward`/`<quest_id>_cleanup` вызывают `unmark_quest_squads`,
    который освобождает и `capture`-отряды, и все динамические
-   `..._dyn_squad_<n>` из `sim_offline_combat.task_squads`.
+   `..._dyn_squad_<n>` из `sim_offline_combat.task_squads`; сразу после этого
+   `..._dyn_squad_cnt` сбрасывается в `0`.
 
 Поэтому `SpawnSquad` в реплике больше не создаёт «неуправляемый» отряд: он
 попадает в pstor, замораживается на точке и освобождается вместе с квестом.
@@ -779,7 +784,7 @@ class Quest(BaseModel):
 | `reward_item_count` | `int` (`ge=1`) | `1` | Количество предметов награды. |
 | `complete_info` | `str \| None` | `None` | Поршень, выдаваемый в `_reward`. |
 | `taken_info` | `str \| None` | `None` | Поршень, выдаваемый в `_start`. Снимается только в `_cleanup` (провал/отмена); при успешном завершении сохраняется. |
-| `cleanup_infos` | `list[str]` | `[]` | Поршни, снимаемые в конце `_reward` и в `_cleanup`. Предназначены для взаимоисключающих вариантов (`assault`/`solo`) и временных маркеров; `taken_info`/`complete_info` в список включать не нужно. |
+| `cleanup_infos` | `list[str]` | `[]` | Поршни, снимаемые в конце `_reward` и в `_cleanup`. Предназначены для взаимоисключающих вариантов (`assault`/`solo`) и временных маркеров; `taken_info`/`complete_info` в список включать не нужно. Дополнительно генератор **автоматически** добавляет сюда все `GiveInfo` из `Stage.on_start_actions` (кроме `complete_info`/`done_info`), поэтому поршни готовности вида `*_ready` снимаются при провале/отмене квеста и не открывают диалог сдачи при повторном взятии. |
 | `return_to_giver_stage` | `int \| None` | `None` | Этап, на котором игрок должен вернуться к квестодателю. |
 | `return_distance` | `float` (`ge=0`) | `40.0` | Радиус «подошёл к квестодателю» в метрах. |
 | `available_info` | `str \| None` | `None` | Маркер доступности для внешних скриптов/UI. Ядро только сохраняет значение в `QUESTS` и **не проверяет** его в сгенерированном коде. Для встроенного гейта используйте `requires_faction`/`requires_warfare` (см. ниже). |
@@ -1169,9 +1174,13 @@ output/<slug>/
 10. Диалог `role="turnin"`/`"turn_in"` с заданным `task_id` и без ручных
     не-info условий получает
     `<precondition>dialogs.<dialog_id>_can_turn_in</precondition>`. Функция
-    проверяет `tsk.stage >= Quest.return_to_giver_stage` и наличие задачи,
-    поэтому сдача работает после save/load даже без тика `_status`. Поршень
-    `*_ready` из `on_start_actions` для этого не используется.
+    проверяет наличие задачи и стадию: при `return_to_giver_stage >= 0` —
+    `tsk.stage >= Quest.return_to_giver_stage`, а если у диалога нет
+    собственного `HasInfo` и `return_to_giver_stage` не задан —
+    `tsk.stage >= Quest.last_stage`. Поэтому сдача работает после save/load
+    даже без тика `_status`. Поршень `*_ready` из `on_start_actions` для
+    этого не используется и автоматически снимается в `_cleanup` при
+    провале/отмене (см. §2.8).
 11. **Ровно один `<action>` на реплику.** Если действий несколько, все они
     (включая `GiveTask`/`CompleteTask`) исполняются единой функцией
     `dialogs.<dialog_id>_phrase_<n>_action` строго в порядке объявления.
@@ -1361,7 +1370,11 @@ register()
 - `Stage.on_start_actions` — в `<quest_id>_status` ровно один раз за этап
   (ключ `<...>_v_<stage>_started`). `GiveItem` выносится в отдельный список
   `item_actions` и выдаётся идемпотентно на каждом тике, пока предмета в
-  инвентаре меньше `count`.
+  инвентаре меньше `count`. Все `GiveInfo` из `Stage.on_start_actions`
+  автоматически добавляются в `Quest.cleanup_infos` (кроме `complete_info` и
+  `done_info`) и снимаются в `<quest_id>_cleanup` при провале/отмене задачи.
+  Это предотвращает утечку поршней готовности (`*_ready`) и открытие диалога
+  сдачи сразу после повторного взятия квеста.
 - `Phrase.actions`:
   - `GiveInfo` → прямой XML-тег `<give_info>`;
   - одиночный `GiveTask` → XML `<action>dialogs.<dialog_id>_accept</action>`;
@@ -1460,9 +1473,13 @@ stages={
 stage_complete        = 3
 ```
 
-Если финальный этап убрать, `stage_complete` станет `2`, а `_can_turn_in`
-будет считать сдачу доступной на этапе захвата — маркер и проверка стадии
-разъедутся.
+Если финальный этап убрать, `stage_complete` станет `2`, а сдача будет
+держаться на `*_ready` из `on_start_actions`. Это допустимо только при
+обязательной очистке такого поршня: генератор автоматически добавляет все
+`GiveInfo` из `Stage.on_start_actions` в `Quest.cleanup_infos` и снимает их в
+`_cleanup`, а для диалога сдачи без `HasInfo` дополнительно включает проверку
+`tsk.stage >= Quest.last_stage`. В противном случае `_can_turn_in` открыл бы
+сдачу на этапе захвата.
 
 ## 3.6. Кодировка, BOM и переносы строк
 

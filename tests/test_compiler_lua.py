@@ -1164,5 +1164,207 @@ class TestIteration3Mechanics(unittest.TestCase):
         self.assertIn('kind = "has_item"', self.can_take)
 
 
+class TestStageReadyInfoLifecycle(unittest.TestCase):
+    """FAIL-1: очистка этапных ``GiveInfo`` и стадийная сдача."""
+
+    @staticmethod
+    def _block(script: str, start: str, end: str) -> str:
+        """Возвращает фрагмент скрипта между двумя маркерами."""
+        start_index = script.index(start)
+        return script[start_index : script.index(end, start_index)]
+
+    def _make_ready_project(self) -> ModProject:
+        """Квест с поршнем готовности, явным вариантом и ``done_info``."""
+        quest = Quest(
+            id="ready_quest",
+            npc_id="esc_mayor",
+            dialog_id="ready_take",
+            taken_info="ready_started",
+            complete_info="ready_done",
+            done_info="ready_archived",
+            cleanup_infos=["ready_assault", "ready_assault"],
+            stages={
+                0: Stage(
+                    id=0,
+                    on_start_actions=[GiveInfo(info="ready_stage_0")],
+                ),
+                1: Stage(
+                    id=1,
+                    on_start_actions=[
+                        GiveInfo(info="ready_ready"),
+                        GiveInfo(info="ready_done"),
+                        GiveInfo(info="ready_archived"),
+                    ],
+                ),
+            },
+        )
+        dialog = Dialog(
+            id="ready_take",
+            task_id=quest.id,
+            role="take",
+            phrases={
+                0: Phrase(id=0, text_ru="Работа?", text_en="Work?")
+            },
+        )
+        return ModProject(
+            name="Ready",
+            quests={quest.id: quest},
+            dialogs={dialog.id: dialog},
+        )
+
+    def test_stage_give_info_is_collected_into_cleanup_infos(self) -> None:
+        """``GiveInfo`` этапов попадают в ``cleanup_infos`` без дублей."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_ready_project(),
+            script_name="ready_quests",
+            mod_prefix="ready",
+        )
+        quests = self._block(script, "local QUESTS = ", "-- Generic helpers")
+        cleanup_part = self._block(
+            quests, "cleanup_infos = {", "available_info ="
+        )
+
+        for info in (
+            "ready_assault",
+            "ready_stage_0",
+            "ready_ready",
+        ):
+            with self.subTest(info=info):
+                self.assertEqual(
+                    cleanup_part.count(f'"{info}"'),
+                    1,
+                )
+
+        self.assertNotIn('"ready_done"', cleanup_part)
+        self.assertNotIn('"ready_archived"', cleanup_part)
+
+    def test_cleanup_removes_stage_ready_infos(self) -> None:
+        """``_cleanup`` снимает все поршни из ``quest.cleanup_infos``."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_ready_project(),
+            script_name="ready_quests",
+            mod_prefix="ready",
+        )
+        cleanup = self._block(
+            script,
+            "local function ready_quest_cleanup",
+            "local function ready_quest_accept",
+        )
+        loop = (
+            "for _, info in ipairs(quest.cleanup_infos or {}) do\n"
+            "\t\tdb.actor:disable_info_portion(info)\n"
+            "\tend"
+        )
+
+        self.assertIn(loop, cleanup)
+
+    def _make_turnin_project(
+        self,
+        *,
+        with_has_info: bool,
+        return_stage: int | None = None,
+    ) -> ModProject:
+        """Квест с 2 этапами и диалогом сдачи (с ``HasInfo`` и без)."""
+        quest = Quest(
+            id="gate_quest",
+            npc_id="esc_mayor",
+            dialog_id="gate_take",
+            return_to_giver_stage=return_stage,
+            stages={
+                0: Stage(id=0, target_alias="esc_smart"),
+                1: Stage(id=1, target_alias="esc_smart"),
+            },
+        )
+        preconditions = (
+            [HasInfo(info="gate_mid_ready")] if with_has_info else []
+        )
+        turnin = Dialog(
+            id="gate_turnin",
+            task_id=quest.id,
+            role="turnin",
+            preconditions=preconditions,
+            phrases={
+                0: Phrase(id=0, text_ru="Сдать", text_en="Turn in")
+            },
+        )
+        take = Dialog(
+            id="gate_take",
+            task_id=quest.id,
+            role="take",
+            phrases={
+                0: Phrase(id=0, text_ru="Взять", text_en="Take")
+            },
+        )
+        return ModProject(
+            name="Gate",
+            quests={quest.id: quest},
+            dialogs={take.id: take, turnin.id: turnin},
+        )
+
+    def test_turn_in_without_has_info_requires_last_stage(self) -> None:
+        """Безусловная сдача блокируется до последнего этапа."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_turnin_project(with_has_info=False),
+            script_name="gate_quests",
+            mod_prefix="gate",
+        )
+        can_turn_in = self._block(
+            script,
+            "local function gate_turnin_can_turn_in",
+            "local function gate_turnin_accept",
+        )
+
+        self.assertIn("last_stage = 1", script)
+        self.assertIn(
+            "if quest.return_stage < 0 and "
+            "(tsk.stage or 0) < (quest.last_stage or 0) then",
+            can_turn_in,
+        )
+        self.assertLess(
+            can_turn_in.index("(quest.last_stage or 0)"),
+            can_turn_in.rindex("return true"),
+        )
+
+    def test_turn_in_with_has_info_is_not_blocked_by_last_stage(self) -> None:
+        """Промежуточный диалог сдачи с ``HasInfo`` работает штатно."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_turnin_project(with_has_info=True),
+            script_name="gate_quests",
+            mod_prefix="gate",
+        )
+        can_turn_in = self._block(
+            script,
+            "local function gate_turnin_can_turn_in",
+            "local function gate_turnin_accept",
+        )
+
+        self.assertNotIn("quest.last_stage", can_turn_in)
+        self.assertIn("return true", can_turn_in)
+
+    def test_turn_in_checks_explicit_return_stage(self) -> None:
+        """При заданном ``return_stage`` проверяется именно он."""
+        script = LuaGenerator().generate_quests_script(
+            self._make_turnin_project(with_has_info=False, return_stage=1),
+            script_name="gate_quests",
+            mod_prefix="gate",
+        )
+        can_turn_in = self._block(
+            script,
+            "local function gate_turnin_can_turn_in",
+            "local function gate_turnin_accept",
+        )
+
+        self.assertIn(
+            "if quest.return_stage >= 0 and "
+            "(tsk.stage or 0) < quest.return_stage then",
+            can_turn_in,
+        )
+        self.assertIn(
+            "if quest.return_stage < 0 and "
+            "(tsk.stage or 0) < (quest.last_stage or 0) then",
+            can_turn_in,
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

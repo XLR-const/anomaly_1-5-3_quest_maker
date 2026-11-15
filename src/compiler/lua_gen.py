@@ -1096,6 +1096,29 @@ class LuaGenerator:
                 ],
             }
 
+        # Автоматическая очистка этапных GiveInfo. Поршни, выданные на старте
+        # этапа (например, "*_ready" для диалога сдачи), обязаны сниматься
+        # при провале/отмене квеста, иначе после повторного взятия они
+        # открывают диалог сдачи до фактического прохождения этапов.
+        cleanup_infos: list[str] = []
+        for info in getattr(quest, "cleanup_infos", []) or []:
+            if info and info not in cleanup_infos:
+                cleanup_infos.append(info)
+        complete_info = quest.complete_info or ""
+        done_info = quest.done_info or ""
+        for stage in quest.stages.values():
+            for action in stage.on_start_actions:
+                if not isinstance(action, GiveInfo):
+                    continue
+                info = action.info or ""
+                if (
+                    info
+                    and info != complete_info
+                    and info != done_info
+                    and info not in cleanup_infos
+                ):
+                    cleanup_infos.append(info)
+
         return {
             "id": quest_id,
             "key_prefix": f"{mod_prefix}_{quest_id}",
@@ -1110,7 +1133,7 @@ class LuaGenerator:
             "msg_start": f"{quest_id}_msg_start",
             "taken_info": quest.taken_info or "",
             "complete_info": quest.complete_info or "",
-            "cleanup_infos": list(getattr(quest, "cleanup_infos", []) or []),
+            "cleanup_infos": cleanup_infos,
             "available_info": quest.available_info or "",
             "done_info": quest.done_info or "",
             "requires_faction": quest.requires_faction or "",
@@ -1506,6 +1529,30 @@ end"""
             "true" if linked_data.get("requires_warfare") else "false"
         )
 
+        # Стадийная защита сдачи. Если известен этап возврата — требуем его.
+        # Для диалога сдачи без собственного HasInfo (он не привязан к
+        # поршню промежуточного этапа) дополнительно требуем последний этап:
+        # безусловная сдача не должна открываться на нулевом этапе.
+        # Многоэтапные квесты с промежуточными HasInfo-диалогами сдачи
+        # сохраняют штатное поведение.
+        has_info_precondition = any(
+            isinstance(condition, HasInfo)
+            for condition in dialog.preconditions
+        )
+        stage_guards = (
+            "\tif quest.return_stage >= 0 and "
+            "(tsk.stage or 0) < quest.return_stage then\n"
+            "\t\treturn false\n"
+            "\tend\n"
+        )
+        if not has_info_precondition:
+            stage_guards += (
+                "\tif quest.return_stage < 0 and "
+                "(tsk.stage or 0) < (quest.last_stage or 0) then\n"
+                "\t\treturn false\n"
+                "\tend\n"
+            )
+
         can_take = f"""\
 -- Dialog availability: all dialog-level conditions plus "task not given".
 -- A completed quest stays closed even after task_manager drops its task.
@@ -1544,10 +1591,7 @@ local function {dialog_id}_can_turn_in(actor, npc, p)
 	local tm = task_manager and task_manager.get_task_manager()
 	local tsk = tm and tm.task_info[linked]
 	if not tsk then return false end
-	if quest.return_stage >= 0 and (tsk.stage or 0) < quest.return_stage then
-		return false
-	end
-	return true
+{stage_guards}	return true
 end"""
 
         accept = f"""\
