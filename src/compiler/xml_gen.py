@@ -155,6 +155,14 @@ class XmlGenerator:
                     stage.msg_complete_en
                     or f"Stage completed: {stage.title_en}.",
                 )
+                for variant_index, variant in enumerate(
+                    stage.descr_variants, start=1
+                ):
+                    add(
+                        f"{prefix}_descr_v{variant_index}",
+                        variant.text_ru,
+                        variant.text_en,
+                    )
 
         for dialog in (project.dialogs or {}).values():
             dialog_id = self._dialog_output_id(dialog)

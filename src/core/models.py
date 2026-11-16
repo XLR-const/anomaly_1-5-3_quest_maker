@@ -193,6 +193,58 @@ Condition: TypeAlias = Annotated[
 
 
 # ---------------------------------------------------------------------------
+# Варианты цели и описания этапа (Story-режим)
+# ---------------------------------------------------------------------------
+
+
+class TargetVariant(BaseModel):
+    """Вариант цели этапа, выбираемый по условиям.
+
+    Варианты проверяются по порядку объявления; побеждает первый, у
+    которого все условия :attr:`when` истинны. Если ни один не подошёл,
+    используется базовый ``Stage.target_alias``.
+
+    Attributes:
+        when (list[Condition]): Непустой список условий выбора варианта.
+        value (str): Непустой алиас цели (смарт/NPC/предмет).
+    """
+
+    model_config = _MODEL_CONFIG
+
+    when: list[Condition] = Field(
+        min_length=1,
+        description="Условия, при которых выбирается этот вариант цели.",
+    )
+    value: str = Field(
+        min_length=1,
+        description="Алиас цели для маркера (смарт/NPC/предмет).",
+    )
+
+
+class DescrVariant(BaseModel):
+    """Вариант текста описания этапа, выбираемый по условиям.
+
+    Варианты проверяются по порядку объявления; побеждает первый, у
+    которого все условия :attr:`when` истинны. Если ни один не подошёл,
+    используется базовое ``Stage.descr_*``.
+
+    Attributes:
+        when (list[Condition]): Непустой список условий выбора варианта.
+        text_ru (str): Русский текст описания.
+        text_en (str): Английский текст описания.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    when: list[Condition] = Field(
+        min_length=1,
+        description="Условия, при которых выбирается этот вариант описания.",
+    )
+    text_ru: str = Field(default="", description="Русский текст описания.")
+    text_en: str = Field(default="", description="Английский текст описания.")
+
+
+# ---------------------------------------------------------------------------
 # Действия
 # ---------------------------------------------------------------------------
 
@@ -227,13 +279,35 @@ class RemoveInfo(BaseAction):
 class SpawnSquad(BaseAction):
     """Заспавнить отряд на смарт-террейне.
 
-    В Lua использует ``SIMBOARD:create_squad`` и ``sim_squad_warfare.set_target``
-    с последующей заморозкой через ``stay_time`` (``standart_of_auto.md``, 2.2).
+    В режиме ``warfare`` (по умолчанию) Lua использует
+    ``SIMBOARD:create_squad`` и ``sim_squad_warfare.set_target`` с
+    последующей заморозкой через ``stay_time`` (``standart_of_auto.md``, 2.2).
+    В режиме ``story`` отряд создаётся без ``set_target``/``stay_time`` и
+    живёт по правилам ванильного Story-отряда.
     """
 
     type: Literal["spawn_squad"] = Field(default="spawn_squad")
     squad_alias: str = Field(description="Секция шаблона отряда.")
     smart_alias: str = Field(description="Алиас смарт-террейна.")
+    mode: Literal["warfare", "story"] = Field(
+        default="warfare",
+        description=(
+            "Режим спавна: 'warfare' — через sim_squad_warfare, 'story' — "
+            "без set_target и stay_time, как ванильный Story-отряд."
+        ),
+    )
+
+
+class RemoveSquad(BaseAction):
+    """Удалить Story-отряд из мира.
+
+    В Lua использует ``get_story_squad(alias)`` и
+    ``SIMBOARD:remove_squad(squad)``. Если отряд уже мёртв и
+    ``get_story_squad`` вернул ``nil``, действие не падает (no-op).
+    """
+
+    type: Literal["remove_squad"] = Field(default="remove_squad")
+    squad_alias: str = Field(description="Story-ID/алиас удаляемого отряда.")
 
 
 class SetTarget(BaseAction):
@@ -328,6 +402,7 @@ Action: TypeAlias = Annotated[
         GiveInfo,
         RemoveInfo,
         SpawnSquad,
+        RemoveSquad,
         SetTarget,
         GiveItem,
         RemoveItem,
@@ -606,9 +681,23 @@ class Stage(BaseModel):
     )
     descr_ru: str = Field(default="", description="Русское описание этапа.")
     descr_en: str = Field(default="", description="Английское описание этапа.")
+    descr_variants: list[DescrVariant] = Field(
+        default_factory=list,
+        description=(
+            "Условные варианты описания этапа. При пустом списке новые "
+            "ключи XML не генерируются."
+        ),
+    )
     target_alias: str = Field(
         default="",
         description="Алиас смарта/NPC/предмета для маркера цели.",
+    )
+    target_variants: list[TargetVariant] = Field(
+        default_factory=list,
+        description=(
+            "Условные варианты цели этапа. Проверяются по порядку; при "
+            "отсутствии совпадений используется target_alias."
+        ),
     )
     target_squad_id: str | None = Field(
         default=None,
@@ -628,6 +717,29 @@ class Stage(BaseModel):
             "Если задано — Lua-генератор создаст логику захвата смарта: "
             "спавн, заморозку и проверку зачистки."
         ),
+    )
+
+
+class QuestCondlist(BaseModel):
+    """Дополнительный quest-level condlist LTX (завершает весь квест).
+
+    Условия сериализуются в строку ``condlist_N`` файла ``tm_<mod>.ltx``.
+    Поддерживаются ``HasInfo``, ``DontHasInfo`` и ``HasItem``; остальные
+    типы условий в Фазе 2 не представимы в LTX и дают ``BuildError``.
+
+    Attributes:
+        when (list[Condition]): Непустой список условий condlist.
+        result (Literal["complete", "fail"]): Итог при истинности условий.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    when: list[Condition] = Field(
+        min_length=1,
+        description="Условия, при истинности которых квест завершается.",
+    )
+    result: Literal["complete", "fail"] = Field(
+        description="Результат срабатывания condlist: complete или fail.",
     )
 
 
@@ -723,6 +835,20 @@ class Quest(BaseModel):
         description=(
             "Правила перехода этапов: {stage: {'complete': [...], "
             "'fail': [...]}}. Транслируются в status_functor."
+        ),
+    )
+    fail_on_giver_death: bool = Field(
+        default=True,
+        description=(
+            "Если True и задан квестодатель — в LTX добавляется "
+            "condlist_0 = {!task_giver_alive(<quest>)} fail."
+        ),
+    )
+    extra_condlists: list[QuestCondlist] = Field(
+        default_factory=list,
+        description=(
+            "Дополнительные quest-level condlist после авто-провала. "
+            "Нумерация начинается с 1, если авто-провал включён."
         ),
     )
 
@@ -867,19 +993,98 @@ class CustomSquad(BaseModel):
         description="Фракция отряда, например 'bandit' или 'army'."
     )
     npc: list[str] = Field(
-        min_length=1,
+        default_factory=list,
         description=(
-            "Непустой список секций NPC, например ['sim_default_bandit_4']."
+            "Список секций NPC, например ['sim_default_bandit_4']. "
+            "Может быть пустым, если задан npc_random."
+        ),
+    )
+    npc_random: list[str] = Field(
+        default_factory=list,
+        description="Список секций NPC для случайного выбора движком.",
+    )
+    npc_in_squad: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Количество NPC в отряде: одно значение (min) или два "
+            "(min, max), 0 <= min <= max."
         ),
     )
     target_smart: str | None = Field(
         default=None,
         description="Опциональный target_smart секции отряда.",
     )
+    relationship: Literal["neutral", "friend", "enemy"] | None = Field(
+        default=None,
+        description="Опциональное отношение отряда к актору.",
+    )
+    idle_time: float | None = Field(
+        default=None,
+        ge=0,
+        description="Опциональное время ожидания отряда на точке.",
+    )
+    spawn_point: str | None = Field(
+        default=None,
+        description="Опциональная точка спавна отряда.",
+    )
     story_id: str | None = Field(
         default=None,
         description="Опциональный story_id секции отряда.",
     )
+    death_infos: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Инфопоршни, выдаваемые в on_death отряда. Сериализуются как "
+            "on_death = %+info_a +info_b%."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_roster(self) -> Self:
+        """Проверяет состав отряда и диапазон ``npc_in_squad``.
+
+        Returns:
+            Self: Валидная модель отряда.
+
+        Raises:
+            ValueError: Если не задан ни ``npc``, ни ``npc_random``, либо
+                ``npc_in_squad`` содержит больше двух/отрицательные значения
+                или ``min > max``.
+        """
+        npc_values = [
+            str(value).strip()
+            for value in self.npc
+            if str(value).strip()
+        ]
+        random_values = [
+            str(value).strip()
+            for value in self.npc_random
+            if str(value).strip()
+        ]
+        if not npc_values and not random_values:
+            raise ValueError(
+                f"Отряд '{self.id}': должен быть задан хотя бы один из "
+                "списков npc или npc_random."
+            )
+        if len(self.npc_in_squad) > 2:
+            raise ValueError(
+                f"Отряд '{self.id}': npc_in_squad принимает 0, 1 или 2 "
+                f"значения, получено {len(self.npc_in_squad)}."
+            )
+        if any(value < 0 for value in self.npc_in_squad):
+            raise ValueError(
+                f"Отряд '{self.id}': значения npc_in_squad не могут быть "
+                "отрицательными."
+            )
+        if (
+            len(self.npc_in_squad) == 2
+            and self.npc_in_squad[0] > self.npc_in_squad[1]
+        ):
+            raise ValueError(
+                f"Отряд '{self.id}': в npc_in_squad min={self.npc_in_squad[0]} "
+                f"больше max={self.npc_in_squad[1]}."
+            )
+        return self
 
 
 class ModProject(BaseModel):
@@ -1087,6 +1292,7 @@ __all__ = [
     "CompleteTask",
     "Condition",
     "CustomSquad",
+    "DescrVariant",
     "Dialog",
     "DontHasInfo",
     "find_phrase_reward_conflicts",
@@ -1101,12 +1307,15 @@ __all__ = [
     "Phrase",
     "phrase_action_mode",
     "Quest",
+    "QuestCondlist",
     "RemoveInfo",
     "RemoveItem",
+    "RemoveSquad",
     "RequiredId",
     "SetTarget",
     "SmartOwner",
     "SpawnSquad",
     "Stage",
+    "TargetVariant",
     "WarfareCapture",
 ]

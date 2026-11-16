@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from src.core.models import DontHasInfo, HasInfo, HasItem
 from src.logger import get_logger
 
 if TYPE_CHECKING:
@@ -68,12 +69,19 @@ class LtxGenerator:
             logger.error("Некорректный тип карты квестов: %s", error)
             raise error
 
+        # Ленивый импорт разрывает цикл builder -> ltx_gen -> builder.
+        from src.compiler.builder import BuildError
+
         sections: list[str] = []
         skipped = 0
 
         for quest_id, quest in quests.items():
             try:
                 section = self._build_quest_section(quest_id, quest)
+            except BuildError:
+                # Ошибка данных, которую нельзя молча пропустить: неподдерживаемое
+                # условие condlist делает LTX заведомо неполным.
+                raise
             except Exception as exc:  # noqa: BLE001 - изоляция одного квеста
                 skipped += 1
                 logger.error(
@@ -112,8 +120,12 @@ class LtxGenerator:
         нужно.
 
         Каждая модель превращается в секцию
-        ``[<squad_id>]:online_offline_group`` с обязательными полями
-        ``faction``/``npc`` и необязательными ``target_smart``/``story_id``.
+        ``[<squad_id>]:online_offline_group`` с обязательным ``faction`` и
+        хотя бы одним из ``npc``/``npc_random``. Новые поля эмитируются в
+        фиксированном порядке и пропускаются, если не заданы:
+        ``relationship``, ``npc``, ``npc_random``, ``npc_in_squad``,
+        ``target_smart``, ``idle_time``, ``spawn_point``, ``story_id``,
+        ``on_death``.
 
         Args:
             squads (dict[str, CustomSquad]):
@@ -145,14 +157,14 @@ class LtxGenerator:
                 continue
 
             faction = str(getattr(squad, "faction", "") or "").strip()
-            npc_values = [
-                str(value).strip()
-                for value in (getattr(squad, "npc", None) or [])
-                if str(value).strip()
-            ]
-            if not faction or not npc_values:
+            npc_values = self._clean_values(getattr(squad, "npc", None))
+            npc_random_values = self._clean_values(
+                getattr(squad, "npc_random", None)
+            )
+            if not faction or (not npc_values and not npc_random_values):
                 logger.warning(
-                    "Кастомный отряд '%s' пропущен: faction/npc не заданы.",
+                    "Кастомный отряд '%s' пропущен: faction/npc/npc_random "
+                    "не заданы.",
                     squad_id,
                 )
                 continue
@@ -160,20 +172,67 @@ class LtxGenerator:
             lines = [
                 f"[{squad_id.strip()}]:online_offline_group",
                 f"faction = {faction}",
-                f"npc     = {', '.join(npc_values)}",
             ]
+            # Порядок новых полей фиксирован; пустые поля не эмитируются.
+            relationship = getattr(squad, "relationship", None)
+            if isinstance(relationship, str) and relationship.strip():
+                lines.append(f"relationship = {relationship.strip()}")
+            if npc_values:
+                lines.append(f"npc     = {', '.join(npc_values)}")
+            if npc_random_values:
+                lines.append(f"npc_random = {', '.join(npc_random_values)}")
+            npc_in_squad = [
+                int(value)
+                for value in (getattr(squad, "npc_in_squad", None) or [])
+            ]
+            if npc_in_squad:
+                lines.append(
+                    "npc_in_squad = "
+                    + ", ".join(str(value) for value in npc_in_squad)
+                )
             target_smart = getattr(squad, "target_smart", None)
             if isinstance(target_smart, str) and target_smart.strip():
                 lines.append(f"target_smart = {target_smart.strip()}")
+            idle_time = getattr(squad, "idle_time", None)
+            if idle_time is not None:
+                lines.append(f"idle_time = {float(idle_time):g}")
+            spawn_point = getattr(squad, "spawn_point", None)
+            if isinstance(spawn_point, str) and spawn_point.strip():
+                lines.append(f"spawn_point = {spawn_point.strip()}")
             story_id = getattr(squad, "story_id", None)
             if isinstance(story_id, str) and story_id.strip():
                 lines.append(f"story_id = {story_id.strip()}")
+            death_infos = self._clean_values(
+                getattr(squad, "death_infos", None)
+            )
+            if death_infos:
+                on_death = " ".join(f"+{info}" for info in death_infos)
+                lines.append(f"on_death = %{on_death}%")
             sections.append("\n".join(lines))
 
         if not sections:
             return ""
         logger.info("Сформирован squad_descr_<slug>.ltx: секций=%d.", len(sections))
         return "\n\n".join(sections) + "\n"
+
+    @staticmethod
+    def _clean_values(values: object) -> list[str]:
+        """Очищает список строковых значений от пустых элементов.
+
+        Args:
+            values (object): Сырой список из модели (может быть ``None``).
+
+        Returns:
+            list[str]: Непустые строки без ведущих/завершающих пробелов.
+        """
+        if not isinstance(values, (list, tuple)):
+            return []
+        cleaned: list[str] = []
+        for value in values:
+            text = str(value).strip()
+            if text:
+                cleaned.append(text)
+        return cleaned
 
     def _build_quest_section(self, quest_id: str, quest: "Quest") -> str:
         """Собирает одну секцию ``[<quest_id>]``.
@@ -224,14 +283,37 @@ class LtxGenerator:
             f"on_cancel             = %={quest_id}_cleanup()%",
         ]
 
-        if isinstance(giver_npc_id, str) and giver_npc_id.strip():
-            lines.extend(
-                [
-                    "",
-                    f"condlist_0            = "
-                    f"{{!task_giver_alive({quest_id})}} fail",
-                ]
+        condlists: list[str] = []
+        fail_on_giver_death = bool(
+            getattr(quest, "fail_on_giver_death", True)
+        )
+        if (
+            isinstance(giver_npc_id, str)
+            and giver_npc_id.strip()
+            and fail_on_giver_death
+        ):
+            # Сохраняем исторический формат строки байт-в-байт.
+            condlists.append(
+                f"condlist_0            = "
+                f"{{!task_giver_alive({quest_id})}} fail"
             )
+
+        start_index = len(condlists)
+        extra_condlists = getattr(quest, "extra_condlists", None) or []
+        for offset, condlist in enumerate(extra_condlists):
+            index = start_index + offset
+            conditions = " ".join(
+                self._serialize_condlist_condition(condition, quest_id)
+                for condition in condlist.when
+            )
+            key = f"condlist_{index}"
+            condlists.append(
+                f"{key:<21} = {{{conditions}}} {condlist.result}"
+            )
+
+        if condlists:
+            lines.append("")
+            lines.extend(condlists)
 
         logger.debug(
             "Секция '%s' сформирована: строк=%d, storyline=%s, этапов=%d.",
@@ -241,6 +323,48 @@ class LtxGenerator:
             stage_complete,
         )
         return "\n".join(lines)
+
+    def _serialize_condlist_condition(
+        self,
+        condition: object,
+        quest_id: str,
+    ) -> str:
+        """Сериализует условие ``QuestCondlist`` в синтаксис LTX condlist.
+
+        Поддерживаются только условия, представимые в строке condlist:
+        ``HasInfo`` (``+info``), ``DontHasInfo`` (``-info``) и ``HasItem``
+        (``=actor_has_item(...)`` / ``=actor_has_item_amount(...)``).
+
+        Args:
+            condition (object): Условие из ``QuestCondlist.when``.
+            quest_id (str): ID квеста для текста ошибки.
+
+        Returns:
+            str: Фрагмент условия без фигурных скобок.
+
+        Raises:
+            BuildError: Если тип условия не поддерживается в LTX condlist.
+        """
+        from src.compiler.builder import BuildError
+
+        if isinstance(condition, HasInfo):
+            return f"+{condition.info}"
+        if isinstance(condition, DontHasInfo):
+            return f"-{condition.info}"
+        if isinstance(condition, HasItem):
+            count = int(getattr(condition, "count", 1))
+            if count > 1:
+                return (
+                    f"=actor_has_item_amount("
+                    f"{condition.item_alias}:{count})"
+                )
+            return f"=actor_has_item({condition.item_alias})"
+        raise BuildError(
+            f"Квест '{quest_id}': условие {type(condition).__name__} не "
+            "поддерживается в extra_condlists (LTX condlist). Допустимы "
+            "только HasInfo, DontHasInfo и HasItem; для HasMoney/SmartOwner "
+            "используйте transfer_conditions."
+        )
 
     def _validate_quest(self, quest_id: object, quest: object) -> None:
         """Проверяет данные квеста перед сериализацией в LTX.

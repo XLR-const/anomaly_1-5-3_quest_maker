@@ -17,7 +17,13 @@ from typing import TYPE_CHECKING
 
 from src.core.actions import validate_action_assets
 from src.core.conditions import validate_condition_assets
-from src.core.models import BaseAction, BaseCondition, ModProject
+from src.core.models import (
+    BaseAction,
+    BaseCondition,
+    ModProject,
+    RemoveSquad,
+    SpawnSquad,
+)
 from src.logger import get_logger
 
 if TYPE_CHECKING:
@@ -154,6 +160,11 @@ class ProjectValidator:
                 ):
                     is_valid = False
 
+        if not self._validate_story_squad_data(project):
+            is_valid = False
+        if not self._validate_mixed_quests(project):
+            is_valid = False
+
         # TODO: Реализовать поиск логических ошибок в сюжете:
         # 1) Проверка на сиротские инфопоршни (квест или фраза требуют
         #    `has_info`, но этот поршень физически никогда не выдается ни в
@@ -167,6 +178,218 @@ class ProjectValidator:
             project.name,
             "успешно" if is_valid else "найдены ошибки",
         )
+        return is_valid
+
+    @staticmethod
+    def _iter_actions_with_owner(
+        project: ModProject,
+    ) -> Iterable[tuple[str, BaseAction]]:
+        """Перебирает все действия проекта вместе с контекстом.
+
+        Args:
+            project (ModProject): Проект мода.
+
+        Yields:
+            tuple[str, BaseAction]: Человекочитаемый владелец и действие.
+        """
+        for quest in (project.quests or {}).values():
+            for field_name in (
+                "on_init_actions",
+                "on_complete_actions",
+                "on_fail_actions",
+            ):
+                for action in getattr(quest, field_name, []) or []:
+                    yield f"квест '{quest.id}' ({field_name})", action
+            for stage in (quest.stages or {}).values():
+                for action in stage.on_start_actions or []:
+                    yield (
+                        f"квест '{quest.id}', этап {stage.id} "
+                        "(on_start_actions)",
+                        action,
+                    )
+        for dialog in (project.dialogs or {}).values():
+            for phrase in (dialog.phrases or {}).values():
+                for action in phrase.actions or []:
+                    yield (
+                        f"диалог '{dialog.id}', фраза {phrase.id} (actions)",
+                        action,
+                    )
+
+    def _squad_alias_exists(
+        self,
+        project: ModProject,
+        alias: str,
+    ) -> bool:
+        """Проверяет, что алиас отряда существует в проекте или в БД.
+
+        Args:
+            project (ModProject): Проект мода.
+            alias (str): Секция/Story-ID отряда.
+
+        Returns:
+            bool: ``True``, если отряд найден в ``project.squads`` или в
+            SQLite-базе через ``find_squad_by_alias``.
+        """
+        normalized = str(alias or "").strip()
+        if not normalized:
+            return False
+        for squad_key, squad in (project.squads or {}).items():
+            if str(squad_key).strip() == normalized:
+                return True
+            story_id = getattr(squad, "story_id", None)
+            if isinstance(story_id, str) and story_id.strip() == normalized:
+                return True
+
+        finder = getattr(self.db_client, "find_squad_by_alias", None)
+        if callable(finder):
+            try:
+                return finder(normalized) is not None
+            except Exception as exc:  # noqa: BLE001 - БД может быть недоступна
+                logger.warning(
+                    "Не удалось проверить отряд '%s' по БД: %s",
+                    normalized,
+                    exc,
+                )
+        return False
+
+    def _validate_story_squad_data(self, project: ModProject) -> bool:
+        """Проверяет Story-отряды и ссылки на них.
+
+        Проверки:
+
+        * ``CustomSquad.story_id`` уникален в проекте;
+        * ``CustomSquad.death_infos`` не содержит пустых строк;
+        * ``SpawnSquad(mode="story").squad_alias`` и ``RemoveSquad.squad_alias``
+          ссылаются на существующий отряд проекта или ванильной БД.
+
+        Args:
+            project (ModProject): Проект мода.
+
+        Returns:
+            bool: ``True``, если нарушений нет.
+        """
+        is_valid = True
+        seen_story_ids: dict[str, str] = {}
+
+        for squad_key, squad in (project.squads or {}).items():
+            story_id = getattr(squad, "story_id", None)
+            normalized_story_id = (
+                story_id.strip() if isinstance(story_id, str) else ""
+            )
+            if normalized_story_id:
+                previous = seen_story_ids.get(normalized_story_id)
+                if previous is not None:
+                    logger.error(
+                        "Story-ID отряда '%s' дублируется: '%s' и '%s'.",
+                        normalized_story_id,
+                        previous,
+                        squad_key,
+                    )
+                    is_valid = False
+                else:
+                    seen_story_ids[normalized_story_id] = str(squad_key)
+
+            for index, death_info in enumerate(
+                getattr(squad, "death_infos", None) or []
+            ):
+                if (
+                    not isinstance(death_info, str)
+                    or not death_info.strip()
+                ):
+                    logger.error(
+                        "Отряд '%s': death_infos[%d] пуст или не является "
+                        "строкой.",
+                        squad_key,
+                        index,
+                    )
+                    is_valid = False
+
+        for owner, action in self._iter_actions_with_owner(project):
+            if isinstance(action, SpawnSquad):
+                if getattr(action, "mode", "warfare") != "story":
+                    continue
+                if not self._squad_alias_exists(
+                    project, action.squad_alias
+                ):
+                    logger.error(
+                        "Действие SpawnSquad(mode='story') в %s ссылается на "
+                        "отсутствующий отряд '%s'.",
+                        owner,
+                        action.squad_alias,
+                    )
+                    is_valid = False
+            elif isinstance(action, RemoveSquad):
+                if not self._squad_alias_exists(
+                    project, action.squad_alias
+                ):
+                    logger.error(
+                        "Действие RemoveSquad в %s ссылается на "
+                        "отсутствующий отряд '%s'.",
+                        owner,
+                        action.squad_alias,
+                    )
+                    is_valid = False
+
+        return is_valid
+
+    def _validate_mixed_quests(self, project: ModProject) -> bool:
+        """Запрещает смешивать Warfare-захват и Story-спавн в одном квесте.
+
+        Фаза 2 не поддерживает квесты, где одновременно есть
+        ``Stage.warfare_capture`` и ``SpawnSquad(mode="story")``: world-гейт
+        Warfare делает такой квест недоступным в freeplay.
+
+        Args:
+            project (ModProject): Проект мода.
+
+        Returns:
+            bool: ``True``, если смешанных квестов нет.
+        """
+        is_valid = True
+        for quest in (project.quests or {}).values():
+            has_capture = any(
+                stage.warfare_capture is not None
+                for stage in (quest.stages or {}).values()
+            )
+            if not has_capture:
+                continue
+
+            actions: list[BaseAction] = []
+            for field_name in (
+                "on_init_actions",
+                "on_complete_actions",
+                "on_fail_actions",
+            ):
+                actions.extend(getattr(quest, field_name, []) or [])
+            for stage in (quest.stages or {}).values():
+                actions.extend(stage.on_start_actions or [])
+
+            related_dialogs = set(quest.dialog_ids or [])
+            if quest.dialog_id:
+                related_dialogs.add(quest.dialog_id)
+            for dialog in (project.dialogs or {}).values():
+                dialog_id = getattr(dialog, "dialog_id", None) or dialog.id
+                if (
+                    getattr(dialog, "task_id", None) == quest.id
+                    or dialog_id in related_dialogs
+                ):
+                    for phrase in (dialog.phrases or {}).values():
+                        actions.extend(phrase.actions or [])
+
+            story_spawns = [
+                action
+                for action in actions
+                if isinstance(action, SpawnSquad)
+                and getattr(action, "mode", "warfare") == "story"
+            ]
+            if story_spawns:
+                logger.error(
+                    "Квест '%s' смешивает warfare_capture и "
+                    "SpawnSquad(mode='story'); разделите его на два квеста.",
+                    quest.id,
+                )
+                is_valid = False
+
         return is_valid
 
     def _validate_conditions(
