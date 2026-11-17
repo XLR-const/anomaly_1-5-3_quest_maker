@@ -6,8 +6,32 @@
 
 Этот файл описывает **весь публичный контракт** конструктора квестов: модели данных,
 правила генерации игровых файлов, ограничения рантайма X-Ray и эталонный шаблон
-сложного сюжета. Прочитав только `API.md`, можно писать новые Python-скрипты квестов
+сложного сюжета. Прочитав только `API_v2.md`, можно писать новые Python-скрипты квестов
 без изучения исходников ядра.
+
+## Единая архитектура и режимы применения
+
+`docs/API_v2.md` — **единственное руководство** по декларативному конструктору
+квестов Anomaly 1.5.3. Отдельного второго руководства «для Warfare» нет:
+базовый режим конструктора — обычная свободная игра и сюжетные квесты
+(**Story**), а **Warfare** — опциональная надстройка для захвата смартов.
+
+| Маркер | Что означает |
+|---|---|
+| `[Общее]` | Элемент работает в freeplay, Story и Warfare. Ничего включать не нужно. |
+| `[Story]` | Сюжетный путь: инфопоршни, `on_death`, `condlist_N`, `GiveTask`. Не требует Warfare и не вызывает `sim_squad_warfare`. |
+| `[Warfare]` | Надстройка захвата точек: `WarfareCapture`, `requires_warfare=True`, `SetTarget`, `stage_cleared`. Работает только при включённом Warfare. |
+
+Правило выбора:
+
+1. Обычный сюжетный квест — `[Story]` + `[Общее]`; `requires_warfare` остаётся
+   `False`, `WarfareCapture` не задаётся.
+2. Квест на захват точки — `[Warfare]`; он помечается `world = true` и вне
+   Warfare не тикает.
+3. Смешивать захват и Story-спавн в одном `Quest` запрещено: валидатор
+   возвращает ошибку. Разделяйте сценарий на два квеста.
+
+Эталон Story-цепочки: `examples/build_story_relay.py`.
 
 ---
 
@@ -244,19 +268,33 @@ RequiredId: TypeAlias = Annotated[
 `Action` — дискриминируемый union по полю `type`. В коде используйте конкретные
 классы, а не словари.
 
-| Класс | `type` | Поля | Что генерируется / делает |
-|---|---|---|---|
-| `GiveInfo` | `"give_info"` | `info: RequiredId` | В реплике — `<give_info>info</give_info>`. В квесте/этапе — Lua `db.actor:give_info_portion(info)`. |
-| `RemoveInfo` | `"remove_info"` | `info: RequiredId` | Lua `db.actor:disable_info_portion(info)`. |
-| `SpawnSquad` | `"spawn_squad"` | `squad_alias: str`, `smart_alias: str` | Lua `SIMBOARD:create_squad` + `sim_squad_warfare.set_target` + заморозка. |
-| `SetTarget` | `"set_target"` | `squad_alias: str`, `smart_alias: str` | Lua `sim_squad_warfare.set_target`. |
-| `GiveItem` | `"give_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `give_item(...)`: `alife_create_item(section, actor)` по одному и одно уведомление `news_manager.relocate_item(actor, "in", section, count)`. Алиас разрешается в реальную секцию. |
-| `RemoveItem` | `"remove_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `take_item(...)`: прямое изъятие из инвентаря игрока через `actor:iterate_inventory` + `alife_release`. |
-| `TakeItem` | `"take_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Семантический алиас `RemoveItem`: та же реализация `take_item`; ровно одно уведомление `news_manager.relocate_item(..., "out", ...)` при `removed > 0`. |
-| `GiveMoney` | `"give_money"` | `amount: int` (`ge=0`) | Lua `give_money(...)`: `actor:give_money(amount)` и одно уведомление `news_manager.relocate_money(actor, "in", amount)`. |
-| `TakeMoney` | `"take_money"` | `amount: int` (`ge=0`) | Lua `take_money(...)`: списание с ограничением по текущему балансу, без ухода в минус. |
-| `GiveTask` | `"give_task"` | `task_id: RequiredId` | Единственное действие реплики — `<action>dialogs.<текущий_dialog_id>_accept</action>`; в Lua — `give_task`. В комбинации с другими действиями сливается в единую `dialogs.<dialog_id>_phrase_<n>_action`. |
-| `CompleteTask` | `"complete_task"` | `task_id: RequiredId` | Единственное действие реплики — `<action>dialogs.<текущий_dialog_id>_turn_in</action>`; в Lua — `complete_task`. В комбинации с другими действиями сливается в единую `dialogs.<dialog_id>_phrase_<n>_action`. |
+| Класс | `type` | Режим | Поля | Что генерируется / делает |
+|---|---|---|---|---|
+| `GiveInfo` | `"give_info"` | `[Общее]` | `info: RequiredId` | В реплике — `<give_info>info</give_info>`. В квесте/этапе — Lua `db.actor:give_info_portion(info)`. |
+| `RemoveInfo` | `"remove_info"` | `[Общее]` | `info: RequiredId` | Lua `db.actor:disable_info_portion(info)`. |
+| `SpawnSquad` | `"spawn_squad"` | `[Общее]`; `mode="warfare"` — `[Warfare]`, `mode="story"` — `[Story]` | `squad_alias: str`, `smart_alias: str`, `mode: "warfare" \| "story" = "warfare"` | `warfare`: `SIMBOARD:create_squad` + `sim_squad_warfare.set_target` + заморозка. `story`: `SIMBOARD:create_squad` без `set_target`, `stay_time` и `force_online`; цель берётся из `target_smart` секции отряда. |
+| `SetTarget` | `"set_target"` | `[Warfare]` | `squad_alias: str`, `smart_alias: str` | Lua `sim_squad_warfare.set_target`. |
+| `GiveItem` | `"give_item"` | `[Общее]` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `give_item(...)`: `alife_create_item(section, actor)` по одному и одно уведомление `news_manager.relocate_item(actor, "in", section, count)`. Алиас разрешается в реальную секцию. |
+| `RemoveItem` | `"remove_item"` | `[Общее]` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `take_item(...)`: прямое изъятие из инвентаря игрока через `actor:iterate_inventory` + `alife_release`. |
+| `TakeItem` | `"take_item"` | `[Общее]` | `item_alias: str`, `count: int = 1` (`ge=1`) | Семантический алиас `RemoveItem`: та же реализация `take_item`; ровно одно уведомление `news_manager.relocate_item(..., "out", ...)` при `removed > 0`. |
+| `GiveMoney` | `"give_money"` | `[Общее]` | `amount: int` (`ge=0`) | Lua `give_money(...)`: `actor:give_money(amount)` и одно уведомление `news_manager.relocate_money(actor, "in", amount)`. |
+| `TakeMoney` | `"take_money"` | `[Общее]` | `amount: int` (`ge=0`) | Lua `take_money(...)`: списание с ограничением по текущему балансу, без ухода в минус. |
+| `GiveTask` | `"give_task"` | `[Общее]` | `task_id: RequiredId` | Единственное действие реплики — `<action>dialogs.<текущий_dialog_id>_accept</action>`; в Lua — `give_task`. В комбинации с другими действиями сливается в единую `dialogs.<dialog_id>_phrase_<n>_action`. |
+| `CompleteTask` | `"complete_task"` | `[Общее]` | `task_id: RequiredId` | Единственное действие реплики — `<action>dialogs.<текущий_dialog_id>_turn_in</action>`; в Lua — `complete_task`. В комбинации с другими действиями сливается в единую `dialogs.<dialog_id>_phrase_<n>_action`. |
+| `RemoveSquad` | `"remove_squad"` | `[Story]` | `squad_alias: str` | Lua `get_story_squad(alias)` → `SIMBOARD:remove_squad(squad)`. Если отряд уже мёртв/не найден — безопасный no-op. Используется в `Quest.on_fail_actions` для очистки Story-отряда. |
+
+> **Story-спавн.** `SpawnSquad(mode="story")` — штатный способ создать
+> сюжетный отряд. Действие вызывает `SIMBOARD:create_squad(spawn_smart, section)`,
+> **не** вызывает `sim_squad_warfare.set_target`, **не** ставит `stay_time` и
+> **не** включает `force_online`. Отряд идёт к `target_smart` из своей секции
+> `squad_descr_<slug>.ltx` и обслуживается `sim_squad_scripted`. Спавн
+> идемпотентен: для `on_init_actions` используется ключ `_init_spawn`, для
+> `Stage.on_start_actions` — `_story_spawn`.
+
+> **`RemoveSquad`.** Story-отряд удаляется через `RemoveSquad(squad_alias=...)`
+> в `Quest.on_fail_actions` (эффекты `on_fail`/`on_cancel`). Действие не
+> падает, если отряд уже уничтожен. Оно не предназначено для Warfare-отрядов:
+> те освобождаются через `unmark_quest_squads`.
 
 > **Ровно один `<action>` на реплику.** Движок X-Ray/OpenXRay хранит
 > **одно** действие на `<phrase>` и молча отбрасывает второй и последующие
@@ -344,13 +382,13 @@ actions = [
 
 `Condition` — дискриминируемый union по полю `type`.
 
-| Класс | `type` | Поля | Где проверяется |
-|---|---|---|---|
-| `HasInfo` | `"has_info"` | `info: RequiredId` | XML `<has_info>`; Lua `has_alife_info(info)`. |
-| `DontHasInfo` | `"dont_has_info"` | `info: RequiredId` | XML `<dont_has_info>`; Lua `not has_alife_info(info)`. |
-| `HasItem` | `"has_item"` | `item_alias: str`, `count: int = 1` (`ge=1`) | Только Lua: подсчёт стаков в инвентаре `actor_item_count(item, actor) >= count`. Выносится в `dialogs.<...>_precondition` или `dialogs.<dialog_id>_can_take`. |
-| `HasMoney` | `"has_money"` | `amount: int` (`ge=0`) | Только Lua: `db.actor:money() >= amount`. |
-| `SmartOwner` | `"smart_owner"` | `smart_alias: str`, `faction: str` | Только Lua: `SIMBOARD.smarts_by_names[smart_alias].owning_faction == faction`. |
+| Класс | `type` | Режим | Поля | Где проверяется |
+|---|---|---|---|---|
+| `HasInfo` | `"has_info"` | `[Общее]` / `[Story]` | `info: RequiredId` | XML `<has_info>`; Lua `has_alife_info(info)`. Основной контракт Story-завершения. |
+| `DontHasInfo` | `"dont_has_info"` | `[Общее]` / `[Story]` | `info: RequiredId` | XML `<dont_has_info>`; Lua `not has_alife_info(info)`. |
+| `HasItem` | `"has_item"` | `[Общее]` / `[Story]` | `item_alias: str`, `count: int = 1` (`ge=1`) | Только Lua: подсчёт стаков в инвентаре `actor_item_count(item, actor) >= count`. Выносится в `dialogs.<...>_precondition` или `dialogs.<dialog_id>_can_take`. В `condlist` поддерживается как `actor_has_item`/`actor_has_item_amount`. |
+| `HasMoney` | `"has_money"` | `[Общее]` | `amount: int` (`ge=0`) | Только Lua: `db.actor:money() >= amount`. В `Quest.extra_condlists` (`[Story]`) не поддерживается — `BuildError`. |
+| `SmartOwner` | `"smart_owner"` | `[Warfare]` | `smart_alias: str`, `faction: str` | Только Lua: `SIMBOARD.smarts_by_names[smart_alias].owning_faction == faction`. В `Quest.extra_condlists` (`[Story]`) не поддерживается — `BuildError`. |
 
 Пример:
 
@@ -493,7 +531,12 @@ branch          -> 4
 > действует и для диалога сдачи: если у него есть ручное не-info условие,
 > используется общий `_can_take`; иначе — `_can_turn_in` по стадии задачи.
 
-## 2.6. `WarfareCapture` — опциональный сценарий захвата смарта
+## 2.6. `WarfareCapture` — опциональный сценарий захвата смарта `[Warfare]`
+
+`[Warfare]` — это надстройка, а не базовый режим. Поле `Stage.warfare_capture`
+включает `world = true`, и `_start`/`_status` работают только при
+`IsWarfare() == true`. Story-квесты **не задают** `WarfareCapture` и не
+смешивают его со `SpawnSquad(mode="story")` в одном `Quest`.
 
 ```python
 class WarfareCapture(BaseModel):
@@ -505,12 +548,12 @@ class WarfareCapture(BaseModel):
     ally_count: int = 0
 ```
 
-| Поле | Тип | По умолчанию | Назначение |
-|---|---|---|---|
-| `smart_alias` | `str` | обязательное | Алиас смарт-террейна, который нужно захватить. |
-| `enemy_squad_alias` | `str` | обязательное | Секция вражеского отряда, который нужно уничтожить. |
-| `ally_squad_alias` | `str \| None` | `None` | Секция союзного отряда, который спавнится на помощь. |
-| `ally_count` | `int` (`ge=0`) | `0` | Сколько союзных отрядов заспавнить. |
+| Поле | Режим | Тип | По умолчанию | Назначение |
+|---|---|---|---|---|
+| `smart_alias` | `[Warfare]` | `str` | обязательное | Алиас смарт-террейна, который нужно захватить. |
+| `enemy_squad_alias` | `[Warfare]` | `str` | обязательное | Секция вражеского отряда, который нужно уничтожить. |
+| `ally_squad_alias` | `[Warfare]` | `str \| None` | `None` | Секция союзного отряда, который спавнится на помощь. |
+| `ally_count` | `[Warfare]` | `int` (`ge=0`) | `0` | Сколько союзных отрядов заспавнить. |
 
 Если `Stage.warfare_capture` задан, Lua-генератор включает автоматическую логику:
 
@@ -562,7 +605,12 @@ class WarfareCapture(BaseModel):
 > `warfare_capture`. Явный `Quest.requires_warfare=True` действует так же,
 > даже без `warfare_capture`.
 
-## 2.7. `Stage` — один этап квеста
+> **Запрет смешивания `[Warfare]` и `[Story]`.** Если в одном `Quest` есть
+> `warfare_capture` **и** `SpawnSquad(mode="story")`, `ProjectValidator`
+> возвращает ошибку. Причина — `world`-гейт: Story-отряд не должен зависеть
+> от Warfare. Разделяйте сценарий на два квеста.
+
+## 2.7. `Stage` — один этап квеста `[Общее]`
 
 ```python
 class Stage(BaseModel):
@@ -575,25 +623,51 @@ class Stage(BaseModel):
     msg_complete_en: str | None = None
     descr_ru: str = ""
     descr_en: str = ""
+    descr_variants: list[DescrVariant] = []
     target_alias: str = ""
+    target_variants: list[TargetVariant] = []
     target_squad_id: str | None = None
     on_start_actions: list[Action] = []
     warfare_capture: WarfareCapture | None = None
 ```
 
-| Поле | Тип | По умолчанию | Назначение |
-|---|---|---|---|
-| `id` | `int` (`ge=0`) | обязательное | Номер этапа. Ключ в `Quest.stages` обязан совпадать. |
-| `title_ru` | `str` | `""` | Русский заголовок этапа. |
-| `title_en` | `str` | `""` | Английский заголовок этапа. |
-| `msg_complete_ru` | `str \| None` | `None` | Текст уведомления КПК при **завершении** этапа. `None` → «Этап выполнен: <title_ru>.». |
-| `msg_complete_en` | `str \| None` | `None` | То же для английского языка; `None` → «Stage completed: <title_en>.». |
-| `descr_ru` | `str` | `""` | Русское описание этапа. |
-| `descr_en` | `str` | `""` | Английское описание этапа. |
-| `target_alias` | `str` | `""` | Цель маркера: имя смарта, числовой server ID или story ID. |
-| `target_squad_id` | `str \| None` | `None` | ID/секция/алиас отряда, который нужно физически уничтожить. Включает автоматическую проверку в `_status`. |
-| `on_start_actions` | `list[Action]` | `[]` | Действия, выполняемые ровно один раз при входе в этап. |
-| `warfare_capture` | `WarfareCapture \| None` | `None` | Включает автоматическую логику захвата смарта. |
+| Поле | Режим | Тип | По умолчанию | Назначение |
+|---|---|---|---|---|
+| `id` | `[Общее]` | `int` (`ge=0`) | обязательное | Номер этапа. Ключ в `Quest.stages` обязан совпадать. |
+| `title_ru` | `[Общее]` | `str` | `""` | Русский заголовок этапа. |
+| `title_en` | `[Общее]` | `str` | `""` | Английский заголовок этапа. |
+| `msg_complete_ru` | `[Общее]` | `str \| None` | `None` | Текст уведомления КПК при **завершении** этапа. `None` → «Этап выполнен: <title_ru>.». |
+| `msg_complete_en` | `[Общее]` | `str \| None` | `None` | То же для английского языка; `None` → «Stage completed: <title_en>.». |
+| `descr_ru` | `[Общее]` | `str` | `""` | Русское описание этапа. |
+| `descr_en` | `[Общее]` | `str` | `""` | Английское описание этапа. |
+| `descr_variants` | `[Story]` | `list[DescrVariant]` | `[]` | Варианты описания по инфопоршням/предметам. Проверяются по порядку; первый подошедший побеждает. |
+| `target_alias` | `[Общее]` | `str` | `""` | Цель маркера: имя смарта, числовой server ID или story ID. |
+| `target_variants` | `[Story]` | `list[TargetVariant]` | `[]` | Варианты цели маркера по условиям. Первый подошедший побеждает; иначе используется `target_alias`. |
+| `target_squad_id` | `[Общее]` | `str \| None` | `None` | ID/секция/алиас отряда, который нужно физически уничтожить. Включает автоматическую проверку в `_status`. Для Story-отряда обычно указывается его `story_id`. |
+| `on_start_actions` | `[Общее]` | `list[Action]` | `[]` | Действия, выполняемые ровно один раз при входе в этап. `SpawnSquad(mode="story")` здесь также допустим. |
+| `warfare_capture` | `[Warfare]` | `WarfareCapture \| None` | `None` | Включает автоматическую логику захвата смарта. Только для Warfare. |
+
+### Варианты цели и описания `[Story]`
+
+```python
+class TargetVariant(BaseModel):
+    when: list[Condition]   # min_length=1
+    value: str              # min_length=1
+
+class DescrVariant(BaseModel):
+    when: list[Condition]   # min_length=1
+    text_ru: str = ""
+    text_en: str = ""
+```
+
+Семантика:
+
+1. Варианты проверяются в порядке объявления.
+2. Побеждает первый вариант, у которого **все** условия `when` истинны.
+3. Если ни один не подошёл, используются базовые `target_alias` и `descr_ru/en`.
+4. XML-строки вариантов получают стабильные ключи
+   `<quest_id>_stage_<n>_descr_v1`, `_v2`, …; индексы не зависят от локали.
+5. Пустой `when` — ошибка валидации.
 
 Как работает `target_alias`:
 
@@ -687,7 +761,7 @@ quest = Quest(
 Если `target_alias` пуст, `target_functor` использует `target_squad_id` как
 источник маркера цели.
 
-## 2.8. `Quest` — сюжетный квест
+## 2.8. `Quest` — сюжетный квест `[Общее] / [Story] / [Warfare]`
 
 ```python
 class Quest(BaseModel):
@@ -715,6 +789,8 @@ class Quest(BaseModel):
     on_complete_actions: list[Action] = []
     on_fail_actions: list[Action] = []
     transfer_conditions: dict[int, dict[str, list[Condition]]] = {}
+    fail_on_giver_death: bool = True
+    extra_condlists: list[QuestCondlist] = []
     reward_money: int | None = None
     reward_item_alias: str | None = None
     reward_item_count: int = 1
@@ -731,36 +807,71 @@ class Quest(BaseModel):
 
 ### Идентификаторы и связи
 
-| Поле | Тип | По умолчанию | Назначение |
-|---|---|---|---|
-| `id` | `RequiredId` | обязательное | ID секции LTX `[id]`, ключ `task_functor` и префикс всех функций. |
-| `giver_npc_id` | `OptionalId` | `None` | Устаревшее имя ID квестодателя. Используется, если `npc_id` не задан. |
-| `npc_id` | `OptionalId` | `None` | Игровой ID NPC-квестодателя. Попадает в `give_task` и `task_giver_alive`. |
-| `npc_location` | `str \| None` | `None` | Локация квестодателя для патча `character_desc_<level>.xml`. |
-| `dialog_id` | `OptionalId` | `None` | ID основного диалога выдачи квеста. |
-| `dialog_ids` | `list[str]` | `[]` | Все связанные диалоги (выдача, сдача, ветки). |
+| Поле | Режим | Тип | По умолчанию | Назначение |
+|---|---|---|---|---|
+| `id` | `[Общее]` | `RequiredId` | обязательное | ID секции LTX `[id]`, ключ `task_functor` и префикс всех функций. |
+| `giver_npc_id` | `[Общее]` | `OptionalId` | `None` | Устаревшее имя ID квестодателя. Используется, если `npc_id` не задан. |
+| `npc_id` | `[Общее]` | `OptionalId` | `None` | Игровой ID NPC-квестодателя. Попадает в `give_task` и `task_giver_alive`. |
+| `npc_location` | `[Общее]` | `str \| None` | `None` | Локация квестодателя для патча `character_desc_<level>.xml`. |
+| `dialog_id` | `[Общее]` | `OptionalId` | `None` | ID основного диалога выдачи квеста. |
+| `dialog_ids` | `[Общее]` | `list[str]` | `[]` | Все связанные диалоги (выдача, сдача, ветки). |
 
 ### Тексты и PDA
 
-| Поле | Тип | По умолчанию | Назначение |
-|---|---|---|---|
-| `title_ru` / `title_en` | `str` | `""` | Название квеста в PDA. |
-| `descr_ru` / `descr_en` | `str` | `""` | Описание квеста в PDA. |
-| `msg_reward_ru` / `msg_reward_en` | `str \| None` | `None` | Тексты PDA-подсказки при завершении. `None` → автогенерация «Задание выполнено: <title>.» / «Task completed: <title>.». |
-| `msg_fail_ru` / `msg_fail_en` | `str \| None` | `None` | Тексты PDA-подсказки при провале/отмене. `None` → автогенерация «Задание провалено: <title>.» / «Task failed: <title>.». |
-| `is_storyline` | `bool` | `True` | Попадает в LTX как `storyline = true/false`. |
-| `icon` | `str \| None` | `None` | Иконка PDA. По умолчанию `ui_inGame2_Put_v_pripyat`. |
-| `prior` | `int \| None` (`ge=0`) | `None` | Приоритет в PDA. По умолчанию `60`. |
+| Поле | Режим | Тип | По умолчанию | Назначение |
+|---|---|---|---|---|
+| `title_ru` / `title_en` | `[Общее]` | `str` | `""` | Название квеста в PDA. |
+| `descr_ru` / `descr_en` | `[Общее]` | `str` | `""` | Описание квеста в PDA. |
+| `msg_reward_ru` / `msg_reward_en` | `[Общее]` | `str \| None` | `None` | Тексты PDA-подсказки при завершении. `None` → автогенерация «Задание выполнено: <title>.» / «Task completed: <title>.». |
+| `msg_fail_ru` / `msg_fail_en` | `[Общее]` | `str \| None` | `None` | Тексты PDA-подсказки при провале/отмене. `None` → автогенерация «Задание провалено: <title>.» / «Task failed: <title>.». |
+| `is_storyline` | `[Story]` | `bool` | `True` | Попадает в LTX как `storyline = true/false`. Сюжетные цепочки используют `True`. |
+| `icon` | `[Общее]` | `str \| None` | `None` | Иконка PDA. По умолчанию `ui_inGame2_Put_v_pripyat`. |
+| `prior` | `[Общее]` | `int \| None` (`ge=0`) | `None` | Приоритет в PDA. По умолчанию `60`. |
 
 ### Этапы и логика
 
-| Поле | Тип | По умолчанию | Назначение |
-|---|---|---|---|
-| `stages` | `dict[int, Stage]` | `{}` | Карта этапов. Ключи обязаны идти подряд с `0` и совпадать с `Stage.id`. |
-| `on_init_actions` | `list[Action]` | `[]` | Действия эффекта `on_init` (`<quest_id>_start`). |
-| `on_complete_actions` | `list[Action]` | `[]` | Действия эффекта `on_complete` (`<quest_id>_reward`). |
-| `on_fail_actions` | `list[Action]` | `[]` | Действия `on_fail`/`on_cancel` (`<quest_id>_cleanup`). |
-| `transfer_conditions` | `dict[int, dict[str, list[Condition]]]` | `{}` | Правила перехода этапов: `{stage: {"complete": [...], "fail": [...]}}`. |
+| Поле | Режим | Тип | По умолчанию | Назначение |
+|---|---|---|---|---|
+| `stages` | `[Общее]` | `dict[int, Stage]` | `{}` | Карта этапов. Ключи обязаны идти подряд с `0` и совпадать с `Stage.id`. |
+| `on_init_actions` | `[Общее]` | `list[Action]` | `[]` | Действия эффекта `on_init` (`<quest_id>_start`). Для Story здесь размещается `SpawnSquad(mode="story")`. |
+| `on_complete_actions` | `[Общее]` | `list[Action]` | `[]` | Действия эффекта `on_complete` (`<quest_id>_reward`). Для цепочки — `GiveTask(next)`. |
+| `on_fail_actions` | `[Общее]` | `list[Action]` | `[]` | Действия `on_fail`/`on_cancel` (`<quest_id>_cleanup`). Для Story — `RemoveSquad(...)`. |
+| `transfer_conditions` | `[Общее]` | `dict[int, dict[str, list[Condition]]]` | `{}` | Правила перехода этапов: `{stage: {"complete": [...], "fail": [...]}}`. Для многоэтапного Story. |
+| `fail_on_giver_death` | `[Общее]` / `[Story]` | `bool` | `True` | Добавлять ли `condlist_0 = {!task_giver_alive(<quest>)} fail`. `False` отключает авто-провал. |
+| `extra_condlists` | `[Story]` | `list[QuestCondlist]` | `[]` | Дополнительные `condlist_N`, завершающие/проваливающие весь квест. Нумерация продолжает авто-провал. |
+
+### `QuestCondlist` и сериализация условий `[Story]`
+
+```python
+class QuestCondlist(BaseModel):
+    when: list[Condition]                      # min_length=1
+    result: Literal["complete", "fail"]
+```
+
+Нумерация:
+
+* `condlist_0` — авто-провал `{!task_giver_alive(<quest_id>)} fail`, если
+  `fail_on_giver_death=True`;
+* далее `extra_condlists` в порядке объявления (`condlist_1`, `condlist_2`, …);
+* при `fail_on_giver_death=False` первый extra становится `condlist_0`;
+* при `fail_on_giver_death=False` и пустых extras блок `condlist_*` не
+  эмитится вовсе.
+
+Поддерживаемые условия в `condlist`:
+
+| Модель | Синтаксис LTX |
+|---|---|
+| `HasInfo` | `+info` |
+| `DontHasInfo` | `-info` |
+| `HasItem(count=1)` | `=actor_has_item(section)` |
+| `HasItem(count>1)` | `=actor_has_item_amount(section:count)` |
+| `HasMoney` | **не поддерживается** в Фазе 2 → `BuildError` |
+| `SmartOwner` | **не поддерживается** в Фазе 2 → `BuildError` |
+
+`condlist_N` завершает **весь квест**, а не отдельный этап, и
+`task_objects` проверяет его раньше `status_functor`. Для многоэтапных
+квестов используйте `transfer_conditions`; `extra_condlists` — для
+одноэтапных звеньев цепочки, как в ванильном `tm_lostzone_ms.ltx`.
 
 Логика `_status` (упрощённо):
 
@@ -777,20 +888,20 @@ class Quest(BaseModel):
 
 ### Награды и информационные поршни
 
-| Поле | Тип | По умолчанию | Назначение |
-|---|---|---|---|
-| `reward_money` | `int \| None` (`ge=0`) | `None` | Деньги, автоматически выдаваемые в `_reward`. |
-| `reward_item_alias` | `str \| None` | `None` | Секция предмета, автоматически выдаваемого в `_reward`. |
-| `reward_item_count` | `int` (`ge=1`) | `1` | Количество предметов награды. |
-| `complete_info` | `str \| None` | `None` | Поршень, выдаваемый в `_reward`. |
-| `taken_info` | `str \| None` | `None` | Поршень, выдаваемый в `_start`. Снимается только в `_cleanup` (провал/отмена); при успешном завершении сохраняется. |
-| `cleanup_infos` | `list[str]` | `[]` | Поршни, снимаемые в конце `_reward` и в `_cleanup`. Предназначены для взаимоисключающих вариантов (`assault`/`solo`) и временных маркеров; `taken_info`/`complete_info` в список включать не нужно. Дополнительно генератор **автоматически** добавляет сюда все `GiveInfo` из `Stage.on_start_actions` (кроме `complete_info`/`done_info`), поэтому поршни готовности вида `*_ready` снимаются при провале/отмене квеста и не открывают диалог сдачи при повторном взятии. |
-| `return_to_giver_stage` | `int \| None` | `None` | Этап, на котором игрок должен вернуться к квестодателю. |
-| `return_distance` | `float` (`ge=0`) | `40.0` | Радиус «подошёл к квестодателю» в метрах. |
-| `available_info` | `str \| None` | `None` | Маркер доступности для внешних скриптов/UI. Ядро только сохраняет значение в `QUESTS` и **не проверяет** его в сгенерированном коде. Для встроенного гейта используйте `requires_faction`/`requires_warfare` (см. ниже). |
-| `done_info` | `str \| None` | `None` | Зарезервировано для внешних скриптов/UI; ядро только сохраняет значение в таблице `QUESTS`. |
-| `requires_faction` | `str \| None` | `None` | Техническое имя фракции игрока (например, `"army"`). Встроенный гейт: `<dialog_id>_can_take` вызывает `is_actor_faction(...)` и закрывает диалог для чужой фракции. |
-| `requires_warfare` | `bool` | `False` | Встроенный гейт Warfare: `<dialog_id>_can_take` требует `is_warfare()`; `<quest_id>_start`/`<quest_id>_status` не выполняются вне Warfare (`if (quest.world or quest.requires_warfare) and not is_warfare() then return nil end`). |
+| Поле | Режим | Тип | По умолчанию | Назначение |
+|---|---|---|---|---|
+| `reward_money` | `[Общее]` | `int \| None` (`ge=0`) | `None` | Деньги, автоматически выдаваемые в `_reward`. |
+| `reward_item_alias` | `[Общее]` | `str \| None` | `None` | Секция предмета, автоматически выдаваемого в `_reward`. |
+| `reward_item_count` | `[Общее]` | `int` (`ge=1`) | `1` | Количество предметов награды. |
+| `complete_info` | `[Общее]` / `[Story]` | `str \| None` | `None` | Поршень, выдаваемый в `_reward`. В Story-цепочке служит предусловием следующего диалога. |
+| `taken_info` | `[Общее]` / `[Story]` | `str \| None` | `None` | Поршень, выдаваемый в `_start`. Снимается только в `_cleanup` (провал/отмена); при успешном завершении сохраняется. |
+| `cleanup_infos` | `[Общее]` / `[Story]` | `list[str]` | `[]` | Поршни, снимаемые в конце `_reward` и в `_cleanup`. Предназначены для взаимоисключающих вариантов (`assault`/`solo`) и временных маркеров; `taken_info`/`complete_info` в список включать не нужно. Дополнительно генератор **автоматически** добавляет сюда все `GiveInfo` из `Stage.on_start_actions` (кроме `complete_info`/`done_info`), поэтому поршни готовности вида `*_ready` снимаются при провале/отмене квеста и не открывают диалог сдачи при повторном взятии. В Story сюда обязательно включается поршень смерти отряда. |
+| `return_to_giver_stage` | `[Общее]` | `int \| None` | `None` | Этап, на котором игрок должен вернуться к квестодателю. |
+| `return_distance` | `[Общее]` | `float` (`ge=0`) | `40.0` | Радиус «подошёл к квестодателю» в метрах. |
+| `available_info` | `[Общее]` | `str \| None` | `None` | Маркер доступности для внешних скриптов/UI. Ядро только сохраняет значение в `QUESTS` и **не проверяет** его в сгенерированном коде. Для встроенного гейта используйте `requires_faction`/`requires_warfare` (см. ниже). |
+| `done_info` | `[Общее]` | `str \| None` | `None` | Зарезервировано для внешних скриптов/UI; ядро только сохраняет значение в таблице `QUESTS`. |
+| `requires_faction` | `[Общее]` | `str \| None` | `None` | Техническое имя фракции игрока (например, `"army"`). Встроенный гейт: `<dialog_id>_can_take` вызывает `is_actor_faction(...)` и закрывает диалог для чужой фракции. |
+| `requires_warfare` | `[Warfare]` | `bool` | `False` | Встроенный гейт Warfare: `<dialog_id>_can_take` требует `is_warfare()`; `<quest_id>_start`/`<quest_id>_status` не выполняются вне Warfare (`if (quest.world or quest.requires_warfare) and not is_warfare() then return nil end`). Для Story оставляйте `False`. |
 
 ### Гейты доступа: `requires_faction` и `requires_warfare`
 
@@ -869,7 +980,7 @@ end
 5. Ключ `stages` обязан совпадать с `Stage.id`.
 6. `return_to_giver_stage`, если задан, обязан существовать в `stages`.
 
-## 2.9. `ModProject` — корневой контейнер
+## 2.9. `ModProject` — корневой контейнер `[Общее]`
 
 ```python
 class ModProject(BaseModel):
@@ -979,7 +1090,7 @@ dialog_id = "deadcity_dushman_take"
 > доступен у конкретного NPC, всегда задавайте и `npc_id`, и `npc_location`.
 > `dialog_id` — это ровно то значение, которое попадёт в `<actor_dialog>`.
 
-## 2.11. `CustomSquad` — кастомные секции отрядов
+## 2.11. `CustomSquad` — кастомные секции отрядов `[Общее]`
 
 ```python
 class CustomSquad(BaseModel):
@@ -987,31 +1098,50 @@ class CustomSquad(BaseModel):
 
     id: RequiredId
     faction: str
-    npc: list[str]                  # непустой список секций NPC
+    npc: list[str] = []
+    npc_random: list[str] = []
+    npc_in_squad: list[int] = []
     target_smart: str | None = None
+    relationship: Literal["neutral", "friend", "enemy"] | None = None
+    idle_time: float | None = None
+    spawn_point: str | None = None
     story_id: str | None = None
+    death_infos: list[str] = []
 ```
 
-| Поле | Тип | По умолчанию | Назначение |
-|---|---|---|---|
-| `id` | `RequiredId` | обязательное | Имя LTX-секции, например `mymod_atp_bandit_leader_squad`. Ключ в `ModProject.squads` обязан совпадать. |
-| `faction` | `str` | обязательное | Фракция отряда, например `bandit` или `army`. |
-| `npc` | `list[str]` | обязательное | Непустой список секций NPC, например `["sim_default_bandit_4"]`. |
-| `target_smart` | `str \| None` | `None` | Необязательный `target_smart` секции. |
-| `story_id` | `str \| None` | `None` | Необязательный `story_id` секции. |
+| Поле | Режим | Тип | По умолчанию | Назначение |
+|---|---|---|---|---|
+| `id` | `[Общее]` | `RequiredId` | обязательное | Имя LTX-секции, например `mymod_atp_bandit_leader_squad`. Ключ в `ModProject.squads` обязан совпадать. |
+| `faction` | `[Общее]` | `str` | обязательное | Фракция отряда, например `bandit` или `army`. |
+| `npc` | `[Общее]` | `list[str]` | `[]` | Явный список секций NPC, например `["sim_default_bandit_4"]`. |
+| `npc_random` | `[Общее]` | `list[str]` | `[]` | Пул секций, из которого движок выбирает NPC случайно. |
+| `npc_in_squad` | `[Общее]` | `list[int]` | `[]` | Размер отряда: `[n]` или `[min, max]`, где `0 <= min <= max`. |
+| `target_smart` | `[Общее]` | `str \| None` | `None` | Необязательный `target_smart` секции. |
+| `relationship` | `[Общее]` | `"neutral" \| "friend" \| "enemy" \| None` | `None` | Отношение отряда к актору. |
+| `idle_time` | `[Общее]` | `float \| None` | `None` | Время ожидания отряда на точке, `>= 0`. |
+| `spawn_point` | `[Общее]` | `str \| None` | `None` | Именованная точка спавна отряда. |
+| `story_id` | `[Общее]` | `str \| None` | `None` | Необязательный `story_id` секции. |
+| `death_infos` | `[Story]` | `list[str]` | `[]` | Инфопоршни, выдаваемые в `on_death` отряда. Сериализуются как `on_death = %+info_a +info_b%`. |
 
-Пример проекта:
+Обязательное условие валидности: непустой `faction` **и** хотя бы один из
+`npc` / `npc_random`. Иначе `BuildError` (секция пропускается).
+
+Пример проекта `[Story]`:
 
 ```python
 from src.core.models import CustomSquad, ModProject
 
 project = ModProject(
     name="My Mod",
+    mod_slug="mymod",
     squads={
-        "mymod_atp_bandit_leader_squad": CustomSquad(
-            id="mymod_atp_bandit_leader_squad",
-            faction="bandit",
-            npc=["sim_default_bandit_4"],
+        "mymod_relay_merc_squad": CustomSquad(
+            id="mymod_relay_merc_squad",
+            faction="monolith",
+            npc=["sim_default_monolith_3", "sim_default_monolith_4"],
+            npc_in_squad=[3, 5],
+            target_smart="zat_stalker_base_smart",
+            death_infos=["mymod_relay_merc_dead"],
         )
     },
 )
@@ -1020,16 +1150,32 @@ project = ModProject(
 Если `project.squads` не пуст, `ModBuilder.build_project` создаёт каталог
 `gamedata/configs/misc/squad_descr` и записывает файл
 `gamedata/configs/misc/squad_descr/squad_descr_<slug>.ltx` в cp1251 **без
-BOM**:
+BOM**. Порядок строк фиксирован:
 
 ```ltx
-[mymod_atp_bandit_leader_squad]:online_offline_group
-faction = bandit
-npc     = sim_default_bandit_4
+[mymod_relay_merc_squad]:online_offline_group
+faction = monolith
+relationship = enemy
+npc = sim_default_monolith_3, sim_default_monolith_4
+npc_random = ...
+npc_in_squad = 3, 5
+target_smart = zat_stalker_base_smart
+idle_time = 30
+spawn_point = ...
+story_id = ...
+on_death = %+mymod_relay_merc_dead%
 ```
 
-Если заданы `target_smart`/`story_id`, они добавляются отдельными строками.
-При пустом `project.squads` файл **не создаётся**.
+Необязательные строки (`relationship`, `npc_random`, `npc_in_squad`,
+`target_smart`, `idle_time`, `spawn_point`, `story_id`, `on_death`)
+эмитируются только при непустом значении. При пустом `project.squads` файл
+**не создаётся**.
+
+> **`on_death` — единственный «мостик» Story → сюжет.** Движок выдаёт
+> инфопоршень при полном уничтожении отряда, а квест ловит его через
+> `extra_condlists` с условием `HasInfo("mymod_relay_merc_dead")`. Это
+> устраняет необходимость в `sim_squad_warfare` и любых Lua-опросах
+> симуляции.
 
 > **`system.ltx` патчить не нужно.** Ванильный
 > `gamedata/configs/misc/squad_descr/squad_descr.ltx` подключает все файлы
@@ -1037,6 +1183,150 @@ npc     = sim_default_bandit_4
 > автоматически. Секция `:online_offline_group` позволяет объявить уникальный
 > квестовый отряд, который симуляция Warfare не создаёт сама (в отличие от
 > «common»-секций).
+
+## 2.12. Story-паттерн: отряд → `condlist_N` → следующая задача `[Story]`
+
+### 2.12.1. Стандарт имён `<mod_slug>_<chapter>_<quest>_<role>`
+
+Все генерируемые сущности Story-проекта следуют одному шаблону:
+
+```text
+<mod_slug>_<chapter>_<quest>_<role>
+```
+
+| Часть | Смысл | Пример |
+|---|---|---|
+| `mod_slug` | Слаг мода: явное extra-поле `mod_slug` (если задано) или слаг, выведенный из `ModProject.name`. | `mymod` |
+| `chapter` | Номер главы или ветки сюжета (`01`, `02`, `side_a`). | `relay_01` |
+| `quest` | Короткое имя задачи. | `silence`, `report` |
+| `role` | Роль сущности. | `take`, `done`, `dead`, `squad`, `reported` |
+
+Единые роли:
+
+| Роль | Назначение | Пример |
+|---|---|---|
+| `take` | Диалог выдачи задачи. | `mymod_relay_take` |
+| `report` | Диалог сдачи/доклада. | `mymod_relay_report` |
+| `squad` | Секция `CustomSquad` Story-отряда. | `mymod_relay_merc_squad` |
+| `dead` | Поршень смерти отряда (`CustomSquad.death_infos`). | `mymod_relay_merc_dead` |
+| `taken` | Поршень «задача взята». | `mymod_relay_01_taken` |
+| `done` | Поршень «задача завершена» (`complete_info`). | `mymod_relay_01_done` |
+| `reported` | Поршень события диалога сдачи. | `mymod_relay_reported` |
+
+Первые две части часто сливаются: `mymod_relay_01_silence` — это
+`<mod_slug>_<chapter>` в `chapter=relay_01`, а `quest=silence` уже входит
+в состав ID задачи. Главное — **не переиспользовать один и тот же ID** для
+поршня, диалога и задачи.
+
+### 2.12.2. Компактный шаблон цепочки
+
+Канонический Story-паттерн состоит из трёх звеньев. Копируйте его как
+скелет новой сюжетной ветки. `mod_slug` — необязательное extra-поле
+`ModProject`: если его не задать, слаг выводится из `name`.
+
+```python
+from src.core.models import (
+    CustomSquad, GiveInfo, GiveTask, HasInfo, ModProject, Quest,
+    QuestCondlist, RemoveSquad, SpawnSquad, Stage,
+)
+
+MOD = "mymod"
+Q1 = f"{MOD}_relay_01_silence"
+Q2 = f"{MOD}_relay_02_report"
+SQUAD = f"{MOD}_relay_merc_squad"
+INFO_DEAD = f"{MOD}_relay_merc_dead"
+INFO_TAKEN = f"{MOD}_relay_01_taken"
+
+project = ModProject(
+    name="My Mod",
+    mod_slug=MOD,
+    squads={
+        SQUAD: CustomSquad(
+            id=SQUAD,
+            faction="killer",
+            npc=["sim_default_killer_1", "sim_default_killer_3"],
+            target_smart="zat_b52",          # точка назначения отряда
+            story_id=SQUAD,
+            death_infos=[INFO_DEAD],         # on_death = %+...%
+            relationship="enemy",
+        ),
+    },
+    quests={
+        Q1: Quest(
+            id=Q1,
+            npc_id="zat_a2_stalker_barmen",
+            npc_location="zaton",
+            is_storyline=True,
+            title_ru="...",
+            stages={0: Stage(id=0, target_squad_id=SQUAD, title_ru="...")},
+            on_init_actions=[                # звено 1: спавн
+                SpawnSquad(
+                    squad_alias=SQUAD,
+                    smart_alias="zat_stalker_base_smart",
+                    mode="story",
+                ),
+            ],
+            extra_condlists=[                # звено 2: condlist_N
+                QuestCondlist(when=[HasInfo(info=INFO_DEAD)], result="complete"),
+            ],
+            cleanup_infos=[INFO_DEAD],
+            on_complete_actions=[            # звено 3: GiveTask
+                GiveTask(task_id=Q2),
+            ],
+            on_fail_actions=[RemoveSquad(squad_alias=SQUAD)],
+            taken_info=INFO_TAKEN,
+        ),
+        Q2: Quest(id=Q2, npc_id="zat_a2_stalker_barmen",
+                  npc_location="zaton", is_storyline=True,
+                  stages={0: Stage(id=0, title_ru="...")}),
+    },
+)
+```
+
+Что и зачем:
+
+1. **Спавн.** `SpawnSquad(mode="story")` вызывает `create_squad` без
+   `set_target` / `stay_time` / `force_online`. Маршрут задаёт
+   `CustomSquad.target_smart`, поэтому Lua не трогает `sim_squad_warfare`.
+2. **Смерть.** `CustomSquad.death_infos` сериализуется в
+   `on_death = %+<info>%`. Движок выдаёт поршень сам, когда отряд уничтожен.
+3. **Завершение.** `QuestCondlist(when=[HasInfo(...)], result="complete")`
+   генерирует `condlist_N` в `tm_<mod>.ltx`. Квест закрывается без
+   `CompleteTask` из диалога и без `transfer_conditions` на Lua.
+4. **Мост к следующей задаче.** `on_complete_actions=[GiveTask(task_id=Q2)]`
+   сразу выдаёт Q2, не требуя возврата к NPC.
+5. **Очистка.** `cleanup_infos=[INFO_DEAD]` снимает поршень при повторном
+   взятии, `on_fail_actions=[RemoveSquad(...)]` не оставляет Story-отряд в
+   мире после провала или отмены.
+
+Сериализованный фрагмент `tm_<mod>.ltx` для такой цепочки выглядит так:
+
+```ltx
+[<quest_id>]
+...
+on_init               = %=<quest_id>_start()%
+on_complete           = %=<quest_id>_reward()%
+on_fail               = %=<quest_id>_cleanup()%
+on_cancel             = %=<quest_id>_cleanup()%
+
+condlist_0            = {!task_giver_alive(<quest_id>)} fail
+condlist_1            = {+<info_dead>} complete
+```
+
+`condlist_1` — это ваш `extra_condlists[0]`; нумерация продолжается после
+автоматического `condlist_0` (смерть квестодателя). `GiveTask` из
+`on_complete_actions` выполняется внутри `<quest_id>_reward()` в Lua, а не
+в LTX-строке `on_complete`. Если `fail_on_giver_death=False` или
+`giver_npc_id` не задан, `condlist_0` не создаётся и ваш condlist получает
+индекс `0`.
+
+> **Не смешивайте режимы.** `WarfareCapture` и `SpawnSquad(mode="story")`
+> в одном квесте недопустимы: `WarfareCapture` требует живой симуляции
+> Warfare и пишет `sim_squad_warfare`-вызовы, а `SpawnSquad(mode="story")`
+> обязан работать в чистом Story без симуляции. Валидатор возвращает
+> `BuildError`. Если сценарию нужны и захват точки, и сюжетный отряд,
+> разделите его на два квеста: Warfare-квест с `requires_warfare=True`
+> и Story-квест с `SpawnSquad(mode="story")`.
 
 ---
 
@@ -1996,9 +2286,17 @@ output/dead_city_dushmans_debt/gamedata/
    действия из реплики, чтобы не дублировать награду.
 8. Если диалог не должен быть привязан к NPC, не задавайте `npc_id`
    (будет warning, диалог всё равно попадёт в XML).
-9. Для Warfare-квестов используйте `WarfareCapture` вместо ручного
-   `SpawnSquad`, либо комбинируйте их осознанно.
-10. Запускайте сборку и проверяйте `logs/app.log` при `False`.
+9. Для Warfare-квестов используйте `WarfareCapture` и **не** добавляйте в тот
+   же квест `SpawnSquad(mode="story")`. Для Story-квестов используйте только
+   `SpawnSquad(mode="story")` и завершайте цепочку через
+   `CustomSquad.death_infos` → `QuestCondlist` → `GiveTask`.
+10. Если задача должна закрываться по смерти отряда, задайте
+    `CustomSquad.death_infos`, продублируйте поршень в
+    `QuestCondlist(when=[HasInfo(...)])` и не забудьте `cleanup_infos`,
+    иначе повторное взятие задачи завершится мгновенно.
+11. Проверьте, что все ID следуют стандарту `<mod_slug>_<chapter>_<quest>_<role>`
+    и не пересекаются между поршнями, диалогами и задачами.
+12. Запускайте сборку и проверяйте `logs/app.log` при `False`.
 
 ---
 
@@ -2010,14 +2308,19 @@ from src.core.models import (
     # Корневые модели
     ModProject,
     Quest,
+    QuestCondlist,
     Stage,
+    TargetVariant,
+    DescrVariant,
     Dialog,
     Phrase,
+    CustomSquad,
     WarfareCapture,
     # Действия
     GiveInfo,
     RemoveInfo,
     SpawnSquad,
+    RemoveSquad,
     SetTarget,
     GiveItem,
     RemoveItem,
@@ -2062,6 +2365,8 @@ from src.core.models import (
                                       <quest_id>_stage_<n>_title,
                                       <quest_id>_stage_<n>_descr,
                                       <quest_id>_stage_<n>_msg
+  Story-поршни:                       condlist_N = {+<info>} complete,
+                                      on_death = %+<info>% в squad_descr_<slug>.ltx
 
 Диалог <dialog_id>:
   XML:                                <dialog id="<dialog_id>">
@@ -2093,10 +2398,20 @@ Lua-скрипт генерируется автоматически.
 `npc_id` сборка выдаёт warning, при отсутствии `npc_location` — ошибку.
 
 **Почему квест не продвигается?**
-Проверьте `transfer_conditions`, `warfare_capture` (работает только в Warfare),
-`target_squad_id` (отряд должен быть обнаружен живым, а затем уничтожен),
-`on_start_actions` и наличие этапа с нужным `target_alias`. Состояние хранится
-в pstor; после изменения логики лучше начать новую игру или очистить сохранение.
+Проверьте `transfer_conditions`, `extra_condlists` (Story-поршни),
+`warfare_capture` (работает только в Warfare), `target_squad_id` (отряд
+должен быть обнаружен живым, а затем уничтожен), `on_start_actions` и
+наличие этапа с нужным `target_alias`. Состояние хранится в pstor; после
+изменения логики лучше начать новую игру или очистить сохранение.
+
+**Чем Story-квест отличается от Warfare-квеста?**
+Story-квест использует `SpawnSquad(mode="story")` и `CustomSquad` с
+`death_infos`; он не обращается к `sim_squad_warfare` и работает при
+отключённой симуляции. Warfare-квест использует `WarfareCapture` и требует
+живой симуляции. Смешивать оба режима в одном квесте запрещено: валидатор
+возвращает `BuildError`, поэтому такой сценарий разделяют на два квеста —
+Warfare-квест с `requires_warfare=True` и Story-квест со
+`SpawnSquad(mode="story")`.
 
 **Можно ли использовать DLTX?**
 Нет. Ядро намеренно не генерирует `.dltx`, `.ext` и рантайм-инъекции диалогов.

@@ -19,10 +19,13 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
+import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import ModuleType
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -30,7 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.compiler.builder import BuildError  # noqa: E402
+from src.compiler.builder import BuildError, ModBuilder  # noqa: E402
 from src.compiler.ltx_gen import LtxGenerator  # noqa: E402
 from src.compiler.lua_gen import LuaGenerator  # noqa: E402
 from src.compiler.xml_gen import XmlGenerator  # noqa: E402
@@ -971,6 +974,156 @@ class TestStoryLuaRuntime(unittest.TestCase):
         )
         self.assertIn("if npc and npc.id", give_body)
         self.assertIn("if not giver_id then", give_body)
+
+
+# ---------------------------------------------------------------------------
+# Интеграция: сборка эталонного проекта «Последний ретранслятор»
+# ---------------------------------------------------------------------------
+
+
+class TestStoryRelayIntegration(unittest.TestCase):
+    """Собирает ``examples/build_story_relay.py`` во временную директорию."""
+
+    @staticmethod
+    def _load_example() -> ModuleType:
+        """Загружает эталонный сценарий как отдельный модуль."""
+        path = PROJECT_ROOT / "examples" / "build_story_relay.py"
+        spec = importlib.util.spec_from_file_location(
+            "build_story_relay_example", path
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Не удалось загрузить {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _function_body(script: str, header: str, next_header: str) -> str:
+        """Возвращает тело функции от ``header`` до ``next_header``."""
+        start = script.index(header)
+        end = script.index(next_header, start + len(header))
+        return script[start:end]
+
+    @staticmethod
+    def _write_fake_vanilla(root: Path) -> None:
+        """Создаёт минимальное fake-дерево ванильной игры для сборщика."""
+        configs = root / "configs"
+        gameplay = configs / "gameplay"
+        gameplay.mkdir(parents=True)
+        (configs / "system.ltx").write_text(
+            "[dialogs]\n"
+            "files = dialogs, dialogs_zaton\n"
+            "\n"
+            "[profiles]\n"
+            "specific_characters_files = character_desc_general, "
+            "character_desc_zaton\n",
+            encoding="cp1251",
+        )
+        (gameplay / "character_desc_zaton.xml").write_text(
+            '<?xml version="1.0" encoding="windows-1251"?>\n'
+            "<specific_characters>\n"
+            '    <specific_character id="zat_a2_stalker_barmen">\n'
+            "        <name>Борода</name>\n"
+            "    </specific_character>\n"
+            "</specific_characters>\n",
+            encoding="cp1251",
+        )
+
+    def test_example_builds_all_story_artifacts(self) -> None:
+        """Валидация, сборка и проверка всех семи артефактов Story-проекта."""
+        module = self._load_example()
+        project = module.build_project()
+
+        self.assertEqual(
+            (project.model_extra or {}).get("mod_slug"), "last_relay"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vanilla = root / "vanilla"
+            self._write_fake_vanilla(vanilla)
+
+            self.assertTrue(
+                ProjectValidator(_DummyDatabase()).validate_project(project),
+                "Эталонный Story-проект не прошёл валидацию.",
+            )
+
+            builder = ModBuilder(
+                output_dir=root / "output",
+                vanilla_root=vanilla,
+            )
+            self.assertTrue(
+                builder.build_project(project),
+                "Сборка эталонного Story-проекта не удалась.",
+            )
+
+            mod_root = root / "output" / "last_relay"
+            gamedata = mod_root / "gamedata"
+            expected_files = [
+                "configs/misc/task/tm_last_relay.ltx",
+                "configs/misc/squad_descr/squad_descr_last_relay.ltx",
+                "configs/gameplay/dialogs_last_relay.xml",
+                "configs/gameplay/character_desc_zaton.xml",
+                "configs/text/rus/st_last_relay.xml",
+                "configs/text/eng/st_last_relay.xml",
+                "scripts/last_relay_quests.script",
+            ]
+            for relative in expected_files:
+                self.assertTrue(
+                    (gamedata / relative).is_file(),
+                    f"Не найден артефакт: {relative}",
+                )
+
+            squad_ltx = (
+                gamedata
+                / "configs"
+                / "misc"
+                / "squad_descr"
+                / "squad_descr_last_relay.ltx"
+            ).read_text(encoding="cp1251")
+            self.assertIn(
+                "on_death = %+mymod_relay_merc_dead%", squad_ltx
+            )
+            self.assertEqual(
+                squad_ltx.count("on_death ="), 1
+            )
+
+            lua = (
+                gamedata / "scripts" / "last_relay_quests.script"
+            ).read_text(encoding="cp1251")
+            # Общий Warfare-хелпер остаётся в шаблоне для обратной
+            # совместимости, но Story-путь не должен к нему обращаться.
+            warfare_helper = self._function_body(
+                lua,
+                "local function spawn_task_squad",
+                "local function freeze_squad",
+            )
+            self.assertIn("sim_squad_warfare", warfare_helper)
+            story_path = "\n".join(
+                line
+                for line in lua.replace(warfare_helper, "").splitlines()
+                if not line.lstrip().startswith("--")
+            )
+            self.assertNotIn("sim_squad_warfare", story_path)
+            self.assertIn('kind = "spawn_story_squad"', lua)
+            self.assertNotIn('kind = "spawn_squad"', lua)
+            self.assertNotIn('kind = "set_target"', lua)
+
+            profile_xml = (
+                gamedata / "configs" / "gameplay" / "character_desc_zaton.xml"
+            )
+            tree = ET.parse(profile_xml)
+            profiles = tree.getroot().findall("specific_character")
+            self.assertEqual(len(profiles), 1)
+            self.assertEqual(
+                profiles[0].get("id"), "zat_a2_stalker_barmen"
+            )
+            actor_dialogs = [
+                element.text
+                for element in profiles[0].findall("actor_dialog")
+            ]
+            self.assertIn("mymod_relay_take", actor_dialogs)
+            self.assertIn("mymod_relay_report", actor_dialogs)
 
 
 if __name__ == "__main__":
