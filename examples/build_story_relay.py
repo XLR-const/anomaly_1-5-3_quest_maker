@@ -1,18 +1,28 @@
 """«Последний ретранслятор» — эталонный Story-проект Anomaly 1.5.3.
 
-Сценарий собран по публичному контракту ``docs/API_v2.md`` и повторяет
-ванильный паттерн сюжетной цепочки:
+Сценарий демонстрирует **все** новые механики Фазы 2 на примере настоящей
+сюжетной цепочки из двух многоэтапных квестов:
 
-1. Борода на Затоне выдаёт Q1 ``mymod_relay_01_silence``.
-2. ``on_init`` Q1 спавнит Story-отряд ``mymod_relay_merc_squad`` на
-   ``zat_stalker_base_smart``. Отряд идёт к ``zat_b52`` по ``target_smart``
-   из своей секции, без вызовов ``sim_squad_warfare``.
-3. Смерть последнего NPC отряда выдаёт поршень
-   ``mymod_relay_merc_dead`` (``CustomSquad.death_infos``).
-4. ``condlist_1`` завершает Q1, ``on_complete`` выдаёт Q2 через ``GiveTask``.
-5. Q2 ``mymod_relay_02_report`` завершается поршнем
-   ``mymod_relay_reported`` из диалога; награда — 12 000 рублей и
-   ``wpn_val_modern_kobra``.
+1. Борода на Затоне выдаёт Q1 ``mymod_relay_01_silence``. Диалог выдачи
+   содержит выбор «согласиться / отказаться»; отказ не выдаёт задачу.
+2. Q1 стартует этап 0: Story-отряд ``mymod_relay_merc_squad`` спавнится на
+   Шевченко (``zat_b7``), вдали от Скадовска, и идёт к Портовым кранам
+   (``zat_b52``) через ``target_smart`` своей секции. Никаких вызовов
+   ``sim_squad_warfare``.
+3. Смерть последнего NPC отряда выдаёт поршень ``mymod_relay_merc_dead``
+   (``CustomSquad.death_infos``). ``transfer_conditions`` переключает Q1 на
+   этап 1, а ``target_variants`` переносит маркер на Бороду.
+4. Q1 завершается только в диалоге сдачи ``mymod_relay_01_turnin``
+   (``CompleteTask``): награда — 5 000 ₽ и поршень ``mymod_relay_01_done``.
+5. После Q1 открывается Q2 ``mymod_relay_02_decryptor``. Диалог выдачи —
+   снова с выбором; этап 0 спавнит охрану ``mymod_relay_guard_squad`` на
+   Земснаряде (``zat_b14_smart_terrain``) и требует добыть
+   ``itm_pda_common``.
+6. ``descr_variants`` обновляет текст этапа 0, когда охрана убита, но ПДА
+   ещё не поднят. Переход на этап 1 — по ``HasItem``.
+7. Q2 завершается в диалоге сдачи: ветка ``HasItem`` изымает ПДА и вызывает
+   ``CompleteTask``; ``_reward`` выдаёт 12 000 ₽ и ВСС «Винторез»
+   (``wpn_vintorez``).
 
 Новые ``character_desc_*.xml`` не создаются: патчится только ванильный
 профиль ``zat_a2_stalker_barmen`` в ``character_desc_zaton.xml``.
@@ -35,19 +45,23 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from src.compiler.builder import ModBuilder
 from src.core.models import (
+    CompleteTask,
     CustomSquad,
+    DescrVariant,
     Dialog,
     DontHasInfo,
     GiveInfo,
     GiveTask,
     HasInfo,
+    HasItem,
     ModProject,
     Phrase,
     Quest,
-    QuestCondlist,
+    RemoveItem,
     RemoveSquad,
     SpawnSquad,
     Stage,
+    TargetVariant,
 )
 
 # ---------------------------------------------------------------------------
@@ -64,25 +78,32 @@ NPC_ALIAS = "zaton.barman"
 
 # Сюжетная цепочка.
 Q1 = "mymod_relay_01_silence"
-Q2 = "mymod_relay_02_report"
-SQUAD = "mymod_relay_merc_squad"
+Q2 = "mymod_relay_02_decryptor"
+
+# Story-отряды.
+SQUAD_MERC = "mymod_relay_merc_squad"
+SQUAD_GUARD = "mymod_relay_guard_squad"
 
 # Инфопоршни (стандарт: <mod_slug>_<chapter>_<quest>_<role>).
-INFO_TAKEN = "mymod_relay_01_taken"
+INFO_Q1_TAKEN = "mymod_relay_01_taken"
 INFO_MERC_DEAD = "mymod_relay_merc_dead"
 INFO_Q1_DONE = "mymod_relay_01_done"
-INFO_REPORTED = "mymod_relay_reported"
-INFO_DONE = "mymod_relay_done"
+INFO_Q2_TAKEN = "mymod_relay_02_taken"
+INFO_GUARD_DEAD = "mymod_relay_guard_dead"
+INFO_Q2_DONE = "mymod_relay_02_done"
 
-# Смарт спавна отряда и точка назначения из его секции.
-SPAWN_SMART = "zat_stalker_base_smart"
-TARGET_SMART = "zat_b52"
+# Смарты Затона (проверены по локальной БД).
+# zat_b7 — Шевченко, zat_b52 — Портовые краны,
+# zat_b14_smart_terrain — Земснаряд.
+Q1_SPAWN_SMART = "zat_b7"
+Q1_TARGET_SMART = "zat_b52"
+Q2_SMART = "zat_b14_smart_terrain"
 
-# Награды.
+# Квестовый предмет и награды.
+DECRYPTOR_ITEM = "itm_pda_common"
 Q1_REWARD_MONEY = 5000
 Q2_REWARD_MONEY = 12000
-Q2_REWARD_ITEM = "wpn_val_modern_kobra"
-
+Q2_REWARD_ITEM = "wpn_vintorez"
 
 # ---------------------------------------------------------------------------
 # Q1: «Последний ретранслятор» — уничтожить группу у ретранслятора
@@ -90,14 +111,14 @@ Q2_REWARD_ITEM = "wpn_val_modern_kobra"
 
 
 def create_first_quest() -> Quest:
-    """Собирает Q1: спавн Story-отряда и завершение по его смерти."""
+    """Собирает Q1: Story-спавн, смерть отряда и возврат к Бороде."""
     return Quest(
         id=Q1,
         npc_id=NPC_ID,
         giver_npc_id=NPC_ID,
         npc_location=NPC_LOCATION,
-        dialog_id="mymod_relay_take",
-        dialog_ids=["mymod_relay_take"],
+        dialog_id="mymod_relay_01_take",
+        dialog_ids=["mymod_relay_01_take", "mymod_relay_01_turnin"],
         title_ru="Последний ретранслятор",
         title_en="The Last Relay",
         descr_ru=(
@@ -125,80 +146,148 @@ def create_first_quest() -> Quest:
                     "Eliminate them."
                 ),
                 # Маркер держится на story id отряда после его спавна.
-                target_squad_id=SQUAD,
+                target_squad_id=SQUAD_MERC,
+                # Story-вариативность: как только отряд уничтожен, маркер
+                # переносится на Бороду, к которому нужно вернуться.
+                target_variants=[
+                    TargetVariant(
+                        when=[HasInfo(info=INFO_MERC_DEAD)],
+                        value=NPC_ID,
+                    ),
+                ],
+            ),
+            1: Stage(
+                id=1,
+                title_ru="Вернуться к Бороде за наградой",
+                title_en="Return to the barman for the reward",
+                descr_ru=(
+                    "Ретранслятор чист. Вернитесь на Скадовск к Бороде."
+                ),
+                descr_en=(
+                    "The relay is clear. Return to the barman at Skadovsk."
+                ),
+                target_alias=NPC_ID,
             ),
         },
         # Story-спавн: create_squad без set_target/stay_time/force_online.
         on_init_actions=[
             SpawnSquad(
-                squad_alias=SQUAD,
-                smart_alias=SPAWN_SMART,
+                squad_alias=SQUAD_MERC,
+                smart_alias=Q1_SPAWN_SMART,
                 mode="story",
             ),
         ],
-        # Ванильный паттерн: on_death -> info -> condlist -> complete.
-        extra_condlists=[
-            QuestCondlist(
-                when=[HasInfo(info=INFO_MERC_DEAD)],
-                result="complete",
-            ),
-        ],
+        # Явный переход этапа 0 -> 1 по поршню смерти отряда.
+        transfer_conditions={
+            0: {"complete": [HasInfo(info=INFO_MERC_DEAD)]},
+        },
         fail_on_giver_death=True,
-        taken_info=INFO_TAKEN,
+        taken_info=INFO_Q1_TAKEN,
         complete_info=INFO_Q1_DONE,
-        # Иначе старый поршень смерти сразу завершит повторное взятие.
+        # Иначе старый поршень смерти сразу переведёт повторное взятие.
         cleanup_infos=[INFO_MERC_DEAD],
-        on_complete_actions=[
-            GiveTask(task_id=Q2),
-        ],
         # При провале/отмене Story-отряд не должен остаться в мире.
         on_fail_actions=[
-            RemoveSquad(squad_alias=SQUAD),
+            RemoveSquad(squad_alias=SQUAD_MERC),
         ],
         reward_money=Q1_REWARD_MONEY,
     )
 
 
 # ---------------------------------------------------------------------------
-# Q2: «Последний ретранслятор: отчёт» — вернуться и доложить
+# Q2: «Шифратор связного» — найти ПДА и вернуть его Бороде
 # ---------------------------------------------------------------------------
 
 
 def create_second_quest() -> Quest:
-    """Собирает Q2: доклад Бороде, завершение поршнем из диалога."""
+    """Собирает Q2: охрана на Земснаряде, предмет и доклад Бороде."""
     return Quest(
         id=Q2,
         npc_id=NPC_ID,
         giver_npc_id=NPC_ID,
         npc_location=NPC_LOCATION,
-        dialog_id="mymod_relay_report",
-        dialog_ids=["mymod_relay_report"],
-        title_ru="Последний ретранслятор: отчёт",
-        title_en="The Last Relay: Report",
-        descr_ru="Вернитесь к Бороде и доложите о зачистке.",
-        descr_en="Return to the barman and report the cleanup.",
+        dialog_id="mymod_relay_02_take",
+        dialog_ids=["mymod_relay_02_take", "mymod_relay_02_turnin"],
+        title_ru="Шифратор связного",
+        title_en="The Courier's Decryptor",
+        descr_ru=(
+            "Связной наёмников ушёл к Земснаряду с шифратором. "
+            "Найдите ПДА и верните его Бороде."
+        ),
+        descr_en=(
+            "The mercenary courier went to the dredge with the decryptor. "
+            "Find the PDA and bring it to the barman."
+        ),
         is_storyline=True,
         icon="ui_inGame2_Put_v_pripyat",
         prior=60,
         stages={
             0: Stage(
                 id=0,
-                title_ru="Доложить Бороде",
-                title_en="Report to the barman",
-                descr_ru="Ретранслятор чист. Поговорите с Бородой.",
-                descr_en="The relay is clear. Talk to the barman.",
+                title_ru="Найти шифратор на Земснаряде",
+                title_en="Find the decryptor at the dredge",
+                descr_ru=(
+                    "Охрана связного укрепилась на Земснаряде. "
+                    "Обыщите точку и заберите ПДА с шифратором."
+                ),
+                descr_en=(
+                    "The courier's guards dug in at the dredge. "
+                    "Search the site and take the PDA with the decryptor."
+                ),
+                # Text-вариативность: охрана убита, но ПДА ещё не поднят.
+                descr_variants=[
+                    DescrVariant(
+                        when=[HasInfo(info=INFO_GUARD_DEAD)],
+                        text_ru=(
+                            "Охрана мертва. Обыщите Земснаряд и заберите "
+                            "ПДА с шифратором."
+                        ),
+                        text_en=(
+                            "The guards are dead. Search the dredge and take "
+                            "the PDA with the decryptor."
+                        ),
+                    ),
+                ],
+                target_alias=Q2_SMART,
+                # Этап сам спавнит охрану ровно один раз при входе.
+                on_start_actions=[
+                    SpawnSquad(
+                        squad_alias=SQUAD_GUARD,
+                        smart_alias=Q2_SMART,
+                        mode="story",
+                    ),
+                ],
+            ),
+            1: Stage(
+                id=1,
+                title_ru="Доставить шифратор Бороде",
+                title_en="Deliver the decryptor to the barman",
+                descr_ru=(
+                    "Шифратор у вас. Вернитесь на Скадовск и отдайте его "
+                    "Бороде."
+                ),
+                descr_en=(
+                    "You have the decryptor. Return to Skadovsk and hand it "
+                    "to the barman."
+                ),
                 target_alias=NPC_ID,
             ),
         },
-        extra_condlists=[
-            QuestCondlist(
-                when=[HasInfo(info=INFO_REPORTED)],
-                result="complete",
-            ),
-        ],
+        # Переход этапа 0 -> 1 только когда ПДА реально в инвентаре.
+        transfer_conditions={
+            0: {
+                "complete": [
+                    HasItem(item_alias=DECRYPTOR_ITEM, count=1),
+                ],
+            },
+        },
         fail_on_giver_death=True,
-        complete_info=INFO_DONE,
-        cleanup_infos=[INFO_REPORTED],
+        taken_info=INFO_Q2_TAKEN,
+        complete_info=INFO_Q2_DONE,
+        cleanup_infos=[INFO_GUARD_DEAD],
+        on_fail_actions=[
+            RemoveSquad(squad_alias=SQUAD_GUARD),
+        ],
         reward_money=Q2_REWARD_MONEY,
         reward_item_alias=Q2_REWARD_ITEM,
         reward_item_count=1,
@@ -211,15 +300,15 @@ def create_second_quest() -> Quest:
 
 
 def create_dialogs() -> list[Dialog]:
-    """Возвращает диалоги выдачи Q1 и сдачи Q2."""
-    take_dialog = Dialog(
-        id="mymod_relay_take",
+    """Возвращает диалоги выдачи и сдачи обоих квестов."""
+    first_take = Dialog(
+        id="mymod_relay_01_take",
         npc_alias=NPC_ALIAS,
         npc_id=NPC_ID,
         npc_location=NPC_LOCATION,
         task_id=Q1,
         role="take",
-        preconditions=[DontHasInfo(info=INFO_TAKEN)],
+        preconditions=[DontHasInfo(info=INFO_Q1_TAKEN)],
         phrases={
             0: Phrase(
                 id=0,
@@ -230,48 +319,194 @@ def create_dialogs() -> list[Dialog]:
             1: Phrase(
                 id=1,
                 text_ru=(
-                    "Слышал. Наёмники заняли его и глушат связь. Убери их."
+                    "Слышал. Наёмники заняли его и глушат связь. "
+                    "Возьмёшься?"
                 ),
                 text_en=(
-                    "I have. Mercs took it and jam the signal. Take them out."
+                    "I have. Mercs took it and jam the signal. "
+                    "Will you take the job?"
                 ),
+                next_phrases=[2, 4],
+            ),
+            2: Phrase(
+                id=2,
+                text_ru="Берусь. Где их искать?",
+                text_en="I'm in. Where do I find them?",
                 actions=[
-                    GiveInfo(info=INFO_TAKEN),
+                    GiveInfo(info=INFO_Q1_TAKEN),
                     GiveTask(task_id=Q1),
                 ],
+                next_phrases=[3],
+            ),
+            3: Phrase(
+                id=3,
+                text_ru=(
+                    "На Шевченко. Убери их и возвращайся на Скадовск "
+                    "за наградой."
+                ),
+                text_en=(
+                    "At Shevchenko. Take them out and come back to Skadovsk "
+                    "for your reward."
+                ),
+            ),
+            4: Phrase(
+                id=4,
+                text_ru="Не сейчас.",
+                text_en="Not now.",
+                next_phrases=[5],
+            ),
+            5: Phrase(
+                id=5,
+                text_ru="Как надумаешь — заходи.",
+                text_en="Come back when you make up your mind.",
             ),
         },
     )
 
-    report_dialog = Dialog(
-        id="mymod_relay_report",
+    first_turnin = Dialog(
+        id="mymod_relay_01_turnin",
+        npc_alias=NPC_ALIAS,
+        npc_id=NPC_ID,
+        npc_location=NPC_LOCATION,
+        task_id=Q1,
+        role="turnin",
+        preconditions=[
+            HasInfo(info=INFO_MERC_DEAD),
+            DontHasInfo(info=INFO_Q1_DONE),
+        ],
+        phrases={
+            0: Phrase(
+                id=0,
+                text_ru="Борода, ретранслятор чист.",
+                text_en="Barman, the relay is clear.",
+                next_phrases=[1],
+            ),
+            1: Phrase(
+                id=1,
+                text_ru="Хорошая работа. Держи свои пять тысяч.",
+                text_en="Good work. Here are your five thousand.",
+                next_phrases=[2],
+            ),
+            2: Phrase(
+                id=2,
+                text_ru="Было дело.",
+                text_en="It was a job.",
+                actions=[CompleteTask(task_id=Q1)],
+            ),
+        },
+    )
+
+    second_take = Dialog(
+        id="mymod_relay_02_take",
+        npc_alias=NPC_ALIAS,
+        npc_id=NPC_ID,
+        npc_location=NPC_LOCATION,
+        task_id=Q2,
+        role="take",
+        preconditions=[
+            HasInfo(info=INFO_Q1_DONE),
+            DontHasInfo(info=INFO_Q2_TAKEN),
+        ],
+        phrases={
+            0: Phrase(
+                id=0,
+                text_ru="Борода, есть ещё работа?",
+                text_en="Barman, got more work?",
+                next_phrases=[1],
+            ),
+            1: Phrase(
+                id=1,
+                text_ru=(
+                    "Раз уж ты вернулся — у тех наёмников связной ушёл "
+                    "к Земснаряду с шифратором. Возьмёшься довести дело "
+                    "до конца?"
+                ),
+                text_en=(
+                    "Since you're back — the mercs' courier went to the "
+                    "dredge with a decryptor. Will you finish the job?"
+                ),
+                next_phrases=[2, 4],
+            ),
+            2: Phrase(
+                id=2,
+                text_ru="Возьмусь.",
+                text_en="I'll take it.",
+                actions=[
+                    GiveInfo(info=INFO_Q2_TAKEN),
+                    GiveTask(task_id=Q2),
+                ],
+                next_phrases=[3],
+            ),
+            3: Phrase(
+                id=3,
+                text_ru=(
+                    "Охрана у Земснаряда. Принеси шифратор, и я хорошо "
+                    "заплачу."
+                ),
+                text_en=(
+                    "The guards are at the dredge. Bring me the decryptor "
+                    "and I'll pay well."
+                ),
+            ),
+            4: Phrase(
+                id=4,
+                text_ru="Не сейчас.",
+                text_en="Not now.",
+                next_phrases=[5],
+            ),
+            5: Phrase(
+                id=5,
+                text_ru="Тогда заходи позже.",
+                text_en="Then come back later.",
+            ),
+        },
+    )
+
+    second_turnin = Dialog(
+        id="mymod_relay_02_turnin",
         npc_alias=NPC_ALIAS,
         npc_id=NPC_ID,
         npc_location=NPC_LOCATION,
         task_id=Q2,
         role="turnin",
         preconditions=[
-            HasInfo(info=INFO_Q1_DONE),
-            DontHasInfo(info=INFO_DONE),
+            HasInfo(info=INFO_Q2_TAKEN),
+            DontHasInfo(info=INFO_Q2_DONE),
         ],
         phrases={
             0: Phrase(
                 id=0,
-                text_ru="Ретранслятор чист.",
-                text_en="The relay is clear.",
+                text_ru="Борода, насчёт шифратора...",
+                text_en="Barman, about that decryptor...",
                 next_phrases=[1],
             ),
             1: Phrase(
                 id=1,
-                text_ru="Хорошая работа. Держи свою плату.",
-                text_en="Good work. Here is your payment.",
-                # Завершает не CompleteTask, а condlist по этому поршню.
-                actions=[GiveInfo(info=INFO_REPORTED)],
+                text_ru="Принёс?",
+                text_en="Did you bring it?",
+                next_phrases=[2, 3],
+            ),
+            2: Phrase(
+                id=2,
+                text_ru="Вот он.",
+                text_en="Here it is.",
+                preconditions=[
+                    HasItem(item_alias=DECRYPTOR_ITEM, count=1),
+                ],
+                actions=[
+                    RemoveItem(item_alias=DECRYPTOR_ITEM, count=1),
+                    CompleteTask(task_id=Q2),
+                ],
+            ),
+            3: Phrase(
+                id=3,
+                text_ru="Ещё ищу. Охрана у Земснаряда.",
+                text_en="Still looking. The guards are at the dredge.",
             ),
         },
     )
 
-    return [take_dialog, report_dialog]
+    return [first_take, first_turnin, second_take, second_turnin]
 
 
 # ---------------------------------------------------------------------------
@@ -296,17 +531,29 @@ def build_project() -> ModProject:
         },
         dialogs={dialog.id: dialog for dialog in dialogs},
         squads={
-            SQUAD: CustomSquad(
-                id=SQUAD,
+            SQUAD_MERC: CustomSquad(
+                id=SQUAD_MERC,
                 faction="killer",
                 npc=[
                     "sim_default_killer_1",
                     "sim_default_killer_2",
                     "sim_default_killer_3",
                 ],
-                target_smart=TARGET_SMART,
-                story_id=SQUAD,
+                target_smart=Q1_TARGET_SMART,
+                story_id=SQUAD_MERC,
                 death_infos=[INFO_MERC_DEAD],
+                relationship="enemy",
+            ),
+            SQUAD_GUARD: CustomSquad(
+                id=SQUAD_GUARD,
+                faction="killer",
+                npc=[
+                    "sim_default_killer_2",
+                    "sim_default_killer_4",
+                ],
+                target_smart=Q2_SMART,
+                story_id=SQUAD_GUARD,
+                death_infos=[INFO_GUARD_DEAD],
                 relationship="enemy",
             ),
         },

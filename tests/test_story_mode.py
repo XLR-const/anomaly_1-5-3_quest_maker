@@ -1030,13 +1030,57 @@ class TestStoryRelayIntegration(unittest.TestCase):
         )
 
     def test_example_builds_all_story_artifacts(self) -> None:
-        """Валидация, сборка и проверка всех семи артефактов Story-проекта."""
+        """Валидация, сборка и проверка двухэтапной Story-цепочки."""
         module = self._load_example()
         project = module.build_project()
 
         self.assertEqual(
             (project.model_extra or {}).get("mod_slug"), "last_relay"
         )
+        self.assertEqual(
+            set(project.quests),
+            {"mymod_relay_01_silence", "mymod_relay_02_decryptor"},
+        )
+
+        first = project.quests["mymod_relay_01_silence"]
+        second = project.quests["mymod_relay_02_decryptor"]
+
+        # Оба квеста — настоящие многоэтапные звенья цепочки.
+        self.assertEqual(len(first.stages), 2)
+        self.assertEqual(len(second.stages), 2)
+        self.assertEqual(first.stages[0].target_squad_id,
+                         "mymod_relay_merc_squad")
+        self.assertEqual(len(first.stages[0].target_variants), 1)
+        self.assertEqual(
+            first.stages[0].target_variants[0].value,
+            "zat_a2_stalker_barmen",
+        )
+        self.assertEqual(len(second.stages[0].descr_variants), 1)
+        self.assertIsInstance(
+            first.transfer_conditions[0]["complete"][0], HasInfo
+        )
+        self.assertIsInstance(
+            second.transfer_conditions[0]["complete"][0], HasItem
+        )
+        self.assertEqual(first.cleanup_infos, ["mymod_relay_merc_dead"])
+        self.assertEqual(second.cleanup_infos, ["mymod_relay_guard_dead"])
+        self.assertEqual(first.reward_money, 5000)
+        self.assertEqual(second.reward_money, 12000)
+        self.assertEqual(second.reward_item_alias, "wpn_vintorez")
+
+        # Два Story-отряда, у каждого — свой on_death.
+        self.assertEqual(len(project.squads), 2)
+        self.assertEqual(
+            project.squads["mymod_relay_merc_squad"].death_infos,
+            ["mymod_relay_merc_dead"],
+        )
+        self.assertEqual(
+            project.squads["mymod_relay_guard_squad"].death_infos,
+            ["mymod_relay_guard_dead"],
+        )
+        for squad in project.squads.values():
+            self.assertEqual(squad.relationship, "enemy")
+            self.assertEqual(squad.story_id, squad.id)
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1081,16 +1125,36 @@ class TestStoryRelayIntegration(unittest.TestCase):
                 / "squad_descr"
                 / "squad_descr_last_relay.ltx"
             ).read_text(encoding="cp1251")
+            self.assertEqual(squad_ltx.count("on_death ="), 2)
             self.assertIn(
                 "on_death = %+mymod_relay_merc_dead%", squad_ltx
             )
-            self.assertEqual(
-                squad_ltx.count("on_death ="), 1
+            self.assertIn(
+                "on_death = %+mymod_relay_guard_dead%", squad_ltx
             )
+            self.assertIn("target_smart = zat_b52", squad_ltx)
+            self.assertIn(
+                "target_smart = zat_b14_smart_terrain", squad_ltx
+            )
+            # Спавн не должен происходить на Скадовске.
+            self.assertNotIn("zat_stalker_base_smart", squad_ltx)
 
             lua = (
                 gamedata / "scripts" / "last_relay_quests.script"
             ).read_text(encoding="cp1251")
+            # Story-спавн вызывается ровно для двух отрядов.
+            self.assertEqual(lua.count('kind = "spawn_story_squad"'), 2)
+            self.assertNotIn('kind = "spawn_squad"', lua)
+            self.assertNotIn('kind = "set_target"', lua)
+
+            # Story-функция спавна не обращается к Warfare-симуляции.
+            story_spawn = self._function_body(
+                lua,
+                "local function spawn_story_squad",
+                "local function remove_story_squad",
+            )
+            self.assertNotIn("sim_squad_warfare", story_spawn)
+
             # Общий Warfare-хелпер остаётся в шаблоне для обратной
             # совместимости, но Story-путь не должен к нему обращаться.
             warfare_helper = self._function_body(
@@ -1105,9 +1169,83 @@ class TestStoryRelayIntegration(unittest.TestCase):
                 if not line.lstrip().startswith("--")
             )
             self.assertNotIn("sim_squad_warfare", story_path)
-            self.assertIn('kind = "spawn_story_squad"', lua)
-            self.assertNotIn('kind = "spawn_squad"', lua)
-            self.assertNotIn('kind = "set_target"', lua)
+
+            # Story-вариативность цели и описания попала в Lua.
+            self.assertIn("target_variants = {", lua)
+            self.assertIn("descr_variants = {", lua)
+            self.assertIn(
+                'key = "mymod_relay_02_decryptor_stage_0_descr_v1"',
+                lua,
+            )
+            self.assertIn('item = "itm_pda_common"', lua)
+            self.assertIn("mymod_relay_guard_dead", lua)
+
+            strings_ru = (
+                gamedata / "configs" / "text" / "rus" / "st_last_relay.xml"
+            ).read_text(encoding="cp1251")
+            self.assertIn(
+                'id="mymod_relay_02_decryptor_stage_0_descr_v1"',
+                strings_ru,
+            )
+            self.assertIn(
+                'id="mymod_relay_01_silence_stage_1_descr"',
+                strings_ru,
+            )
+
+            dialogs_root = ET.parse(
+                gamedata
+                / "configs"
+                / "gameplay"
+                / "dialogs_last_relay.xml"
+            ).getroot()
+            dialogs_by_id = {
+                dialog.get("id"): dialog
+                for dialog in dialogs_root.findall("dialog")
+            }
+            self.assertEqual(
+                set(dialogs_by_id),
+                {
+                    "mymod_relay_01_take",
+                    "mymod_relay_01_turnin",
+                    "mymod_relay_02_take",
+                    "mymod_relay_02_turnin",
+                },
+            )
+
+            # Разветвление «согласие / отказ»: у обоих диалогов выдачи
+            # есть как минимум две ветки игрока (чётные ID 2 и 4).
+            for take_id in ("mymod_relay_01_take", "mymod_relay_02_take"):
+                take_phrases = {
+                    phrase.get("id")
+                    for phrase in dialogs_by_id[take_id].findall(
+                        "./phrase_list/phrase"
+                    )
+                }
+                self.assertTrue({"0", "1", "2", "4"} <= take_phrases)
+
+            second_take = dialogs_by_id["mymod_relay_02_take"]
+            self.assertEqual(second_take.findtext("has_info"),
+                             "mymod_relay_01_done")
+            self.assertEqual(second_take.findtext("dont_has_info"),
+                             "mymod_relay_02_taken")
+
+            # Ветка сдачи Q2 проверяет ПДА в Phrase.preconditions,
+            # а альтернативная реплика остаётся доступной.
+            turnin_phrases = {
+                phrase.get("id"): phrase
+                for phrase in dialogs_by_id["mymod_relay_02_turnin"].findall(
+                    "./phrase_list/phrase"
+                )
+            }
+            self.assertIn("3", turnin_phrases)
+            self.assertEqual(
+                turnin_phrases["2"].findtext("precondition"),
+                "dialogs.mymod_relay_02_turnin_phrase_2_precondition",
+            )
+            self.assertEqual(
+                turnin_phrases["2"].findtext("action"),
+                "dialogs.mymod_relay_02_turnin_phrase_2_action",
+            )
 
             profile_xml = (
                 gamedata / "configs" / "gameplay" / "character_desc_zaton.xml"
@@ -1122,8 +1260,8 @@ class TestStoryRelayIntegration(unittest.TestCase):
                 element.text
                 for element in profiles[0].findall("actor_dialog")
             ]
-            self.assertIn("mymod_relay_take", actor_dialogs)
-            self.assertIn("mymod_relay_report", actor_dialogs)
+            for dialog_id in dialogs_by_id:
+                self.assertIn(dialog_id, actor_dialogs)
 
 
 if __name__ == "__main__":
