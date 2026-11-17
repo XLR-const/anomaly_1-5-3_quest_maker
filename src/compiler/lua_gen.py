@@ -34,6 +34,7 @@ from src.core.models import (
     RemoveSquad,
     SetTarget,
     SmartOwner,
+    SpawnNpcItem,
     SpawnSquad,
     TakeItem,
     TakeMoney,
@@ -663,7 +664,7 @@ local function eval_conditions(list, actor)
 	return true
 end
 
-__STORY_HELPERS__-- Executes a list of serialized action specs in order.
+__NPC_ITEM_HELPERS____STORY_HELPERS__-- Executes a list of serialized action specs in order.
 local function run_actions(actions, actor, npc, quest_id__STORY_RUN_ARGS__)
 	if not actions then return end
 	for _, spec in ipairs(actions) do
@@ -689,7 +690,7 @@ local function run_actions(actions, actor, npc, quest_id__STORY_RUN_ARGS__)
 			give_task(spec.task, actor, npc)
 		elseif kind == "complete_task" then
 			complete_task(spec.task)
-__STORY_ACTION_BRANCHES__		end
+__NPC_ITEM_ACTION_BRANCH____STORY_ACTION_BRANCHES__		end
 	end
 end
 """
@@ -766,7 +767,10 @@ class LuaGenerator:
 
         blocks.append(self._build_quests_table(quest_data))
         needs_story = self._project_uses_story(quests, dialogs)
-        blocks.append(self._build_helpers(module_name, needs_story))
+        needs_npc_item = self._project_uses_npc_item(quests, dialogs)
+        blocks.append(
+            self._build_helpers(module_name, needs_story, needs_npc_item)
+        )
 
         for quest_id, data in quest_data.items():
             quest = quests[quest_id]
@@ -891,6 +895,53 @@ class LuaGenerator:
             for phrase in (getattr(dialog, "phrases", None) or {}).values():
                 actions = getattr(phrase, "actions", None) or []
                 if any(cls._action_uses_story(action) for action in actions):
+                    return True
+        return False
+
+    @staticmethod
+    def _action_uses_npc_item(action: Any) -> bool:
+        """True, если действие — :class:`SpawnNpcItem`.
+
+        Args:
+            action (Any): Действие модели.
+
+        Returns:
+            bool: Действие спавнит предмет в инвентарь NPC.
+        """
+        return isinstance(action, SpawnNpcItem)
+
+    @classmethod
+    def _project_uses_npc_item(
+        cls, quests: dict[str, Any], dialogs: dict[str, Any]
+    ) -> bool:
+        """Проверяет, нужен ли проекту хелпер ``spawn_npc_item``.
+
+        Учитываются действия квестов (init/start/reward/fail) и действия
+        реплик диалогов. Если ``SpawnNpcItem`` не используется, хелпер не
+        вставляется и вывод остаётся байт-идентичным прежнему.
+
+        Args:
+            quests (dict[str, Any]): Карта квестов проекта.
+            dialogs (dict[str, Any]): Карта диалогов проекта.
+
+        Returns:
+            bool: True, если найдено хотя бы одно ``SpawnNpcItem``.
+        """
+        for quest in quests.values():
+            action_lists = [
+                getattr(quest, "on_init_actions", None) or [],
+                getattr(quest, "on_complete_actions", None) or [],
+                getattr(quest, "on_fail_actions", None) or [],
+            ]
+            for stage in (getattr(quest, "stages", None) or {}).values():
+                action_lists.append(getattr(stage, "on_start_actions", None) or [])
+            for actions in action_lists:
+                if any(cls._action_uses_npc_item(action) for action in actions):
+                    return True
+        for dialog in dialogs.values():
+            for phrase in (getattr(dialog, "phrases", None) or {}).values():
+                actions = getattr(phrase, "actions", None) or []
+                if any(cls._action_uses_npc_item(action) for action in actions):
                     return True
         return False
 
@@ -1067,6 +1118,13 @@ class LuaGenerator:
                 "kind": "set_target",
                 "squad": action.squad_alias,
                 "smart": action.smart_alias,
+            }
+        if isinstance(action, SpawnNpcItem):
+            return {
+                "kind": "spawn_npc_item",
+                "item": self._resolve_item_section(action.item_alias),
+                "target": action.target_alias,
+                "count": action.count,
             }
         if isinstance(action, GiveItem):
             return {
@@ -1290,24 +1348,74 @@ class LuaGenerator:
         """
         return "local QUESTS = " + self._to_lua(quest_data, indent=0)
 
-    def _build_helpers(self, script_name: str, needs_story: bool) -> str:
+    def _build_helpers(
+        self,
+        script_name: str,
+        needs_story: bool,
+        needs_npc_item: bool = False,
+    ) -> str:
         """Подставляет имя модуля и константы в шаблон общих хелперов.
 
-        Story-фрагменты вставляются только при ``needs_story``; для
-        Warfare-проектов шаблон остаётся байт-идентичным прежнему.
+        Story- и NPC-item-фрагменты вставляются только при соответствующих
+        флагах; для проектов без них шаблон остаётся байт-идентичным
+        прежнему.
 
         Args:
             script_name (str): Имя модуля для логов.
             needs_story (bool): Проект использует хотя бы одно Story-действие
                 (``SpawnSquad(mode="story")`` или ``RemoveSquad``).
+            needs_npc_item (bool): Проект использует ``SpawnNpcItem``.
 
         Returns:
             str: Lua-код generic-хелперов.
         """
+        npc_item_helpers = ""
+        npc_item_branch = ""
         story_helpers = ""
         story_unmark = ""
         story_branches = ""
         story_run_args = ""
+        if needs_npc_item:
+            npc_item_helpers = (
+                "\n"
+                + r"""-- Spawns an item into an NPC inventory or a squad commander
+-- for later looting; no news_manager notifications are emitted.
+local function spawn_npc_item(section, target_name, count)
+	if not (section and section ~= "" and target_name and target_name ~= "") then
+		return
+	end
+	local obj = resolve_alife_object(target_name)
+	if not obj and get_story_squad then
+		local squad_ok, squad = pcall(function()
+			return get_story_squad(target_name)
+		end)
+		if squad_ok and squad then obj = squad end
+	end
+	if not obj then
+		printe("[__SCRIPT_NAME__] ! cannot resolve NPC/squad [%s] for item [%s]",
+			tostring(target_name), tostring(section))
+		return
+	end
+	if obj.commander_id then
+		local cmd_id = obj:commander_id()
+		if cmd_id and cmd_id ~= 0 then
+			local commander = alife_object(cmd_id)
+			if commander then obj = commander end
+		end
+	end
+	count = tonumber(count) or 1
+	for _ = 1, count do
+		pcall(function()
+			alife_create_item(section, obj)
+		end)
+	end
+end"""
+                + "\n\n"
+            )
+            npc_item_branch = (
+                '\t\telseif kind == "spawn_npc_item" then\n'
+                "\t\t\tspawn_npc_item(spec.item, spec.target, spec.count)\n"
+            )
         if needs_story:
             story_helpers = (
                 "\n"
@@ -1413,6 +1521,8 @@ end"""
             .replace("__PDA_SOUND__", DEFAULT_PDA_SOUND)
             .replace("__STATUS_THROTTLE__", str(DEFAULT_STATUS_THROTTLE_MS))
             .replace("__RETURN_DISTANCE__", str(DEFAULT_RETURN_DISTANCE))
+            .replace("__NPC_ITEM_HELPERS__", npc_item_helpers)
+            .replace("__NPC_ITEM_ACTION_BRANCH__", npc_item_branch)
             .replace("__STORY_UNMARK__", story_unmark)
             .replace("__STORY_HELPERS__", story_helpers)
             .replace("__STORY_ACTION_BRANCHES__", story_branches)

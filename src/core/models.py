@@ -318,6 +318,32 @@ class SetTarget(BaseAction):
     smart_alias: str = Field(description="Алиас смарта-цели.")
 
 
+class SpawnNpcItem(BaseAction):
+    """Заспавнить предмет в инвентарь NPC или командира отряда.
+
+    Используется, когда предмет нужно не выдать игроку, а положить в
+    инвентарь конкретного NPC (или командира Story-отряда), чтобы игрок
+    снял его с трупа. В Lua вызывается ``alife_create_item(section, obj)``
+    без уведомлений ``news_manager``.
+
+    Attributes:
+        item_alias (str): Секция или алиас предмета из БД.
+        target_alias (str): ``story_id`` NPC, числовой server ID или
+            ``id``/``story_id`` отряда :class:`CustomSquad`.
+        count (int): Количество предметов (``>= 1``).
+    """
+
+    type: Literal["spawn_npc_item"] = Field(default="spawn_npc_item")
+    item_alias: str = Field(description="Секция или алиас предмета из БД.")
+    target_alias: str = Field(
+        description=(
+            "story_id NPC, числовой server ID или id/story_id отряда "
+            "CustomSquad, в инвентарь которого кладётся предмет."
+        )
+    )
+    count: int = Field(default=1, ge=1, description="Количество предметов.")
+
+
 class GiveItem(BaseAction):
     """Выдать предмет игроку через ``alife_create_item``.
 
@@ -404,6 +430,7 @@ Action: TypeAlias = Annotated[
         SpawnSquad,
         RemoveSquad,
         SetTarget,
+        SpawnNpcItem,
         GiveItem,
         RemoveItem,
         TakeItem,
@@ -1314,6 +1341,7 @@ __all__ = [
     "RequiredId",
     "SetTarget",
     "SmartOwner",
+    "SpawnNpcItem",
     "SpawnSquad",
     "Stage",
     "TargetVariant",

@@ -19,7 +19,9 @@
    Земснаряде (``zat_b14_smart_terrain``) и требует добыть
    ``itm_pda_common``.
 6. ``descr_variants`` обновляет текст этапа 0, когда охрана убита, но ПДА
-   ещё не поднят. Переход на этап 1 — по ``HasItem``.
+   ещё не поднят. При старте этапа ``SpawnNpcItem`` кладёт ``itm_pda_common``
+   в рюкзак командира охраны, поэтому шифратор снимается с трупа.
+   Переход на этап 1 — по ``HasItem``.
 7. Q2 завершается в диалоге сдачи: ветка ``HasItem`` изымает ПДА и вызывает
    ``CompleteTask``; ``_reward`` выдаёт 12 000 ₽ и ВСС «Винторез»
    (``wpn_vintorez``).
@@ -59,6 +61,7 @@ from src.core.models import (
     Quest,
     RemoveItem,
     RemoveSquad,
+    SpawnNpcItem,
     SpawnSquad,
     Stage,
     TargetVariant,
@@ -255,6 +258,13 @@ def create_second_quest() -> Quest:
                         squad_alias=SQUAD_GUARD,
                         smart_alias=Q2_SMART,
                         mode="story",
+                    ),
+                    # Шифратор лежит в рюкзаке командира охраны: игрок
+                    # снимает его с трупа после боя.
+                    SpawnNpcItem(
+                        item_alias=DECRYPTOR_ITEM,
+                        target_alias=SQUAD_GUARD,
+                        count=1,
                     ),
                 ],
             ),

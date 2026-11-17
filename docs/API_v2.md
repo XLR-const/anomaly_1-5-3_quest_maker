@@ -274,6 +274,7 @@ RequiredId: TypeAlias = Annotated[
 | `RemoveInfo` | `"remove_info"` | `[Общее]` | `info: RequiredId` | Lua `db.actor:disable_info_portion(info)`. |
 | `SpawnSquad` | `"spawn_squad"` | `[Общее]`; `mode="warfare"` — `[Warfare]`, `mode="story"` — `[Story]` | `squad_alias: str`, `smart_alias: str`, `mode: "warfare" \| "story" = "warfare"` | `warfare`: `SIMBOARD:create_squad` + `sim_squad_warfare.set_target` + заморозка. `story`: `SIMBOARD:create_squad` без `set_target`, `stay_time` и `force_online`; цель берётся из `target_smart` секции отряда. |
 | `SetTarget` | `"set_target"` | `[Warfare]` | `squad_alias: str`, `smart_alias: str` | Lua `sim_squad_warfare.set_target`. |
+| `SpawnNpcItem` | `"spawn_npc_item"` | `[Общее] / [Story]` | `item_alias: str`, `target_alias: str`, `count: int = 1` (`ge=1`) | Lua `spawn_npc_item(...)`: резолвит NPC через `resolve_alife_object`/`get_story_squad`, для отряда берёт `commander_id()` и кладёт предмет в инвентарь командира через `alife_create_item(section, npc)` в цикле `1..count`. Уведомления `news_manager` не выводятся: предмет предназначен для лута. |
 | `GiveItem` | `"give_item"` | `[Общее]` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `give_item(...)`: `alife_create_item(section, actor)` по одному и одно уведомление `news_manager.relocate_item(actor, "in", section, count)`. Алиас разрешается в реальную секцию. |
 | `RemoveItem` | `"remove_item"` | `[Общее]` | `item_alias: str`, `count: int = 1` (`ge=1`) | Lua `take_item(...)`: прямое изъятие из инвентаря игрока через `actor:iterate_inventory` + `alife_release`. |
 | `TakeItem` | `"take_item"` | `[Общее]` | `item_alias: str`, `count: int = 1` (`ge=1`) | Семантический алиас `RemoveItem`: та же реализация `take_item`; ровно одно уведомление `news_manager.relocate_item(..., "out", ...)` при `removed > 0`. |
@@ -2320,6 +2321,7 @@ from src.core.models import (
     GiveInfo,
     RemoveInfo,
     SpawnSquad,
+    SpawnNpcItem,
     RemoveSquad,
     SetTarget,
     GiveItem,

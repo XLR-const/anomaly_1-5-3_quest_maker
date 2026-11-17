@@ -53,6 +53,7 @@ from src.core.models import (  # noqa: E402
     QuestCondlist,
     RemoveSquad,
     SmartOwner,
+    SpawnNpcItem,
     SpawnSquad,
     Stage,
     TargetVariant,
@@ -160,6 +161,35 @@ class TestStoryModels(unittest.TestCase):
         )
         self.assertIsInstance(action, RemoveSquad)
         self.assertEqual(action.squad_alias, SQUAD_ID)
+
+    def test_spawn_npc_item_model_and_union(self) -> None:
+        """``SpawnNpcItem`` входит в union, ``count`` ограничен снизу."""
+        action = SpawnNpcItem(
+            item_alias="itm_pda_common",
+            target_alias=SQUAD_ID,
+        )
+        self.assertEqual(action.type, "spawn_npc_item")
+        self.assertEqual(action.count, 1)
+
+        adapter = TypeAdapter(Action)
+        parsed = adapter.validate_python(
+            {
+                "type": "spawn_npc_item",
+                "item_alias": "itm_pda_common",
+                "target_alias": SQUAD_ID,
+                "count": 2,
+            }
+        )
+        self.assertIsInstance(parsed, SpawnNpcItem)
+        self.assertEqual(parsed.count, 2)
+        self.assertEqual(parsed.target_alias, SQUAD_ID)
+
+        with self.assertRaises(ValidationError):
+            SpawnNpcItem(
+                item_alias="itm_pda_common",
+                target_alias=SQUAD_ID,
+                count=0,
+            )
 
     def test_spawn_squad_mode_defaults_to_warfare(self) -> None:
         """Режим по умолчанию — warfare, story принимается."""
@@ -918,6 +948,51 @@ class TestStoryLuaRuntime(unittest.TestCase):
             self.assertNotIn("descr_variants", body)
             self.assertNotIn("var.when", body)
 
+    def test_spawn_npc_item_helper_and_branch(self) -> None:
+        """``SpawnNpcItem`` вставляет хелпер и ветку в ``run_actions``."""
+        script = self._build(
+            stages={
+                0: _stage(
+                    on_start_actions=[
+                        SpawnNpcItem(
+                            item_alias="itm_pda_common",
+                            target_alias=SQUAD_ID,
+                        )
+                    ]
+                )
+            }
+        )
+        self.assertIn('kind = "spawn_npc_item"', script)
+        self.assertIn('item = "itm_pda_common"', script)
+        self.assertIn(f'target = "{SQUAD_ID}"', script)
+        self.assertIn("count = 1", script)
+        self.assertIn(
+            "spawn_npc_item(spec.item, spec.target, spec.count)", script
+        )
+
+        body = self._function_body(
+            script,
+            "local function spawn_npc_item",
+            "-- Executes a list of serialized action specs",
+        )
+        # Резолв NPC напрямую и через Story-отряд.
+        self.assertIn("resolve_alife_object(target_name)", body)
+        self.assertIn("get_story_squad(target_name)", body)
+        # Для отряда предмет кладётся в инвентарь командира.
+        self.assertIn("if obj.commander_id then", body)
+        self.assertIn("local cmd_id = obj:commander_id()", body)
+        self.assertIn("alife_object(cmd_id)", body)
+        # Создание предмета защищено и не шлёт уведомлений игроку.
+        self.assertIn("alife_create_item(section, obj)", body)
+        self.assertIn("pcall(function()", body)
+        self.assertNotIn("news_manager", body)
+        self.assertNotIn("sim_squad_warfare", body)
+
+    def test_spawn_npc_item_absent_without_action(self) -> None:
+        """Без ``SpawnNpcItem`` хелпер и ветка не генерируются."""
+        script = self._build()
+        self.assertNotIn("spawn_npc_item", script)
+
     def test_warfare_project_keeps_old_runtime(self) -> None:
         """Warfare-проект не получает Story-фрагментов и аргумента stage."""
         quest = _quest(
@@ -1082,6 +1157,17 @@ class TestStoryRelayIntegration(unittest.TestCase):
             self.assertEqual(squad.relationship, "enemy")
             self.assertEqual(squad.story_id, squad.id)
 
+        # Q2 stage 0 сначала спавнит охрану, затем кладёт шифратор
+        # в рюкзак её командира.
+        q2_start_actions = second.stages[0].on_start_actions
+        self.assertEqual(len(q2_start_actions), 2)
+        self.assertIsInstance(q2_start_actions[0], SpawnSquad)
+        self.assertIsInstance(q2_start_actions[1], SpawnNpcItem)
+        looter = q2_start_actions[1]
+        self.assertEqual(looter.item_alias, "itm_pda_common")
+        self.assertEqual(looter.target_alias, "mymod_relay_guard_squad")
+        self.assertEqual(looter.count, 1)
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             vanilla = root / "vanilla"
@@ -1146,6 +1232,35 @@ class TestStoryRelayIntegration(unittest.TestCase):
             self.assertEqual(lua.count('kind = "spawn_story_squad"'), 2)
             self.assertNotIn('kind = "spawn_squad"', lua)
             self.assertNotIn('kind = "set_target"', lua)
+
+            # Шифратор спавнится в инвентарь командира охраны Q2.
+            self.assertEqual(lua.count('kind = "spawn_npc_item"'), 1)
+            guard_block_start = lua.index('kind = "spawn_npc_item"')
+            guard_block = lua[guard_block_start:guard_block_start + 200]
+            self.assertIn('item = "itm_pda_common"', guard_block)
+            self.assertIn(
+                'target = "mymod_relay_guard_squad"', guard_block
+            )
+            self.assertIn("count = 1", guard_block)
+
+            npc_item_helper = self._function_body(
+                lua,
+                "local function spawn_npc_item",
+                "-- Executes a list of serialized action specs",
+            )
+            self.assertIn(
+                "local cmd_id = obj:commander_id()", npc_item_helper
+            )
+            self.assertIn(
+                "alife_object(cmd_id)", npc_item_helper
+            )
+            self.assertIn(
+                "alife_create_item(section, obj)", npc_item_helper
+            )
+            self.assertIn(
+                "get_story_squad(target_name)", npc_item_helper
+            )
+            self.assertNotIn("news_manager", npc_item_helper)
 
             # Story-функция спавна не обращается к Warfare-симуляции.
             story_spawn = self._function_body(
