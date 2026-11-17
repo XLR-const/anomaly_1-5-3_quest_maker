@@ -32,6 +32,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.compiler.builder import BuildError  # noqa: E402
 from src.compiler.ltx_gen import LtxGenerator  # noqa: E402
+from src.compiler.lua_gen import LuaGenerator  # noqa: E402
 from src.compiler.xml_gen import XmlGenerator  # noqa: E402
 from src.core.models import (  # noqa: E402
     Action,
@@ -39,6 +40,7 @@ from src.core.models import (  # noqa: E402
     DescrVariant,
     Dialog,
     DontHasInfo,
+    GiveTask,
     HasInfo,
     HasItem,
     HasMoney,
@@ -694,6 +696,281 @@ class TestStoryValidator(unittest.TestCase):
             squads={SQUAD_ID: squad},
         )
         self.assertTrue(self._validate(project))
+
+
+# ---------------------------------------------------------------------------
+# Lua: Story-рантайм
+# ---------------------------------------------------------------------------
+
+
+class TestStoryLuaRuntime(unittest.TestCase):
+    """Проверяет условную генерацию Story-фрагментов в Lua-рантайме."""
+
+    @staticmethod
+    def _build(**quest_kwargs: object) -> str:
+        """Собирает Lua-скрипт одного Story-квеста в памяти."""
+        quest = _quest(**quest_kwargs)
+        project = ModProject(
+            name="Story runtime",
+            quests={QUEST_ID: quest},
+            squads={SQUAD_ID: _story_squad(story_id=SQUAD_ID)},
+        )
+        return LuaGenerator().generate_quests_script(
+            project,
+            script_name="st_story_test",
+            mod_prefix="mymod",
+        )
+
+    @staticmethod
+    def _function_body(script: str, header: str, next_header: str) -> str:
+        """Возвращает текст функции от ``header`` до ``next_header``."""
+        start = script.index(header)
+        end = script.index(next_header, start + len(header))
+        return script[start:end]
+
+    def test_spawn_story_squad_avoids_warfare_api(self) -> None:
+        """Story-спавн не трогает ``sim_squad_warfare`` и не ставит таймеры."""
+        script = self._build(
+            on_init_actions=[
+                SpawnSquad(
+                    squad_alias=SQUAD_ID,
+                    smart_alias="zat_b52",
+                    mode="story",
+                )
+            ]
+        )
+        body = self._function_body(
+            script,
+            "local function spawn_story_squad",
+            "local function remove_story_squad",
+        )
+
+        self.assertIn("SIMBOARD:create_squad(base, section)", body)
+        self.assertIn("mark_task_squad(squad)", body)
+        self.assertIn("register_story_squad(quest_id, squad)", body)
+        self.assertNotIn("sim_squad_warfare", body)
+        self.assertNotIn("set_target", body)
+        self.assertNotIn("stay_time", body)
+        self.assertNotIn("force_online", body)
+
+    def test_spawn_story_squad_is_idempotent_and_resets(self) -> None:
+        """Спавн защищён ``once_key`` и сбрасывается при отмене/повторе."""
+        script = self._build(
+            on_init_actions=[
+                SpawnSquad(
+                    squad_alias=SQUAD_ID,
+                    smart_alias="zat_b52",
+                    mode="story",
+                )
+            ],
+            stages={
+                0: _stage(
+                    on_start_actions=[
+                        SpawnSquad(
+                            squad_alias=SQUAD_ID,
+                            smart_alias="zat_b52",
+                            mode="story",
+                        )
+                    ]
+                )
+            },
+        )
+        spawn_body = self._function_body(
+            script,
+            "local function spawn_story_squad",
+            "local function remove_story_squad",
+        )
+        self.assertIn(
+            "if once_key and vget(once_key, 0) == 1 then", spawn_body
+        )
+        self.assertIn("vset(once_key, 1)", spawn_body)
+
+        self.assertIn(
+            'stage_key(quest, stage_idx, "story_spawn")', script
+        )
+        self.assertIn('quest.key_prefix .. "_init_spawn"', script)
+
+        unmark_body = self._function_body(
+            script,
+            "local function unmark_quest_squads",
+            "-- Remembers a squad",
+        )
+        self.assertIn('"_story_squad_cnt"', unmark_body)
+        self.assertIn('"_init_spawn"', unmark_body)
+
+        start_body = self._function_body(
+            script,
+            f"local function {QUEST_ID}_start",
+            f"local function {QUEST_ID}_reward",
+        )
+        self.assertIn(
+            'vset(stage_key(quest, stage, "story_spawn"), 0)', start_body
+        )
+
+    def test_remove_squad_is_safe_noop_and_clears_story_list(self) -> None:
+        """``RemoveSquad`` использует Story-API и переносит ``nil``."""
+        script = self._build(
+            on_fail_actions=[RemoveSquad(squad_alias=SQUAD_ID)]
+        )
+        self.assertIn('kind = "remove_squad"', script)
+        self.assertIn("remove_story_squad(spec.squad)", script)
+
+        remove_body = self._function_body(
+            script,
+            "local function remove_story_squad",
+            "-- Executes a list of serialized action specs",
+        )
+        self.assertIn(
+            'if not alias_or_section or alias_or_section == "" then '
+            "return end",
+            remove_body,
+        )
+        self.assertIn("get_story_squad(alias_or_section)", remove_body)
+        self.assertIn("SIMBOARD.remove_squad", remove_body)
+        self.assertIn("if squad and SIMBOARD", remove_body)
+
+        unmark_body = self._function_body(
+            script,
+            "local function unmark_quest_squads",
+            "-- Remembers a squad",
+        )
+        self.assertIn('"_story_squad_" .. tostring(i)', unmark_body)
+        self.assertIn("unmark_task_squad(", unmark_body)
+        self.assertIn('"_story_squad_cnt"', unmark_body)
+
+    def test_freeze_dyn_squads_ignores_story_list(self) -> None:
+        """``freeze_dyn_squads`` читает только ``_dyn_squad_*``."""
+        script = self._build(
+            on_init_actions=[
+                SpawnSquad(
+                    squad_alias=SQUAD_ID,
+                    smart_alias="zat_b52",
+                    mode="story",
+                )
+            ]
+        )
+        body = self._function_body(
+            script,
+            "local function freeze_dyn_squads",
+            "-- A stage with capture data",
+        )
+        self.assertIn('"_dyn_squad_"', body)
+        self.assertNotIn("_story_squad_", body)
+
+    def test_variants_are_emitted_only_when_present(self) -> None:
+        """Проверки вариантов появляются в ``_target``/``_descr``."""
+        script = self._build(
+            stages={
+                0: _stage(
+                    target_variants=[
+                        TargetVariant(
+                            when=[HasInfo(info="mymod_alt")],
+                            value="alt_smart",
+                        )
+                    ],
+                    descr_variants=[
+                        DescrVariant(
+                            when=[HasInfo(info="mymod_alt")],
+                            text_ru="Вариант",
+                            text_en="Variant",
+                        )
+                    ],
+                )
+            }
+        )
+        target_body = self._function_body(
+            script,
+            f"local function {QUEST_ID}_target",
+            f"local function {QUEST_ID}_descr",
+        )
+        self.assertIn("stage_data.target_variants", target_body)
+        self.assertIn("eval_conditions(var.when, db.actor)", target_body)
+        self.assertIn("resolve_target(var.value)", target_body)
+
+        descr_body = self._function_body(
+            script,
+            f"local function {QUEST_ID}_descr",
+            f"local function {QUEST_ID}_status",
+        )
+        self.assertIn("stage_data.descr_variants", descr_body)
+        self.assertIn("return var.key", descr_body)
+
+        self.assertIn(f"{QUEST_ID}_stage_0_descr_v1", script)
+
+    def test_no_variants_means_no_variant_blocks(self) -> None:
+        """Без вариантов ``_target``/``_descr`` остаются прежними."""
+        script = self._build()
+        target_body = self._function_body(
+            script,
+            f"local function {QUEST_ID}_target",
+            f"local function {QUEST_ID}_descr",
+        )
+        descr_body = self._function_body(
+            script,
+            f"local function {QUEST_ID}_descr",
+            f"local function {QUEST_ID}_status",
+        )
+        for body in (target_body, descr_body):
+            self.assertNotIn("target_variants", body)
+            self.assertNotIn("descr_variants", body)
+            self.assertNotIn("var.when", body)
+
+    def test_warfare_project_keeps_old_runtime(self) -> None:
+        """Warfare-проект не получает Story-фрагментов и аргумента stage."""
+        quest = _quest(
+            on_init_actions=[
+                SpawnSquad(squad_alias=SQUAD_ID, smart_alias="zat_b52")
+            ]
+        )
+        project = ModProject(
+            name="Warfare runtime",
+            quests={QUEST_ID: quest},
+            squads={SQUAD_ID: _story_squad()},
+        )
+        script = LuaGenerator().generate_quests_script(
+            project,
+            script_name="st_warfare_test",
+            mod_prefix="mymod",
+        )
+
+        self.assertIn(
+            "local function run_actions(actions, actor, npc, quest_id)",
+            script,
+        )
+        self.assertIn("sim_squad_warfare.set_target", script)
+        self.assertIn("squad.stay_time = nil", script)
+        for marker in (
+            "spawn_story_squad",
+            "register_story_squad",
+            "remove_story_squad",
+            "_story_squad_",
+        ):
+            self.assertNotIn(marker, script)
+
+    def test_give_task_from_reward_handles_nil_npc(self) -> None:
+        """``GiveTask`` из ``on_complete_actions`` не падает без ``npc``."""
+        script = self._build(
+            on_complete_actions=[GiveTask(task_id="mymod_next_quest")]
+        )
+        self.assertIn('kind = "give_task"', script)
+
+        reward_body = self._function_body(
+            script,
+            f"local function {QUEST_ID}_reward",
+            f"local function {QUEST_ID}_cleanup",
+        )
+        self.assertIn(
+            "run_actions(quest.complete_actions, actor or db.actor, npc",
+            reward_body,
+        )
+
+        give_body = self._function_body(
+            script,
+            "local function give_task",
+            "local function complete_task",
+        )
+        self.assertIn("if npc and npc.id", give_body)
+        self.assertIn("if not giver_id then", give_body)
 
 
 if __name__ == "__main__":
