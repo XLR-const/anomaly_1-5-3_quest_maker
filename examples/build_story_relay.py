@@ -296,6 +296,9 @@ def create_second_quest() -> Quest:
         complete_info=INFO_Q2_DONE,
         cleanup_infos=[INFO_GUARD_DEAD],
         on_fail_actions=[
+            # При отмене изымаем уже подобранный ПДА: иначе повторное
+            # взятие сразу закроет этап 0 по HasItem.
+            RemoveItem(item_alias=DECRYPTOR_ITEM, count=1),
             RemoveSquad(squad_alias=SQUAD_GUARD),
         ],
         reward_money=Q2_REWARD_MONEY,
@@ -494,7 +497,7 @@ def create_dialogs() -> list[Dialog]:
                 id=1,
                 text_ru="Принёс?",
                 text_en="Did you bring it?",
-                next_phrases=[2, 3],
+                next_phrases=[2, 4],
             ),
             2: Phrase(
                 id=2,
@@ -507,9 +510,15 @@ def create_dialogs() -> list[Dialog]:
                     RemoveItem(item_alias=DECRYPTOR_ITEM, count=1),
                     CompleteTask(task_id=Q2),
                 ],
+                next_phrases=[3],
             ),
             3: Phrase(
                 id=3,
+                text_ru="Отличная работа, сталкер. Вот твоя награда.",
+                text_en="Good work, stalker. Here is your reward.",
+            ),
+            4: Phrase(
+                id=4,
                 text_ru="Ещё ищу. Охрана у Земснаряда.",
                 text_en="Still looking. The guards are at the dredge.",
             ),

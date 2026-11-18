@@ -51,6 +51,7 @@ from src.core.models import (  # noqa: E402
     Phrase,
     Quest,
     QuestCondlist,
+    RemoveItem,
     RemoveSquad,
     SmartOwner,
     SpawnNpcItem,
@@ -982,11 +983,105 @@ class TestStoryLuaRuntime(unittest.TestCase):
         self.assertIn("if obj.commander_id then", body)
         self.assertIn("local cmd_id = obj:commander_id()", body)
         self.assertIn("alife_object(cmd_id)", body)
-        # Создание предмета защищено и не шлёт уведомлений игроку.
+        # Создание предмета защищено и возвращает статус успеха.
         self.assertIn("alife_create_item(section, obj)", body)
-        self.assertIn("pcall(function()", body)
+        self.assertIn("if not (ok and se_item) then", body)
+        self.assertIn("return false", body)
+        self.assertIn("return true", body)
         self.assertNotIn("news_manager", body)
         self.assertNotIn("sim_squad_warfare", body)
+
+    def test_spawn_npc_item_retries_on_later_status_ticks(self) -> None:
+        """Неудачный ``SpawnNpcItem`` повторяется по ``npc_item_done``."""
+        script = self._build(
+            stages={
+                0: _stage(
+                    on_start_actions=[
+                        SpawnSquad(
+                            squad_alias=SQUAD_ID,
+                            smart_alias="zat_b52",
+                            mode="story",
+                        ),
+                        SpawnNpcItem(
+                            item_alias="itm_pda_common",
+                            target_alias=SQUAD_ID,
+                        ),
+                    ]
+                )
+            }
+        )
+        status_body = self._function_body(
+            script,
+            f"local function {QUEST_ID}_status",
+            f"local function {QUEST_ID}_start",
+        )
+        self.assertIn('stage_data.npc_item_actions or {}', status_body)
+        self.assertIn('"npc_item_done"', status_body)
+        self.assertIn(
+            "spawn_npc_item(item_spec.item, item_spec.target, "
+            "item_spec.count)",
+            status_body,
+        )
+        self.assertLess(
+            status_body.index("npc_items_done = false"),
+            status_body.index('vset(stage_key(quest, stage, "npc_item_done"), 1)'),
+        )
+
+        start_body = self._function_body(
+            script,
+            f"local function {QUEST_ID}_start",
+            f"local function {QUEST_ID}_reward",
+        )
+        self.assertIn('vset(stage_key(quest, stage, "npc_item_done"), 0)', start_body)
+        self.assertIn('"npc_item_done_" .. tostring(i)', start_body)
+
+    def test_turn_in_last_stage_gate_is_unconditional(self) -> None:
+        """Гейт ``last_stage`` работает и при собственном ``HasInfo``."""
+        quest = _quest(
+            stages={0: _stage(0), 1: _stage(1)},
+        )
+        take = Dialog(
+            id="mymod_gate_take",
+            task_id=QUEST_ID,
+            role="take",
+            phrases={
+                0: Phrase(id=0, text_ru="Взять", text_en="Take"),
+            },
+        )
+        turnin = Dialog(
+            id="mymod_gate_turnin",
+            task_id=QUEST_ID,
+            role="turnin",
+            preconditions=[HasInfo(info="mymod_gate_taken")],
+            phrases={
+                0: Phrase(id=0, text_ru="Сдать", text_en="Turn in"),
+            },
+        )
+        project = ModProject(
+            name="Gate runtime",
+            quests={QUEST_ID: quest},
+            dialogs={take.id: take, turnin.id: turnin},
+        )
+        script = LuaGenerator().generate_quests_script(
+            project,
+            script_name="st_gate_test",
+            mod_prefix="mymod",
+        )
+        body = self._function_body(
+            script,
+            "local function mymod_gate_turnin_can_turn_in",
+            "local function mymod_gate_turnin_accept",
+        )
+        self.assertIn(
+            "if quest.return_stage < 0 and "
+            "(tsk.stage or 0) < (quest.last_stage or 0) then",
+            body,
+        )
+        self.assertIn("return false", body)
+        self.assertLess(
+            body.index("(quest.last_stage or 0)"),
+            body.rindex("return true"),
+        )
 
     def test_spawn_npc_item_absent_without_action(self) -> None:
         """Без ``SpawnNpcItem`` хелпер и ветка не генерируются."""
@@ -1168,6 +1263,16 @@ class TestStoryRelayIntegration(unittest.TestCase):
         self.assertEqual(looter.target_alias, "mymod_relay_guard_squad")
         self.assertEqual(looter.count, 1)
 
+        # WARN-1: при отмене Q2 уже подобранный ПДА изымается, чтобы
+        # повторное взятие не закрыло этап 0 мгновенно.
+        self.assertEqual(len(second.on_fail_actions), 2)
+        self.assertIsInstance(second.on_fail_actions[0], RemoveItem)
+        self.assertEqual(
+            second.on_fail_actions[0].item_alias, "itm_pda_common"
+        )
+        self.assertEqual(second.on_fail_actions[0].count, 1)
+        self.assertIsInstance(second.on_fail_actions[1], RemoveSquad)
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             vanilla = root / "vanilla"
@@ -1345,14 +1450,42 @@ class TestStoryRelayIntegration(unittest.TestCase):
                              "mymod_relay_02_taken")
 
             # Ветка сдачи Q2 проверяет ПДА в Phrase.preconditions,
-            # а альтернативная реплика остаётся доступной.
+            # а альтернативная реплика «ещё ищу» имеет чётный ID.
             turnin_phrases = {
                 phrase.get("id"): phrase
                 for phrase in dialogs_by_id["mymod_relay_02_turnin"].findall(
                     "./phrase_list/phrase"
                 )
             }
-            self.assertIn("3", turnin_phrases)
+            self.assertEqual(
+                set(turnin_phrases), {"0", "1", "2", "3", "4"}
+            )
+            self.assertEqual(
+                turnin_phrases["3"].findtext("text"),
+                "mymod_relay_02_turnin_phrase_3_text",
+            )
+            self.assertEqual(
+                turnin_phrases["4"].findtext("text"),
+                "mymod_relay_02_turnin_phrase_4_text",
+            )
+            self.assertEqual(
+                [
+                    next_phrase.text
+                    for next_phrase in turnin_phrases["1"].findall("next")
+                ],
+                ["2", "4"],
+            )
+            self.assertEqual(
+                [
+                    next_phrase.text
+                    for next_phrase in turnin_phrases["2"].findall("next")
+                ],
+                ["3"],
+            )
+            # Нарушение FAIL-1: реплика Игрока не должна иметь нечётный ID.
+            self.assertNotEqual(
+                (int(turnin_phrases["4"].get("id")) % 2), 1
+            )
             self.assertEqual(
                 turnin_phrases["2"].findtext("precondition"),
                 "dialogs.mymod_relay_02_turnin_phrase_2_precondition",
@@ -1360,6 +1493,36 @@ class TestStoryRelayIntegration(unittest.TestCase):
             self.assertEqual(
                 turnin_phrases["2"].findtext("action"),
                 "dialogs.mymod_relay_02_turnin_phrase_2_action",
+            )
+
+            # WARN-2: диалог сдачи Q2 не открывается до последнего этапа,
+            # несмотря на собственный HasInfo (mymod_relay_02_taken).
+            turnin_gate = self._function_body(
+                lua,
+                "local function mymod_relay_02_turnin_can_turn_in",
+                "local function mymod_relay_02_turnin_accept",
+            )
+            self.assertIn(
+                "if quest.return_stage < 0 and "
+                "(tsk.stage or 0) < (quest.last_stage or 0) then",
+                turnin_gate,
+            )
+
+            # WARN-3: SpawnNpcItem повторяется на следующих тиках _status.
+            q2_status = self._function_body(
+                lua,
+                "local function mymod_relay_02_decryptor_status",
+                "local function mymod_relay_02_decryptor_start",
+            )
+            self.assertIn("stage_data.npc_item_actions or {}", q2_status)
+            self.assertIn('"npc_item_done"', q2_status)
+            self.assertIn(
+                "spawn_npc_item(item_spec.item, item_spec.target, "
+                "item_spec.count)",
+                q2_status,
+            )
+            self.assertIn(
+                "kind = \"remove_item\"", lua
             )
 
             profile_xml = (

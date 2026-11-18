@@ -1191,12 +1191,17 @@ class LuaGenerator:
             # GiveItem из on_start_actions выдаётся идемпотентно: _status
             # повторяет выдачу каждый тик, если предмет потерян. Остальные
             # действия по-прежнему выполняются один раз (ключ "started").
+            # SpawnNpcItem вынесен отдельно: если командир отряда ещё не
+            # инициализирован, _status повторяет попытку на следующих тиках.
             start_actions: list[dict[str, Any]] = []
             item_actions: list[dict[str, Any]] = []
+            npc_item_actions: list[dict[str, Any]] = []
             for action in stage.on_start_actions:
                 spec = self._action_spec(action)
                 if isinstance(action, GiveItem):
                     item_actions.append(spec)
+                elif isinstance(action, SpawnNpcItem):
+                    npc_item_actions.append(spec)
                 else:
                     start_actions.append(spec)
             # target_variants / descr_variants (only serialized if non-empty)
@@ -1236,6 +1241,8 @@ class LuaGenerator:
                 stage_data["target_variants"] = target_variants
             if descr_variants:
                 stage_data["descr_variants"] = descr_variants
+            if npc_item_actions:
+                stage_data["npc_item_actions"] = npc_item_actions
             stages[stage_id] = stage_data
 
         # Автоматическая очистка этапных GiveInfo. Поршни, выданные на старте
@@ -1380,9 +1387,11 @@ class LuaGenerator:
                 "\n"
                 + r"""-- Spawns an item into an NPC inventory or a squad commander
 -- for later looting; no news_manager notifications are emitted.
+-- Returns true only when the target server object (or squad commander)
+-- exists and every alife_create_item call produced an item.
 local function spawn_npc_item(section, target_name, count)
 	if not (section and section ~= "" and target_name and target_name ~= "") then
-		return
+		return false
 	end
 	local obj = resolve_alife_object(target_name)
 	if not obj and get_story_squad then
@@ -1394,21 +1403,33 @@ local function spawn_npc_item(section, target_name, count)
 	if not obj then
 		printe("[__SCRIPT_NAME__] ! cannot resolve NPC/squad [%s] for item [%s]",
 			tostring(target_name), tostring(section))
-		return
+		return false
 	end
 	if obj.commander_id then
 		local cmd_id = obj:commander_id()
+		local commander = nil
 		if cmd_id and cmd_id ~= 0 then
-			local commander = alife_object(cmd_id)
-			if commander then obj = commander end
+			commander = alife_object(cmd_id)
 		end
+		if not commander then
+			printe("[__SCRIPT_NAME__] ! commander of [%s] is not ready for item [%s]",
+				tostring(target_name), tostring(section))
+			return false
+		end
+		obj = commander
 	end
 	count = tonumber(count) or 1
 	for _ = 1, count do
-		pcall(function()
-			alife_create_item(section, obj)
+		local ok, se_item = pcall(function()
+			return alife_create_item(section, obj)
 		end)
+		if not (ok and se_item) then
+			printe("[__SCRIPT_NAME__] ! cannot create item [%s] for [%s]",
+				tostring(section), tostring(target_name))
+			return false
+		end
 	end
+	return true
 end"""
                 + "\n\n"
             )
@@ -1565,6 +1586,47 @@ end"""
             else ""
         )
 
+        # SpawnNpcItem из on_start_actions повторяется, пока командир отряда
+        # не будет доступен: результат вызова фиксируется отдельными
+        # pstor-ключами, а не общим "started".
+        npc_item_reset = ""
+        npc_item_status = ""
+        if any(
+            stage_data.get("npc_item_actions")
+            for stage_data in data["stages"].values()
+        ):
+            npc_item_reset = (
+                '\t\tvset(stage_key(quest, stage, "npc_item_done"), 0)\n'
+                "\t\tfor i = 1, #(stage_data.npc_item_actions or {}) do\n"
+                '\t\t\tvset(stage_key(quest, stage, '
+                '"npc_item_done_" .. tostring(i)), 0)\n'
+                "\t\tend\n"
+            )
+            npc_item_status = (
+                "\t-- NPC items from on_start_actions are retried on later\n"
+                "\t-- status ticks until the squad commander is available.\n"
+                '\tif vget(stage_key(quest, stage, "npc_item_done"), 0) == 0 then\n'
+                "\t\tlocal npc_items_done = true\n"
+                "\t\tfor idx, item_spec in ipairs("
+                "stage_data.npc_item_actions or {}) do\n"
+                "\t\t\tlocal item_key = stage_key(\n"
+                '\t\t\t\tquest, stage, "npc_item_done_" .. tostring(idx)\n'
+                "\t\t\t)\n"
+                "\t\t\tif vget(item_key, 0) == 0 then\n"
+                "\t\t\t\tif spawn_npc_item(item_spec.item, "
+                "item_spec.target, item_spec.count) then\n"
+                "\t\t\t\t\tvset(item_key, 1)\n"
+                "\t\t\t\telse\n"
+                "\t\t\t\t\tnpc_items_done = false\n"
+                "\t\t\t\tend\n"
+                "\t\t\tend\n"
+                "\t\tend\n"
+                "\t\tif npc_items_done then\n"
+                '\t\t\tvset(stage_key(quest, stage, "npc_item_done"), 1)\n'
+                "\t\tend\n"
+                "\tend\n"
+            )
+
         # Build target function with optional target_variants
         target_variants_code = ""
         if data["stages"]:
@@ -1680,7 +1742,7 @@ local function {quest_id}_status(tsk, task_id)
 		end
 	end
 
-	spawn_stage_for(quest, stage, stage_data)
+{npc_item_status}	spawn_stage_for(quest, stage, stage_data)
 	freeze_stage_for(quest, stage, stage_data)
 	freeze_dyn_squads(quest)
 
@@ -1724,7 +1786,7 @@ local function {quest_id}_start(actor, npc, p)
 		vset(stage_key(quest, stage, "enemy"), 0)
 		vset(stage_key(quest, stage, "started"), 0)
 		vset(stage_key(quest, stage, "target_seen"), 0)
-{story_reset}		local allies = (stage_data.capture and stage_data.capture.ally_count) or 0
+{npc_item_reset}{story_reset}		local allies = (stage_data.capture and stage_data.capture.ally_count) or 0
 		for i = 1, allies do
 			vset(stage_key(quest, stage, "ally" .. i), 0)
 		end
@@ -1892,28 +1954,20 @@ end"""
         )
 
         # Стадийная защита сдачи. Если известен этап возврата — требуем его.
-        # Для диалога сдачи без собственного HasInfo (он не привязан к
-        # поршню промежуточного этапа) дополнительно требуем последний этап:
-        # безусловная сдача не должна открываться на нулевом этапе.
-        # Многоэтапные квесты с промежуточными HasInfo-диалогами сдачи
-        # сохраняют штатное поведение.
-        has_info_precondition = any(
-            isinstance(condition, HasInfo)
-            for condition in dialog.preconditions
-        )
+        # Если этап возврата не задан, безусловно требуем последний этап:
+        # диалог сдачи не должен открываться до полного прохождения квеста,
+        # даже если у него есть собственный HasInfo (``taken`` — признак
+        # выдачи, а не готовности).
         stage_guards = (
             "\tif quest.return_stage >= 0 and "
             "(tsk.stage or 0) < quest.return_stage then\n"
             "\t\treturn false\n"
             "\tend\n"
+            "\tif quest.return_stage < 0 and "
+            "(tsk.stage or 0) < (quest.last_stage or 0) then\n"
+            "\t\treturn false\n"
+            "\tend\n"
         )
-        if not has_info_precondition:
-            stage_guards += (
-                "\tif quest.return_stage < 0 and "
-                "(tsk.stage or 0) < (quest.last_stage or 0) then\n"
-                "\t\treturn false\n"
-                "\tend\n"
-            )
 
         can_take = f"""\
 -- Dialog availability: all dialog-level conditions plus "task not given".
