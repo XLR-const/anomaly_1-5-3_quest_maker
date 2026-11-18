@@ -1325,8 +1325,8 @@ class TestStageReadyInfoLifecycle(unittest.TestCase):
             can_turn_in.rindex("return true"),
         )
 
-    def test_turn_in_with_has_info_is_not_blocked_by_last_stage(self) -> None:
-        """Промежуточный диалог сдачи с ``HasInfo`` работает штатно."""
+    def test_turn_in_with_has_info_still_requires_last_stage(self) -> None:
+        """Собственный ``HasInfo`` не отключает безусловный гейт стадии."""
         script = LuaGenerator().generate_quests_script(
             self._make_turnin_project(with_has_info=True),
             script_name="gate_quests",
@@ -1338,8 +1338,15 @@ class TestStageReadyInfoLifecycle(unittest.TestCase):
             "local function gate_turnin_accept",
         )
 
-        self.assertNotIn("quest.last_stage", can_turn_in)
-        self.assertIn("return true", can_turn_in)
+        self.assertIn(
+            "if quest.return_stage < 0 and "
+            "(tsk.stage or 0) < (quest.last_stage or 0) then",
+            can_turn_in,
+        )
+        self.assertLess(
+            can_turn_in.index("(quest.last_stage or 0)"),
+            can_turn_in.rindex("return true"),
+        )
 
     def test_turn_in_checks_explicit_return_stage(self) -> None:
         """При заданном ``return_stage`` проверяется именно он."""

@@ -31,8 +31,10 @@ from src.core.models import (
     HasMoney,
     RemoveInfo,
     RemoveItem,
+    RemoveSquad,
     SetTarget,
     SmartOwner,
+    SpawnNpcItem,
     SpawnSquad,
     TakeItem,
     TakeMoney,
@@ -351,7 +353,7 @@ local function unmark_quest_squads(q)
 			vget(q.key_prefix .. "_dyn_squad_" .. tostring(i), 0)
 		)
 	end
-end
+__STORY_UNMARK__end
 
 -- Remembers a squad spawned by a dialog/quest action so that _status can
 -- freeze it and _reward/_cleanup can release it from the offline simulation.
@@ -662,8 +664,8 @@ local function eval_conditions(list, actor)
 	return true
 end
 
--- Executes a list of serialized action specs in order.
-local function run_actions(actions, actor, npc, quest_id)
+__NPC_ITEM_HELPERS____STORY_HELPERS__-- Executes a list of serialized action specs in order.
+local function run_actions(actions, actor, npc, quest_id__STORY_RUN_ARGS__)
 	if not actions then return end
 	for _, spec in ipairs(actions) do
 		local kind = spec.kind
@@ -688,7 +690,7 @@ local function run_actions(actions, actor, npc, quest_id)
 			give_task(spec.task, actor, npc)
 		elseif kind == "complete_task" then
 			complete_task(spec.task)
-		end
+__NPC_ITEM_ACTION_BRANCH____STORY_ACTION_BRANCHES__		end
 	end
 end
 """
@@ -764,12 +766,18 @@ class LuaGenerator:
                 )
 
         blocks.append(self._build_quests_table(quest_data))
-        blocks.append(self._build_helpers(module_name))
+        needs_story = self._project_uses_story(quests, dialogs)
+        needs_npc_item = self._project_uses_npc_item(quests, dialogs)
+        blocks.append(
+            self._build_helpers(module_name, needs_story, needs_npc_item)
+        )
 
         for quest_id, data in quest_data.items():
             quest = quests[quest_id]
             try:
-                code, keys = self._build_quest_functions(quest_id, quest, data)
+                code, keys = self._build_quest_functions(
+                    quest_id, quest, data, needs_story
+                )
                 blocks.append(code)
                 registrations.extend(keys)
             except Exception as exc:  # noqa: BLE001
@@ -786,7 +794,7 @@ class LuaGenerator:
                 dialog_id = self._dialog_output_id(dialog)
                 linked = self._linked_quest_id(dialog_id, dialog, quest_data)
                 code, keys = self._build_dialog_functions(
-                    dialog_id, dialog, linked, quest_data
+                    dialog_id, dialog, linked, quest_data, needs_story
                 )
                 blocks.append(code)
                 registrations.extend(keys)
@@ -839,6 +847,103 @@ class LuaGenerator:
                 "Lua-идентификатором."
             )
         return dialog_id
+
+    @staticmethod
+    def _action_uses_story(action: Any) -> bool:
+        """True, если действие относится к Story-отрядам.
+
+        Args:
+            action (Any): Действие модели.
+
+        Returns:
+            bool: ``SpawnSquad(mode="story")`` или ``RemoveSquad``.
+        """
+        if isinstance(action, RemoveSquad):
+            return True
+        return isinstance(action, SpawnSquad) and getattr(
+            action, "mode", "warfare"
+        ) == "story"
+
+    @classmethod
+    def _project_uses_story(
+        cls, quests: dict[str, Any], dialogs: dict[str, Any]
+    ) -> bool:
+        """Проверяет, нужны ли проекту Story-хелперы.
+
+        Учитываются действия квестов (init/start/reward/fail) и действия
+        реплик диалогов, чтобы условные фрагменты не потерялись.
+
+        Args:
+            quests (dict[str, Any]): Карта квестов проекта.
+            dialogs (dict[str, Any]): Карта диалогов проекта.
+
+        Returns:
+            bool: True, если найдено хотя бы одно Story-действие.
+        """
+        for quest in quests.values():
+            action_lists = [
+                getattr(quest, "on_init_actions", None) or [],
+                getattr(quest, "on_complete_actions", None) or [],
+                getattr(quest, "on_fail_actions", None) or [],
+            ]
+            for stage in (getattr(quest, "stages", None) or {}).values():
+                action_lists.append(getattr(stage, "on_start_actions", None) or [])
+            for actions in action_lists:
+                if any(cls._action_uses_story(action) for action in actions):
+                    return True
+        for dialog in dialogs.values():
+            for phrase in (getattr(dialog, "phrases", None) or {}).values():
+                actions = getattr(phrase, "actions", None) or []
+                if any(cls._action_uses_story(action) for action in actions):
+                    return True
+        return False
+
+    @staticmethod
+    def _action_uses_npc_item(action: Any) -> bool:
+        """True, если действие — :class:`SpawnNpcItem`.
+
+        Args:
+            action (Any): Действие модели.
+
+        Returns:
+            bool: Действие спавнит предмет в инвентарь NPC.
+        """
+        return isinstance(action, SpawnNpcItem)
+
+    @classmethod
+    def _project_uses_npc_item(
+        cls, quests: dict[str, Any], dialogs: dict[str, Any]
+    ) -> bool:
+        """Проверяет, нужен ли проекту хелпер ``spawn_npc_item``.
+
+        Учитываются действия квестов (init/start/reward/fail) и действия
+        реплик диалогов. Если ``SpawnNpcItem`` не используется, хелпер не
+        вставляется и вывод остаётся байт-идентичным прежнему.
+
+        Args:
+            quests (dict[str, Any]): Карта квестов проекта.
+            dialogs (dict[str, Any]): Карта диалогов проекта.
+
+        Returns:
+            bool: True, если найдено хотя бы одно ``SpawnNpcItem``.
+        """
+        for quest in quests.values():
+            action_lists = [
+                getattr(quest, "on_init_actions", None) or [],
+                getattr(quest, "on_complete_actions", None) or [],
+                getattr(quest, "on_fail_actions", None) or [],
+            ]
+            for stage in (getattr(quest, "stages", None) or {}).values():
+                action_lists.append(getattr(stage, "on_start_actions", None) or [])
+            for actions in action_lists:
+                if any(cls._action_uses_npc_item(action) for action in actions):
+                    return True
+        for dialog in dialogs.values():
+            for phrase in (getattr(dialog, "phrases", None) or {}).values():
+                actions = getattr(phrase, "actions", None) or []
+                if any(cls._action_uses_npc_item(action) for action in actions):
+                    return True
+        return False
 
     @staticmethod
     def _linked_quest_id(
@@ -992,16 +1097,34 @@ class LuaGenerator:
         if isinstance(action, RemoveInfo):
             return {"kind": "remove_info", "info": action.info}
         if isinstance(action, SpawnSquad):
+            if action.mode == "story":
+                return {
+                    "kind": "spawn_story_squad",
+                    "squad": self._resolve_squad_section(action.squad_alias),
+                    "smart": action.smart_alias,
+                }
             return {
                 "kind": "spawn_squad",
                 "squad": action.squad_alias,
                 "smart": action.smart_alias,
+            }
+        if isinstance(action, RemoveSquad):
+            return {
+                "kind": "remove_squad",
+                "squad": action.squad_alias,
             }
         if isinstance(action, SetTarget):
             return {
                 "kind": "set_target",
                 "squad": action.squad_alias,
                 "smart": action.smart_alias,
+            }
+        if isinstance(action, SpawnNpcItem):
+            return {
+                "kind": "spawn_npc_item",
+                "item": self._resolve_item_section(action.item_alias),
+                "target": action.target_alias,
+                "count": action.count,
             }
         if isinstance(action, GiveItem):
             return {
@@ -1068,15 +1191,34 @@ class LuaGenerator:
             # GiveItem из on_start_actions выдаётся идемпотентно: _status
             # повторяет выдачу каждый тик, если предмет потерян. Остальные
             # действия по-прежнему выполняются один раз (ключ "started").
+            # SpawnNpcItem вынесен отдельно: если командир отряда ещё не
+            # инициализирован, _status повторяет попытку на следующих тиках.
             start_actions: list[dict[str, Any]] = []
             item_actions: list[dict[str, Any]] = []
+            npc_item_actions: list[dict[str, Any]] = []
             for action in stage.on_start_actions:
                 spec = self._action_spec(action)
                 if isinstance(action, GiveItem):
                     item_actions.append(spec)
+                elif isinstance(action, SpawnNpcItem):
+                    npc_item_actions.append(spec)
                 else:
                     start_actions.append(spec)
-            stages[stage_id] = {
+            # target_variants / descr_variants (only serialized if non-empty)
+            target_variants = []
+            for variant in getattr(stage, "target_variants", []) or []:
+                target_variants.append({
+                    "when": [self._condition_spec(c) for c in variant.when],
+                    "value": variant.value,
+                })
+            descr_variants = []
+            for idx, variant in enumerate(getattr(stage, "descr_variants", []) or []):
+                descr_variants.append({
+                    "when": [self._condition_spec(c) for c in variant.when],
+                    "key": f"{quest_id}_stage_{stage_id}_descr_v{idx + 1}",
+                })
+
+            stage_data: dict[str, Any] = {
                 "target": stage.target_alias or "",
                 "target_squad": self._resolve_squad_section(
                     stage.target_squad_id
@@ -1095,6 +1237,13 @@ class LuaGenerator:
                     for condition in (rules.get("fail") or [])
                 ],
             }
+            if target_variants:
+                stage_data["target_variants"] = target_variants
+            if descr_variants:
+                stage_data["descr_variants"] = descr_variants
+            if npc_item_actions:
+                stage_data["npc_item_actions"] = npc_item_actions
+            stages[stage_id] = stage_data
 
         # Автоматическая очистка этапных GiveInfo. Поршни, выданные на старте
         # этапа (например, "*_ready" для диалога сдачи), обязаны сниматься
@@ -1206,25 +1355,208 @@ class LuaGenerator:
         """
         return "local QUESTS = " + self._to_lua(quest_data, indent=0)
 
-    def _build_helpers(self, script_name: str) -> str:
+    def _build_helpers(
+        self,
+        script_name: str,
+        needs_story: bool,
+        needs_npc_item: bool = False,
+    ) -> str:
         """Подставляет имя модуля и константы в шаблон общих хелперов.
+
+        Story- и NPC-item-фрагменты вставляются только при соответствующих
+        флагах; для проектов без них шаблон остаётся байт-идентичным
+        прежнему.
 
         Args:
             script_name (str): Имя модуля для логов.
+            needs_story (bool): Проект использует хотя бы одно Story-действие
+                (``SpawnSquad(mode="story")`` или ``RemoveSquad``).
+            needs_npc_item (bool): Проект использует ``SpawnNpcItem``.
 
         Returns:
             str: Lua-код generic-хелперов.
         """
+        npc_item_helpers = ""
+        npc_item_branch = ""
+        story_helpers = ""
+        story_unmark = ""
+        story_branches = ""
+        story_run_args = ""
+        if needs_npc_item:
+            npc_item_helpers = (
+                "\n"
+                + r"""-- Spawns an item into an NPC inventory or a squad commander
+-- for later looting; no news_manager notifications are emitted.
+-- Returns true only when the target server object (or squad commander)
+-- exists and every alife_create_item call produced an item.
+local function spawn_npc_item(section, target_name, count)
+	if not (section and section ~= "" and target_name and target_name ~= "") then
+		return false
+	end
+	local obj = resolve_alife_object(target_name)
+	if not obj and get_story_squad then
+		local squad_ok, squad = pcall(function()
+			return get_story_squad(target_name)
+		end)
+		if squad_ok and squad then obj = squad end
+	end
+	if not obj then
+		printe("[__SCRIPT_NAME__] ! cannot resolve NPC/squad [%s] for item [%s]",
+			tostring(target_name), tostring(section))
+		return false
+	end
+	if obj.commander_id then
+		local cmd_id = obj:commander_id()
+		local commander = nil
+		if cmd_id and cmd_id ~= 0 then
+			commander = alife_object(cmd_id)
+		end
+		if not commander then
+			printe("[__SCRIPT_NAME__] ! commander of [%s] is not ready for item [%s]",
+				tostring(target_name), tostring(section))
+			return false
+		end
+		obj = commander
+	end
+	count = tonumber(count) or 1
+	for _ = 1, count do
+		local ok, se_item = pcall(function()
+			return alife_create_item(section, obj)
+		end)
+		if not (ok and se_item) then
+			printe("[__SCRIPT_NAME__] ! cannot create item [%s] for [%s]",
+				tostring(section), tostring(target_name))
+			return false
+		end
+	end
+	return true
+end"""
+                + "\n\n"
+            )
+            npc_item_branch = (
+                '\t\telseif kind == "spawn_npc_item" then\n'
+                "\t\t\tspawn_npc_item(spec.item, spec.target, spec.count)\n"
+            )
+        if needs_story:
+            story_helpers = (
+                "\n"
+                + r"""-- Story squads: separate namespace, no sim_squad_warfare calls.
+local function register_story_squad(quest_id, squad)
+	if not (quest_id and quest_id ~= "" and squad and squad.id) then
+		return
+	end
+	local quest = QUESTS[quest_id]
+	if not quest then return end
+	local idx = (vget(quest.key_prefix .. "_story_squad_cnt", 0) or 0) + 1
+	vset(quest.key_prefix .. "_story_squad_cnt", idx)
+	vset(quest.key_prefix .. "_story_squad_" .. tostring(idx), squad.id)
+end
+
+-- Spawns a story squad; movement is driven by target_smart in its LTX section.
+local function spawn_story_squad(base_name, section, quest_id, once_key)
+	if once_key and vget(once_key, 0) == 1 then
+		return
+	end
+	local base = get_smart(base_name)
+	if not (base and SIMBOARD and SIMBOARD.create_squad) then
+		printe("[__SCRIPT_NAME__] ! cannot spawn story squad [%s] at [%s]",
+			tostring(section), tostring(base_name))
+		return nil
+	end
+
+	local ok, squad = pcall(function()
+		return SIMBOARD:create_squad(base, section)
+	end)
+	if not ok or not squad then
+		printe("[__SCRIPT_NAME__] ! story spawn failed [%s]", tostring(section))
+		return nil
+	end
+
+	mark_task_squad(squad)
+	register_story_squad(quest_id, squad)
+	if once_key then
+		vset(once_key, 1)
+	end
+	printf("[__SCRIPT_NAME__] story squad [%s] id=%s spawned at [%s]",
+		tostring(section), tostring(squad.id), tostring(base_name))
+	return squad
+end
+
+-- Removes a story squad by story id/section; missing squad is a safe no-op.
+local function remove_story_squad(alias_or_section)
+	if not alias_or_section or alias_or_section == "" then return end
+	local squad = nil
+	if get_story_squad then
+		local ok, found = pcall(function()
+			return get_story_squad(alias_or_section)
+		end)
+		if ok and found then squad = found end
+	end
+	if not squad then
+		squad = resolve_alife_object(alias_or_section)
+	end
+	if squad and SIMBOARD and SIMBOARD.remove_squad then
+		pcall(SIMBOARD.remove_squad, SIMBOARD, squad)
+	end
+end"""
+                + "\n\n"
+            )
+            story_unmark = (
+                "\t-- Story squads: separate namespace so freeze_dyn_squads "
+                "never touches them.\n"
+                "\tlocal story_cnt = vget(q.key_prefix .. "
+                '"_story_squad_cnt", 0) or 0\n'
+                "\tfor i = 1, story_cnt do\n"
+                "\t\tunmark_task_squad(\n"
+                '\t\t\tvget(q.key_prefix .. "_story_squad_" .. '
+                'tostring(i), 0)\n'
+                "\t\t)\n"
+                "\tend\n"
+                '\tvset(q.key_prefix .. "_story_squad_cnt", 0)\n'
+                "\t-- Reset init spawn flag so a re-taken cancelled quest "
+                "can spawn again.\n"
+                '\tvset(q.key_prefix .. "_init_spawn", 0)\n'
+            )
+            story_branches = (
+                '\t\telseif kind == "spawn_story_squad" then\n'
+                "\t\t\tlocal quest = QUESTS[quest_id]\n"
+                "\t\t\tif quest then\n"
+                "\t\t\t\tlocal once_key\n"
+                "\t\t\t\tif stage_idx and stage_idx >= 0 then\n"
+                '\t\t\t\t\tonce_key = stage_key(quest, stage_idx, '
+                '"story_spawn")\n'
+                "\t\t\t\telse\n"
+                '\t\t\t\t\tonce_key = quest.key_prefix .. '
+                '"_init_spawn"\n'
+                "\t\t\t\tend\n"
+                "\t\t\t\tspawn_story_squad(spec.smart, spec.squad, "
+                "quest_id, once_key)\n"
+                "\t\t\tend\n"
+                '\t\telseif kind == "remove_squad" then\n'
+                "\t\t\tremove_story_squad(spec.squad)\n"
+            )
+            story_run_args = ", stage_idx"
+
         return (
             _HELPERS_TEMPLATE.replace("__SCRIPT_NAME__", script_name)
             .replace("__PDA_SOUND__", DEFAULT_PDA_SOUND)
             .replace("__STATUS_THROTTLE__", str(DEFAULT_STATUS_THROTTLE_MS))
             .replace("__RETURN_DISTANCE__", str(DEFAULT_RETURN_DISTANCE))
+            .replace("__NPC_ITEM_HELPERS__", npc_item_helpers)
+            .replace("__NPC_ITEM_ACTION_BRANCH__", npc_item_branch)
+            .replace("__STORY_UNMARK__", story_unmark)
+            .replace("__STORY_HELPERS__", story_helpers)
+            .replace("__STORY_ACTION_BRANCHES__", story_branches)
+            .replace("__STORY_RUN_ARGS__", story_run_args)
             .strip()
         )
 
     def _build_quest_functions(
-        self, quest_id: str, quest: "Quest", data: dict[str, Any]
+        self,
+        quest_id: str,
+        quest: "Quest",
+        data: dict[str, Any],
+        needs_story: bool = False,
     ) -> tuple[str, list[tuple[str, str, str]]]:
         """Генерирует плоские функции одного квеста.
 
@@ -1237,6 +1569,8 @@ class LuaGenerator:
             quest_id (str): ID квеста.
             quest (Quest): Модель квеста.
             data (dict[str, Any]): Сериализованные данные квеста.
+            needs_story (bool): Проект использует Story-действия; добавляет
+                аргумент ``stage_idx`` в вызовы ``run_actions``.
 
         Returns:
             tuple[str, list[tuple[str, str, str]]]:
@@ -1244,6 +1578,75 @@ class LuaGenerator:
         """
         q = self._lua_string(quest_id)
         keys: list[tuple[str, str, str]] = []
+        stage_arg = ", stage" if needs_story else ""
+        extra_arg = ", -1" if needs_story else ""
+        story_reset = (
+            '\t\tvset(stage_key(quest, stage, "story_spawn"), 0)\n'
+            if needs_story
+            else ""
+        )
+
+        # SpawnNpcItem из on_start_actions повторяется, пока командир отряда
+        # не будет доступен: результат вызова фиксируется отдельными
+        # pstor-ключами, а не общим "started".
+        npc_item_reset = ""
+        npc_item_status = ""
+        if any(
+            stage_data.get("npc_item_actions")
+            for stage_data in data["stages"].values()
+        ):
+            npc_item_reset = (
+                '\t\tvset(stage_key(quest, stage, "npc_item_done"), 0)\n'
+                "\t\tfor i = 1, #(stage_data.npc_item_actions or {}) do\n"
+                '\t\t\tvset(stage_key(quest, stage, '
+                '"npc_item_done_" .. tostring(i)), 0)\n'
+                "\t\tend\n"
+            )
+            npc_item_status = (
+                "\t-- NPC items from on_start_actions are retried on later\n"
+                "\t-- status ticks until the squad commander is available.\n"
+                '\tif vget(stage_key(quest, stage, "npc_item_done"), 0) == 0 then\n'
+                "\t\tlocal npc_items_done = true\n"
+                "\t\tfor idx, item_spec in ipairs("
+                "stage_data.npc_item_actions or {}) do\n"
+                "\t\t\tlocal item_key = stage_key(\n"
+                '\t\t\t\tquest, stage, "npc_item_done_" .. tostring(idx)\n'
+                "\t\t\t)\n"
+                "\t\t\tif vget(item_key, 0) == 0 then\n"
+                "\t\t\t\tif spawn_npc_item(item_spec.item, "
+                "item_spec.target, item_spec.count) then\n"
+                "\t\t\t\t\tvset(item_key, 1)\n"
+                "\t\t\t\telse\n"
+                "\t\t\t\t\tnpc_items_done = false\n"
+                "\t\t\t\tend\n"
+                "\t\t\tend\n"
+                "\t\tend\n"
+                "\t\tif npc_items_done then\n"
+                '\t\t\tvset(stage_key(quest, stage, "npc_item_done"), 1)\n'
+                "\t\tend\n"
+                "\tend\n"
+            )
+
+        # Build target function with optional target_variants
+        target_variants_code = ""
+        if data["stages"]:
+            # Check if any stage has target_variants
+            has_target_variants = any(
+                stage_data.get("target_variants")
+                for stage_data in data["stages"].values()
+            )
+            if has_target_variants:
+                target_variants_code = """\t-- Check target_variants for current stage
+\tlocal variants = (stage_data and stage_data.target_variants) or {}
+\tfor _, var in ipairs(variants) do
+\t\tif eval_conditions(var.when, db.actor) then
+\t\t\tlocal target_id = resolve_target(var.value)
+\t\t\tif target_id then return target_id end
+\t\t\tlocal target_obj = resolve_alife_object(var.value)
+\t\t\tif target_obj then return target_obj.id end
+\t\tend
+\tend
+"""
 
         target = f"""\
 -- Quest target: smart/story id of the current stage.
@@ -1253,26 +1656,44 @@ local function {quest_id}_target(task_id, field, p, tsk)
 	if not quest then return nil end
 	local stage = (tsk and tsk.stage) or 0
 	local stage_data = quest.stages[stage]
-	local target_name = (stage_data and stage_data.target) or ""
-	if target_name ~= "" then
-		local target_id = resolve_target(target_name)
-		if target_id then return target_id end
-		local target_obj = resolve_alife_object(target_name)
-		if target_obj then return target_obj.id end
-	end
-	local target_squad = (stage_data and stage_data.target_squad) or ""
-	if target_squad ~= "" then
-		local squad = resolve_alife_object(target_squad)
-		return squad and squad.id or nil
-	end
-	if tsk and tsk.task_giver_id and tsk.task_giver_id ~= 0 then
-		return tsk.task_giver_id
-	end
-	local target_id = resolve_target(quest.npc)
-	if target_id then return target_id end
-	local target_obj = resolve_alife_object(quest.npc)
-	return (target_obj and target_obj.id) or nil
+{target_variants_code}\tlocal target_name = (stage_data and stage_data.target) or ""
+\tif target_name ~= "" then
+\t\tlocal target_id = resolve_target(target_name)
+\t\tif target_id then return target_id end
+\t\tlocal target_obj = resolve_alife_object(target_name)
+\t\tif target_obj then return target_obj.id end
+\tend
+\tlocal target_squad = (stage_data and stage_data.target_squad) or ""
+\tif target_squad ~= "" then
+\t\tlocal squad = resolve_alife_object(target_squad)
+\t\treturn squad and squad.id or nil
+\tend
+\tif tsk and tsk.task_giver_id and tsk.task_giver_id ~= 0 then
+\t\treturn tsk.task_giver_id
+\tend
+\tlocal target_id = resolve_target(quest.npc)
+\tif target_id then return target_id end
+\tlocal target_obj = resolve_alife_object(quest.npc)
+\treturn (target_obj and target_obj.id) or nil
 end"""
+
+        # Build descr function with optional descr_variants
+        descr_variants_code = ""
+        if data["stages"]:
+            # Check if any stage has descr_variants
+            has_descr_variants = any(
+                stage_data.get("descr_variants")
+                for stage_data in data["stages"].values()
+            )
+            if has_descr_variants:
+                descr_variants_code = """\t-- Check descr_variants for current stage
+\tlocal variants = (stage_data and stage_data.descr_variants) or {}
+\tfor _, var in ipairs(variants) do
+\t\tif eval_conditions(var.when, db.actor) then
+\t\t\treturn var.key
+\t\tend
+\tend
+"""
 
         descr = f"""\
 -- Quest description: per-stage string id, falls back to the quest descr.
@@ -1281,7 +1702,7 @@ local function {quest_id}_descr(task_id, field, p, tsk)
 	local quest = QUESTS[{q}]
 	local stage = (tsk and tsk.stage) or 0
 	local stage_data = quest and quest.stages[stage]
-	return (stage_data and stage_data.descr) or (quest and quest.descr) or nil
+{descr_variants_code}\treturn (stage_data and stage_data.descr) or (quest and quest.descr) or nil
 end"""
 
         advance = self._build_advance_code(quest_id, data)
@@ -1308,7 +1729,7 @@ local function {quest_id}_status(tsk, task_id)
 	local start_key = stage_key(quest, stage, "started")
 	if vget(start_key, 0) == 0 then
 		vset(start_key, 1)
-		run_actions(stage_data.start_actions, db.actor, nil, {q})
+		run_actions(stage_data.start_actions, db.actor, nil, {q}{stage_arg})
 	end
 
 	-- Quest items from on_start_actions are idempotent: if the actor lost
@@ -1321,7 +1742,7 @@ local function {quest_id}_status(tsk, task_id)
 		end
 	end
 
-	spawn_stage_for(quest, stage, stage_data)
+{npc_item_status}	spawn_stage_for(quest, stage, stage_data)
 	freeze_stage_for(quest, stage, stage_data)
 	freeze_dyn_squads(quest)
 
@@ -1365,7 +1786,7 @@ local function {quest_id}_start(actor, npc, p)
 		vset(stage_key(quest, stage, "enemy"), 0)
 		vset(stage_key(quest, stage, "started"), 0)
 		vset(stage_key(quest, stage, "target_seen"), 0)
-		local allies = (stage_data.capture and stage_data.capture.ally_count) or 0
+{npc_item_reset}{story_reset}		local allies = (stage_data.capture and stage_data.capture.ally_count) or 0
 		for i = 1, allies do
 			vset(stage_key(quest, stage, "ally" .. i), 0)
 		end
@@ -1375,7 +1796,7 @@ local function {quest_id}_start(actor, npc, p)
 	if quest.taken_info ~= "" then
 		db.actor:give_info_portion(quest.taken_info)
 	end
-	run_actions(quest.init_actions, actor or db.actor, npc, {q})
+	run_actions(quest.init_actions, actor or db.actor, npc, {q}{extra_arg})
 	sound_task()
 	pda_tip(quest.msg_start)
 	printf("[__SCRIPT_NAME__] %s started", {q})
@@ -1397,7 +1818,7 @@ local function {quest_id}_reward(actor, npc, p)
 		db.actor:give_info_portion(quest.complete_info)
 	end
 
-	run_actions(quest.complete_actions, actor or db.actor, npc, {q})
+	run_actions(quest.complete_actions, actor or db.actor, npc, {q}{extra_arg})
 	for _, info in ipairs(quest.cleanup_infos or {{}}) do
 		db.actor:disable_info_portion(info)
 	end
@@ -1416,7 +1837,7 @@ local function {quest_id}_cleanup(actor, npc, p)
 
 	unmark_quest_squads(quest)
 	vset(quest.key_prefix .. "_dyn_squad_cnt", 0)
-	run_actions(quest.fail_actions, actor or db.actor, npc, {q})
+	run_actions(quest.fail_actions, actor or db.actor, npc, {q}{extra_arg})
 	if db.actor and quest.taken_info ~= "" then
 		db.actor:disable_info_portion(quest.taken_info)
 	end
@@ -1486,6 +1907,7 @@ end"""
         dialog: "Dialog",
         linked_quest_id: str | None,
         quest_data: dict[str, dict[str, Any]],
+        needs_story: bool = False,
     ) -> tuple[str, list[tuple[str, str, str]]]:
         """Генерирует функции диалога и реплик.
 
@@ -1498,6 +1920,7 @@ end"""
             dialog (Dialog): Модель диалога.
             linked_quest_id (str | None): Связанный квест.
             quest_data (dict[str, dict[str, Any]]): Данные квестов.
+            needs_story (bool): Проект использует Story-действия.
 
         Returns:
             tuple[str, list[tuple[str, str, str]]]:
@@ -1505,6 +1928,7 @@ end"""
         """
         keys: list[tuple[str, str, str]] = []
         blocks: list[str] = []
+        extra_arg = ", -1" if needs_story else ""
 
         # HasInfo/DontHasInfo уже вынесены в нативные XML-теги диалога.
         # Повторять их в _can_take нельзя (P1-9): это дублирует условие.
@@ -1530,28 +1954,20 @@ end"""
         )
 
         # Стадийная защита сдачи. Если известен этап возврата — требуем его.
-        # Для диалога сдачи без собственного HasInfo (он не привязан к
-        # поршню промежуточного этапа) дополнительно требуем последний этап:
-        # безусловная сдача не должна открываться на нулевом этапе.
-        # Многоэтапные квесты с промежуточными HasInfo-диалогами сдачи
-        # сохраняют штатное поведение.
-        has_info_precondition = any(
-            isinstance(condition, HasInfo)
-            for condition in dialog.preconditions
-        )
+        # Если этап возврата не задан, безусловно требуем последний этап:
+        # диалог сдачи не должен открываться до полного прохождения квеста,
+        # даже если у него есть собственный HasInfo (``taken`` — признак
+        # выдачи, а не готовности).
         stage_guards = (
             "\tif quest.return_stage >= 0 and "
             "(tsk.stage or 0) < quest.return_stage then\n"
             "\t\treturn false\n"
             "\tend\n"
+            "\tif quest.return_stage < 0 and "
+            "(tsk.stage or 0) < (quest.last_stage or 0) then\n"
+            "\t\treturn false\n"
+            "\tend\n"
         )
-        if not has_info_precondition:
-            stage_guards += (
-                "\tif quest.return_stage < 0 and "
-                "(tsk.stage or 0) < (quest.last_stage or 0) then\n"
-                "\t\treturn false\n"
-                "\tend\n"
-            )
 
         can_take = f"""\
 -- Dialog availability: all dialog-level conditions plus "task not given".
@@ -1665,7 +2081,7 @@ end"""
                     f"""\
 -- Phrase {phrase_id} action: merged actions of the phrase.
 local function {prefix}_action(actor, npc, p)
-	run_actions({specs}, actor or db.actor, npc, {linked})
+	run_actions({specs}, actor or db.actor, npc, {linked}{extra_arg})
 end"""
                 )
                 keys.append(
