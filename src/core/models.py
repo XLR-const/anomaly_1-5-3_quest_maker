@@ -318,6 +318,45 @@ class SetTarget(BaseAction):
     smart_alias: str = Field(description="Алиас смарта-цели.")
 
 
+class ClearSmart(BaseAction):
+    """Очистить смарт от ванильных отрядов перед спавном квестового.
+
+    Действие выполняется **до** :class:`SpawnSquad`: иначе оно удалит только
+    что созданный квестовый отряд. Хелпер ``clear_smart`` пропускает актора,
+    компаньонов, отряды из ``sim_offline_combat.task_squads``, сюжетные
+    отряды и явно перечисленные ``keep_story_ids``. Если задан ``faction``,
+    удаляются только отряды этой фракции.
+
+    Attributes:
+        smart_alias (str): Алиас смарт-террейна, который нужно очистить.
+        faction (str | None): Техническое имя фракции; ``None`` — все
+            не-сюжетные отряды.
+        keep_story_ids (list[str]): Story-ID отрядов, которые нельзя удалять.
+        allow_giver_smart (bool): Явное разрешение чистить смарт квестодателя.
+    """
+
+    type: Literal["clear_smart"] = Field(default="clear_smart")
+    smart_alias: str = Field(description="Алиас очищаемого смарт-террейна.")
+    faction: str | None = Field(
+        default=None,
+        description=(
+            "Удалять только отряды указанной фракции; None — все "
+            "не-сюжетные отряды."
+        ),
+    )
+    keep_story_ids: list[str] = Field(
+        default_factory=list,
+        description="Story-ID отрядов, которые запрещено удалять.",
+    )
+    allow_giver_smart: bool = Field(
+        default=False,
+        description=(
+            "Явно разрешает очистку смарта квестодателя. Без этого флага "
+            "XrayLinter сообщает ERROR XRAY-SPAWN-001."
+        ),
+    )
+
+
 class SpawnNpcItem(BaseAction):
     """Заспавнить предмет в инвентарь NPC или командира отряда.
 
@@ -430,6 +469,7 @@ Action: TypeAlias = Annotated[
         SpawnSquad,
         RemoveSquad,
         SetTarget,
+        ClearSmart,
         SpawnNpcItem,
         GiveItem,
         RemoveItem,
@@ -1316,6 +1356,7 @@ __all__ = [
     "Action",
     "BaseAction",
     "BaseCondition",
+    "ClearSmart",
     "CompleteTask",
     "Condition",
     "CustomSquad",

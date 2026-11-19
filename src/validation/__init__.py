@@ -8,6 +8,7 @@ from src.validation.report import (
     ValidationReport,
     ValidationReportError,
 )
+from src.validation.xray_linter import XrayLinter
 
 __all__ = [
     "CatalogValidator",
@@ -17,4 +18,5 @@ __all__ = [
     "ValidationIssue",
     "ValidationReport",
     "ValidationReportError",
+    "XrayLinter",
 ]
