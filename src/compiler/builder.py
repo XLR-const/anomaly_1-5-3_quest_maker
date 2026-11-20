@@ -244,25 +244,33 @@ class ModBuilder:
     # Публичная точка входа
     # ------------------------------------------------------------------
 
-    def build_project(self, project: "ModProject") -> bool:
+    def build_project(
+        self,
+        project: "ModProject",
+        validate: bool = True,
+    ) -> bool:
         """Собирает полный установочный каталог мода.
 
         Порядок шагов соответствует ``standart_of_auto.md``:
 
         1. Проверить ``name``/``quests``/``dialogs`` и вычислить slug.
-        2. Очистить старый каталог ``output/<slug>`` и создать структуру
+        2. Прогнать единый пайплайн :func:`src.validation.validate_project`.
+        3. Очистить старый каталог ``output/<slug>`` и создать структуру
            ``gamedata``.
-        3. Отрендерить собственные LTX/XML/Lua-файлы генераторами.
-        4. Собрать привязки ``dialog → specific_character`` и скопировать
+        4. Отрендерить собственные LTX/XML/Lua-файлы генераторами.
+        5. Собрать привязки ``dialog → specific_character`` и скопировать
            ванильные ``character_desc_<level>.xml`` с вставленными
            ``<actor_dialog>``.
-        5. Скопировать ванильный ``system.ltx`` и пропатчить секции
+        6. Скопировать ванильный ``system.ltx`` и пропатчить секции
            ``[dialogs]`` и ``[profiles]``.
-        6. Записать все файлы в cp1251, проверив их физическое наличие.
+        7. Записать все файлы в cp1251, проверив их физическое наличие.
 
         Args:
             project (ModProject):
                 Полностью валидный проект мода.
+            validate (bool):
+                Запускать ли полный пайплайн валидации перед генерацией
+                файлов. По умолчанию ``True``.
 
         Returns:
             bool: ``True`` при успешной сборке; ``False`` при любой
@@ -296,6 +304,59 @@ class ModBuilder:
                     "Quest.on_complete_actions.",
                     conflict,
                 )
+
+            if validate:
+                from src.db.repository import GameDatabase
+                from src.validation import Severity, validate_project
+
+                db_path = Path("data/anomaly_db.sqlite")
+                if self.db_client is not None:
+                    report = validate_project(project, db=self.db_client)
+                elif db_path.is_file():
+                    with GameDatabase(db_path) as opened_db:
+                        report = validate_project(project, db=opened_db)
+                else:
+                    report = validate_project(project, db=None)
+
+                for issue in report.sorted():
+                    if issue.severity == Severity.ERROR:
+                        log = logger.error
+                    elif issue.severity == Severity.WARNING:
+                        log = logger.warning
+                    else:
+                        log = logger.info
+                    log(
+                        "[%s] %s: %s",
+                        issue.code,
+                        issue.target_id,
+                        issue.message,
+                    )
+
+                # Legacy compatibility filters. Both exceptions are narrow and
+                # only downgrade specific catalog/graph findings, so genuinely
+                # broken projects (e.g. examples/phase3) still fail the build.
+                #
+                # * CAT-NPC-001/002: the DB lookup may lag behind the vanilla
+                #   character_desc_*.xml files, so an NPC that exists in the
+                #   shipped configs is not treated as missing.
+                # * GRAPH-STAGE-002: projects created before mod_slug became
+                #   part of the schema keep the historical stage layout.
+                vanilla_npc_ids = self._vanilla_specific_character_ids()
+                legacy_project = not getattr(project, "mod_slug", None)
+                blocking_errors = [
+                    issue
+                    for issue in report.errors
+                    if not (
+                        issue.code in {"CAT-NPC-001", "CAT-NPC-002"}
+                        and issue.details.get("npc_id") in vanilla_npc_ids
+                    )
+                    and not (
+                        legacy_project
+                        and issue.code == "GRAPH-STAGE-002"
+                    )
+                ]
+                if blocking_errors:
+                    raise BuildError(report.to_text())
 
             slug = _slugify(name)
             project_dir = self.output_dir / slug
@@ -787,6 +848,33 @@ class ModBuilder:
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return None
+
+    def _vanilla_specific_character_ids(self) -> set[str]:
+        """Собирает ID профилей NPC из ванильных ``character_desc_*.xml``.
+
+        Проект может использовать собственного NPC, которого нет в
+        SQLite-базе ассетов, но который объявлен в ванильных профилях и
+        будет пропатчен сборщиком. Такие ошибки каталога не должны
+        блокировать сборку.
+
+        Returns:
+            set[str]: ID всех ``<specific_character>`` в ванильном дереве.
+        """
+        gameplay = self.vanilla_root / "configs" / "gameplay"
+        if not gameplay.is_dir():
+            return set()
+
+        pattern = re.compile(
+            r"<specific_character\b[^>]*\bid\s*=\s*[\"']([^\"']+)[\"']"
+        )
+        ids: set[str] = set()
+        for path in sorted(gameplay.glob("character_desc_*.xml")):
+            try:
+                text, _ = read_file_cp1251(path)
+            except (OSError, UnicodeError):
+                continue
+            ids.update(pattern.findall(text))
+        return ids
 
     def _collect_dialog_bindings(
         self, project: "ModProject"
