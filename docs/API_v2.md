@@ -218,6 +218,10 @@ print(f"Готовый мод: {builder.output_dir}")
       `npc_location`.
 - [ ] ID квестов и диалогов — валидные Lua-идентификаторы:
       `[A-Za-z_][A-Za-z0-9_]*`, без пробелов и зарезервированных слов Lua.
+- [ ] `validate_project(project, db)` не возвращает `ERROR`
+      (см. §3.6), либо `build_project(..., validate=True)` проходит.
+- [ ] При модульной сборке `ModProject.merge(...)` не бросает `ValueError`,
+      а `MergeValidator` не находит `MERGE-ID-001` (см. §2.13).
 
 ---
 
@@ -283,6 +287,24 @@ RequiredId: TypeAlias = Annotated[
 | `GiveTask` | `"give_task"` | `[Общее]` | `task_id: RequiredId` | Единственное действие реплики — `<action>dialogs.<текущий_dialog_id>_accept</action>`; в Lua — `give_task`. В комбинации с другими действиями сливается в единую `dialogs.<dialog_id>_phrase_<n>_action`. |
 | `CompleteTask` | `"complete_task"` | `[Общее]` | `task_id: RequiredId` | Единственное действие реплики — `<action>dialogs.<текущий_dialog_id>_turn_in</action>`; в Lua — `complete_task`. В комбинации с другими действиями сливается в единую `dialogs.<dialog_id>_phrase_<n>_action`. |
 | `RemoveSquad` | `"remove_squad"` | `[Story]` | `squad_alias: str` | Lua `get_story_squad(alias)` → `SIMBOARD:remove_squad(squad)`. Если отряд уже мёртв/не найден — безопасный no-op. Используется в `Quest.on_fail_actions` для очистки Story-отряда. |
+| `ClearSmart` | `"clear_smart"` | `[Story]` | `smart_alias: str`, `faction: str \| None = None`, `keep_story_ids: list[str] = []`, `allow_giver_smart: bool = False` | Lua `clear_smart(...)`: удаляет ванильные и не-сюжетные отряды на смарте **перед** спавном квестового. Пропускает актора, компаньонов, `keep_story_ids`, Story-отряды и отряды текущего квеста; при заданном `faction` — только отряды этой фракции. Не меняет владельца смарта. |
+
+> **`ClearSmart` — только Story и строго до `SpawnSquad`.**
+> `ClearSmart` вызывается **до** `SpawnSquad` в одном и том же списке
+> `on_start_actions`: иначе действие удалит только что созданный квестовый
+> отряд. Оно несовместимо с `WarfareCapture` в одном квесте (используйте
+> отдельный Story-квест). Если `smart_alias` совпадает со смартом
+> квестодателя, требуется явный `allow_giver_smart=True`; без него
+> `XrayLinter` возвращает `ERROR XRAY-SPAWN-001`. Повторный вызов
+> идемпотентен (no-op).
+>
+> ```python
+> on_start_actions=[
+>     ClearSmart(smart_alias=SPAWN_SMART, faction="bandit"),
+>     SpawnSquad(squad_alias=SQUAD, smart_alias=SPAWN_SMART, mode="story"),
+>     SpawnNpcItem(item_alias=ITEM, target_alias=SQUAD, count=1),
+> ]
+> ```
 
 > **Story-спавн.** `SpawnSquad(mode="story")` — штатный способ создать
 > сюжетный отряд. Действие вызывает `SIMBOARD:create_squad(spawn_smart, section)`,
@@ -320,6 +342,7 @@ RequiredId: TypeAlias = Annotated[
 
 ```python
 from src.core.models import (
+    ClearSmart,
     CompleteTask,
     GiveInfo,
     GiveItem,
@@ -332,18 +355,37 @@ from src.core.models import (
     TakeMoney,
 )
 
-actions = [
+# Story: ClearSmart строго перед SpawnSquad(mode="story").
+story_actions = [
     GiveInfo(info="my_quest_started"),
-    SpawnSquad(squad_alias="squad.mercenary_advanced", smart_alias="deadcity.hospital"),
-    SetTarget(squad_alias="squad.mercenary_advanced", smart_alias="deadcity.hospital"),
+    ClearSmart(smart_alias="deadcity.hospital", faction="bandit"),
+    SpawnSquad(
+        squad_alias="squad.killer_advanced",
+        smart_alias="deadcity.hospital",
+        mode="story",
+    ),
+]
+
+# Warfare: SpawnSquad(mode="warfare") + SetTarget. ClearSmart здесь запрещён.
+warfare_actions = [
+    SpawnSquad(
+        squad_alias="squad.killer_advanced",
+        smart_alias="deadcity.hospital",
+        mode="warfare",
+    ),
+    SetTarget(squad_alias="squad.killer_advanced", smart_alias="deadcity.hospital"),
+]
+
+item_actions = [
     GiveItem(item_alias="wpn_ak74", count=1),
     RemoveItem(item_alias="itm_pda_common", count=1),
     TakeItem(item_alias="itm_pda_common", count=1),
     GiveMoney(amount=50000),
     TakeMoney(amount=2500),
-    GiveTask(task_id="my_quest"),
-    CompleteTask(task_id="my_quest"),
 ]
+
+# GiveTask и CompleteTask — взаимоисключающие действия разных реплик.
+task_actions = [GiveTask(task_id="my_quest")]  # или CompleteTask(task_id=...)
 ```
 
 > **Алиасы и секции.** Поля `item_alias` в `GiveItem`/`RemoveItem`/`TakeItem`
@@ -354,6 +396,21 @@ actions = [
 > сборка не падает). Без БД или при ошибке запроса строка также используется
 > как есть. Warning важен: несуществующая секция иначе даёт молчаливый no-op
 > в игре (`give_item` только пишет `printe` в лог).
+
+> **Секции отрядов в `SpawnSquad.squad_alias`/`SetTarget.squad_alias`.**
+> Это всегда секция/игровой ID **отряда** (`squad.killer_advanced`,
+> `merc_sim_squad_advanced`, `squad.army_advanced`), а не NPC-шаблон.
+> `sim_default_stalker_1` — NPC-секция и как `squad_alias`/`ally_squad_alias`
+> запрещена (`CAT-WARFARE-001`/`CAT-SQUAD-001`). Секция
+> `squad.mercenary_advanced` в БД Anomaly 1.5.3 отсутствует — используйте
+> `squad.killer_advanced` (игровой ID `merc_sim_squad_advanced`).
+
+> **Порядок `SpawnSquad` → `SpawnNpcItem`.** Если `SpawnNpcItem.target_alias`
+> указывает на `CustomSquad`, действие обязано идти **после** `SpawnSquad`
+> в том же списке `on_start_actions`. Для отряда принимается
+> `CustomSquad.id`/`story_id`, но без заданного `story_id` командир не
+> гарантирован (`CAT-SQUAD-002`/`XRAY-SPAWNITEM-002`). Если командир не
+> найден, предмет не создаётся.
 
 > **Уведомления при изъятии предмета.** `TakeItem`/`RemoveItem` удаляют
 > предметы напрямую через `actor:iterate_inventory` и `alife_release`. Сообщение
@@ -670,6 +727,38 @@ class DescrVariant(BaseModel):
    `<quest_id>_stage_<n>_descr_v1`, `_v2`, …; индексы не зависят от локали.
 5. Пустой `when` — ошибка валидации.
 
+### Три семантики смарта: маркер / спавн / назначение
+
+Это главная ловушка Phase 3. Три поля с `alias`/`smart` **не взаимозаменяемы**:
+
+| Поле | Что означает | Где используется | Типичная ошибка |
+|---|---|---|---|
+| `Stage.target_alias` | Цель **маркера** в КПК. Не точка спавна. | `target_functor` | Считать, что это место появления отряда. |
+| `SpawnSquad.smart_alias` | Точка **спавна** отряда. | `spawn_squad`/`create_squad` | Спавн врага на смарте квестодателя → мгновенный бой и гибель NPC. |
+| `CustomSquad.target_smart` | Точка **назначения**; куда отряд идёт после спавна. | секция `squad_descr_*.ltx` | Совпадение с точкой спавна → отряд не марширует. |
+
+Правильный пример: спавн на `zat_b7`, марш к `zat_b52`, маркер — на
+`zat_b7` (или на цели, если игрок должен идти туда):
+
+```python
+Stage(
+    id=0,
+    target_alias="zat_b7",                       # маркер КПК
+    on_start_actions=[
+        SpawnSquad(
+            squad_alias=SQUAD,
+            smart_alias="zat_b7",                # точка спавна
+            mode="story",
+        ),
+    ],
+)
+# CustomSquad(SQUAD, ..., target_smart="zat_b52")  # точка назначения
+```
+
+> **Жёсткое правило.** Вражеский отряд **не должен** спавниться на смарте
+> квестодателя (`XRAY-SPAWN-001`/`CAT-SMART-003`). `target_alias` —
+> независимое поле маркера: оно не задаёт ни спавн, ни маршрут.
+
 Как работает `target_alias`:
 
 ```text
@@ -811,11 +900,18 @@ class Quest(BaseModel):
 | Поле | Режим | Тип | По умолчанию | Назначение |
 |---|---|---|---|---|
 | `id` | `[Общее]` | `RequiredId` | обязательное | ID секции LTX `[id]`, ключ `task_functor` и префикс всех функций. |
-| `giver_npc_id` | `[Общее]` | `OptionalId` | `None` | Устаревшее имя ID квестодателя. Используется, если `npc_id` не задан. |
-| `npc_id` | `[Общее]` | `OptionalId` | `None` | Игровой ID NPC-квестодателя. Попадает в `give_task` и `task_giver_alive`. |
+| `giver_npc_id` | `[Общее]` | `OptionalId` | `None` | Устаревшее имя ID квестодателя. Эффективный квестодатель вычисляется как `giver_npc_id or npc_id`; он используется в `give_task`, `task_giver_alive`, `condlist_0` и `target_functor`. |
+| `npc_id` | `[Общее]` | `OptionalId` | `None` | Игровой ID NPC-квестодателя. Попадает в `give_task` и `task_giver_alive`; используется, если `giver_npc_id` не задан. Для привязки диалога приоритет у `Dialog.npc_id`. |
 | `npc_location` | `[Общее]` | `str \| None` | `None` | Локация квестодателя для патча `character_desc_<level>.xml`. |
 | `dialog_id` | `[Общее]` | `OptionalId` | `None` | ID основного диалога выдачи квеста. |
 | `dialog_ids` | `[Общее]` | `list[str]` | `[]` | Все связанные диалоги (выдача, сдача, ветки). |
+
+> **`giver_npc_id` vs `npc_id`.** Это не два независимых квестодателя.
+> Эффективный квестодатель — `giver_npc_id or npc_id`; `giver_npc_id`
+> перекрывает `npc_id`, если задан. `condlist_0 = {!task_giver_alive(...)} fail`
+> создаётся, если **эффективный** giver задан и `fail_on_giver_death=True`
+> (а не только при заполненном `giver_npc_id`). Для привязки диалога
+> `Dialog.npc_id` имеет приоритет над `Quest.npc_id`/`Quest.giver_npc_id`.
 
 ### Тексты и PDA
 
@@ -848,6 +944,21 @@ class QuestCondlist(BaseModel):
     when: list[Condition]                      # min_length=1
     result: Literal["complete", "fail"]
 ```
+
+> **Только объекты `QuestCondlist`.** `Quest.extra_condlists` принимает
+> исключительно `QuestCondlist`. Сырой `dict` вида
+> `{"complete": [SmartOwner(...)]}` даёт `pydantic.ValidationError` ещё до
+> сборки. Внутри `when` допустимы только `HasInfo`, `DontHasInfo` и
+> `HasItem`; `SmartOwner` и `HasMoney` в `[Story]`-condlist **не
+> поддерживаются** и дают `BuildError` (см. таблицу ниже).
+>
+> ```python
+> from src.core.models import HasInfo, QuestCondlist
+>
+> extra_condlists=[
+>     QuestCondlist(when=[HasInfo(info="mymod_merc_dead")], result="complete"),
+> ]
+> ```
 
 Нумерация:
 
@@ -948,24 +1059,55 @@ end
 квест не будет «висеть» вне Warfare, а его эффекты не выполнятся без
 включённого режима.
 
-> **Награда сдачи — только через `Quest.reward_*` или `on_complete_actions`.**
-> Если вы задали `reward_money`, `reward_item_alias` или `complete_info`, не
-> добавляйте те же `GiveMoney`/`GiveItem`/`GiveInfo` в диалоговые `actions`,
-> иначе награда выдастся дважды.
+> **Жёсткое правило: `requires_warfare=True` — это гейт, а не подсказка.**
+> Вне Warfare:
 >
+> - `<dialog_id>_can_take` возвращает `false` — стартовой фразы не будет;
+> - `<quest_id>_start` не выполняется — `on_init_actions`/`taken_info` не сработают;
+> - `<quest_id>_status` не тикает — `on_start_actions`, `transfer_conditions`
+>   и `target_squad_id` не продвигают квест;
+> - `WarfareCapture` дополнительно включает `world = true`.
+>
+> Если сценарий тестируется в Story/freeplay, **не задавайте**
+> `requires_warfare` и не используйте `WarfareCapture`. Смешение
+> `WarfareCapture` и `SpawnSquad(mode="story")` в одном квесте — `BuildError`;
+> разделяйте сценарий на два квеста.
+
+> **Запрет: `CompleteTask` + ручная выдача награды при пустых `reward_*`.**
 > Если `reward_money`/`reward_item_alias` **пусты**, награда в `actions`
-> реплики, где есть `CompleteTask`, не поддерживается: движок исполняет только
+> реплики, где есть `CompleteTask`, **не поддерживается** и считается
+> ошибкой (`GRAPH-REWARD-001`/`XRAY-REWARD-002`): движок исполняет только
 > один `<action>` на реплику, а `CompleteTask` завершает задачу раньше
 > остальных эффектов. В результате игрок не получает ни денег, ни предмета.
-> Надёжные пути:
 >
-> - `Quest.reward_money` / `Quest.reward_item_alias` (эффект `_reward`);
-> - `Quest.on_complete_actions` (Lua после завершения задачи);
-> - `Quest.complete_info` для поршня завершения.
+> ```python
+> # ПЛОХО: награда потеряется, reward_* пусты
+> Phrase(
+>     id=2,
+>     actions=[
+>         CompleteTask(task_id=QUEST_ID),
+>         GiveMoney(amount=50000),
+>         GiveItem(item_alias="wpn_ak74"),
+>     ],
+> )
 >
-> Компилятор (`ModBuilder.build_project`) выводит предупреждение в лог, если
-> видит `GiveMoney`/`GiveItem` рядом с `CompleteTask` при пустых
-> `reward_money`/`reward_item_alias`.
+> # ХОРОШО: награда в Quest.reward_* (эффект _reward)
+> Quest(
+>     ...,
+>     reward_money=50000,
+>     reward_item_alias="wpn_ak74",
+>     reward_item_count=1,
+> )
+>
+> # ХОРОШО: награда в Quest.on_complete_actions
+> Quest(..., on_complete_actions=[GiveItem(item_alias="wpn_ak74")])
+> ```
+>
+> Надёжные пути: `Quest.reward_money`/`Quest.reward_item_alias`
+> (эффект `_reward`), `Quest.on_complete_actions` (Lua после завершения
+> задачи) или `Quest.complete_info` для поршня завершения. Компилятор
+> выводит warning, а предполётная валидация трактует это как `ERROR`
+> (см. §3.6).
 
 > **Автоматическая сдача vs диалоговая сдача.** Если задан
 > `return_to_giver_stage`, квест завершится автоматически при приближении к
@@ -1091,6 +1233,25 @@ dialog_id = "deadcity_dushman_take"
 > доступен у конкретного NPC, всегда задавайте и `npc_id`, и `npc_location`.
 > `dialog_id` — это ровно то значение, которое попадёт в `<actor_dialog>`.
 
+### Уникальные торговцы и `meet`-диалоги (`XRAY-MEET-001`)
+
+`Dialog.npc_id` + `npc_location` лишь **добавляют** `<actor_dialog>` в профиль.
+Они не заменяют существующий `meet`-диалог и не гарантируют, что уникальный
+торговец покажет новую ветку. Для уникальных NPC с `meet`-схемой стартовая
+фраза может не появиться, хотя сборка успешна.
+
+Типичные примеры: `zat_a2_stalker_barmen`, `cit_killers_merc_trader_stalker`,
+`esc_2_12_stalker_nimble`, `esc_2_12_stalker_trader`. Профиль `esc_m_trader`
+в Anomaly 1.5.3 отсутствует (Сидорович — `esc_2_12_stalker_trader`).
+
+`XrayLinter` сообщает `XRAY-MEET-001` (WARNING с ручной проверкой). Что делать:
+
+1. Тестировать на **чистом сохранении/новом профиле** — старый
+   `taken_info` может блокировать диалог через `DontHasInfo`.
+2. Если ветка не появляется — патчить `meet`-диалог или добавлять реплику в
+   существующий `meet`, а не только `<actor_dialog>`.
+3. Для детерминированного теста использовать неуникального NPC.
+
 ## 2.11. `CustomSquad` — кастомные секции отрядов `[Общее]`
 
 ```python
@@ -1116,16 +1277,32 @@ class CustomSquad(BaseModel):
 | `faction` | `[Общее]` | `str` | обязательное | Фракция отряда, например `bandit` или `army`. |
 | `npc` | `[Общее]` | `list[str]` | `[]` | Явный список секций NPC, например `["sim_default_bandit_4"]`. |
 | `npc_random` | `[Общее]` | `list[str]` | `[]` | Пул секций, из которого движок выбирает NPC случайно. |
-| `npc_in_squad` | `[Общее]` | `list[int]` | `[]` | Размер отряда: `[n]` или `[min, max]`, где `0 <= min <= max`. |
-| `target_smart` | `[Общее]` | `str \| None` | `None` | Необязательный `target_smart` секции. |
+| `npc_in_squad` | `[Общее]` | `list[int]` | `[]` | Размер отряда: `[n]` или `[min, max]`, где `0 <= min <= max`. Значение `max` не должно превышать число шаблонов `npc`/`npc_random`. |
+| `target_smart` | `[Общее]` | `str \| None` | `None` | **Точка назначения** отряда после спавна, а не точка спавна. Должна отличаться от `SpawnSquad.smart_alias`, если нужен марш. |
 | `relationship` | `[Общее]` | `"neutral" \| "friend" \| "enemy" \| None` | `None` | Отношение отряда к актору. |
 | `idle_time` | `[Общее]` | `float \| None` | `None` | Время ожидания отряда на точке, `>= 0`. |
 | `spawn_point` | `[Общее]` | `str \| None` | `None` | Именованная точка спавна отряда. |
-| `story_id` | `[Общее]` | `str \| None` | `None` | Необязательный `story_id` секции. |
+| `story_id` | `[Общее]` | `str \| None` | `None` | **Обязателен** для отряда, который адресуется `RemoveSquad`, `SpawnNpcItem` или `Stage.target_squad_id`. Без него нет устойчивой связи «отряд → командир → предмет → смерть → completion». |
 | `death_infos` | `[Story]` | `list[str]` | `[]` | Инфопоршни, выдаваемые в `on_death` отряда. Сериализуются как `on_death = %+info_a +info_b%`. |
 
 Обязательное условие валидности: непустой `faction` **и** хотя бы один из
 `npc` / `npc_random`. Иначе `BuildError` (секция пропускается).
+
+> **`story_id` фактически обязателен.** В модели поле необязательное, но для
+> квестового отряда оно обязательно, если отряд адресуется:
+>
+> - `RemoveSquad(squad_alias=...)` — резолв через `get_story_squad(alias)`;
+> - `SpawnNpcItem(target_alias=...)` — резолв командира через story-отряд;
+> - `Stage.target_squad_id` / `target_seen` — используют story-ID.
+>
+> Без `story_id` валидатор возвращает `CAT-SQUAD-002`/`XRAY-SPAWNITEM-002`.
+> `target_smart` — это точка **назначения**, а не спавна: если нужен марш,
+> она должна отличаться от `SpawnSquad.smart_alias`.
+
+> **`npc_in_squad`.** Формат `[n]` или `[min, max]`; `max` не должен
+> превышать число шаблонов в `npc` + `npc_random`. Иначе
+> `CAT-SQUAD-005`/`XRAY-SQUAD-001` (WARNING): движок может переспавнить или
+> подменить NPC. Для детерминированного отряда задавайте явные шаблоны.
 
 Пример проекта `[Story]`:
 
@@ -1140,8 +1317,9 @@ project = ModProject(
             id="mymod_relay_merc_squad",
             faction="monolith",
             npc=["sim_default_monolith_3", "sim_default_monolith_4"],
-            npc_in_squad=[3, 5],
+            npc_in_squad=[2, 2],
             target_smart="zat_stalker_base_smart",
+            story_id="mymod_relay_merc_squad",
             death_infos=["mymod_relay_merc_dead"],
         )
     },
@@ -1318,8 +1496,8 @@ condlist_1            = {+<info_dead>} complete
 автоматического `condlist_0` (смерть квестодателя). `GiveTask` из
 `on_complete_actions` выполняется внутри `<quest_id>_reward()` в Lua, а не
 в LTX-строке `on_complete`. Если `fail_on_giver_death=False` или
-`giver_npc_id` не задан, `condlist_0` не создаётся и ваш condlist получает
-индекс `0`.
+**эффективный** квестодатель (`giver_npc_id or npc_id`) не задан, `condlist_0`
+не создаётся и ваш condlist получает индекс `0`.
 
 > **Не смешивайте режимы.** `WarfareCapture` и `SpawnSquad(mode="story")`
 > в одном квесте недопустимы: `WarfareCapture` требует живой симуляции
@@ -1328,6 +1506,70 @@ condlist_1            = {+<info_dead>} complete
 > `BuildError`. Если сценарию нужны и захват точки, и сюжетный отряд,
 > разделите его на два квеста: Warfare-квест с `requires_warfare=True`
 > и Story-квест с `SpawnSquad(mode="story")`.
+
+## 2.13. Модульная сборка и слияние глав (`ModProject.merge` и `MergeValidator`)
+
+Большой мод удобно писать главами: каждая глава — независимый
+`ModProject` со своими `quests`, `dialogs` и `squads`. Перед сборкой главы
+объединяются в один проект методом `ModProject.merge`:
+
+```python
+class ModProject(BaseModel):
+    ...
+    @classmethod
+    def merge(
+        cls,
+        *projects: "ModProject",
+        mod_slug: str | None = None,
+        mod_title: str | None = None,
+    ) -> "ModProject": ...
+```
+
+`merge` не перезаписывает данные: при коллизии ключа или `story_id` между
+главами он поднимает `ValueError`. Если `mod_slug`/`mod_title` не заданы,
+они берутся из первой главы (`mod_slug`/`mod_title`, иначе `name`).
+
+```python
+from src.core.models import ModProject
+from src.validation import MergeValidator, ValidationReport
+
+# Каждая глава — самостоятельный ModProject со своим mod_slug.
+ch1 = ModProject(name="My Mod — Chapter 1", mod_slug="mymod", quests={...}, dialogs={...})
+ch2 = ModProject(name="My Mod — Chapter 2", mod_slug="mymod", quests={...}, dialogs={...})
+side_quests = ModProject(name="My Mod — Side Quests", mod_slug="mymod", quests={...})
+
+merged = ModProject.merge(
+    ch1,
+    ch2,
+    side_quests,
+    mod_slug="mymod",
+    mod_title="My Mod",
+)
+
+# Диагностика слияния: коллизии, общие поршни, пространство имён.
+report = ValidationReport()
+MergeValidator(report).validate_chapters(
+    [ch1, ch2, side_quests],
+    target_slug="mymod",
+)
+if report.has_errors:
+    report.raise_if_errors()
+
+# Дальше — обычная предполётная валидация объединённого проекта (§3.6).
+```
+
+Правила изоляции глав:
+
+| Код | Severity | Что проверяется | Как исправить |
+|---|---|---|---|
+| `MERGE-ID-001` | `ERROR` | Дубль ключа `quests`/`dialogs`/`squads` или `CustomSquad.story_id` между главами. `merge` в этом случае также бросает `ValueError`. | Переименуйте сущность/`story_id` в одной из глав. |
+| `MERGE-INFO-001` | `WARNING` | Один инфопоршень выдают разные квесты из **разных** глав. | Разведите поршни по главам или убедитесь, что повторная выдача безопасна. |
+| `MERGE-NS-001` | `WARNING` | ID квеста/диалога/отряда не начинается с единого префикса `<mod_slug>_`. | Приведите ID к виду `<mod_slug>_<chapter>_<quest>_<role>` (см. §2.12.1). |
+
+> **Единый префикс.** Все главы обязаны использовать один `mod_slug` и
+> один префикс `<mod_slug>_` для квестов, диалогов, отрядов и поршней.
+> Иначе возможны коллизии при объединении и смешение пространств имён
+> (`MERGE-NS-001`).
 
 ---
 
@@ -1775,7 +2017,76 @@ stage_complete        = 3
 `tsk.stage >= Quest.last_stage`. В противном случае `_can_turn_in` открыл бы
 сдачу на этапе захвата.
 
-## 3.6. Кодировка, BOM и переносы строк
+## 3.6. Предполётная валидация (`validate_project` и CLI `main.py validate`)
+
+До записи файлов проект проверяется пакетом `src/validation/`. Точка входа:
+
+```python
+from src.validation import validate_project
+
+report = validate_project(project, db)   # db: GameDatabase | None
+if report.has_errors:
+    report.raise_if_errors()             # или обработайте report.to_dict()
+```
+
+`validate_project(project, db=None) -> ValidationReport` запускает три
+валидатора в фиксированном порядке: `CatalogValidator` → `GraphValidator` →
+`XrayLinter`. Все замечания попадают в один отчёт; `ERROR` блокирует сборку,
+`WARNING` выводится в отчёт и не блокирует её (кроме режима `--strict`).
+
+### Автоматическая проверка в `ModBuilder`
+
+```python
+builder.build_project(project)                 # validate=True по умолчанию
+builder.build_project(project, validate=False) # отключить предполётную проверку
+```
+
+При `validate=True` сборщик вызывает `validate_project` **до** создания
+каталогов и записи файлов. Если в отчёте есть `ERROR`:
+
+1. сборка не начинается и возвращает `False`;
+2. причина и коды замечаний пишутся в `logs/app.log`;
+3. файлы мода не записываются.
+
+`WARNING` не блокирует сборку, но попадает в лог. Отключайте проверку только
+для диагностических запусков — не для релизной сборки.
+
+### CLI
+
+```text
+python main.py validate <script.py> [--json report.json] [--strict]
+```
+
+- `<script.py>` — файл-сценарий, который создаёт и возвращает `ModProject`;
+- `--json report.json` — сохранить машиночитаемый отчёт
+  (`summary` + `issues`) в указанный файл;
+- `--strict` — считать `WARNING` ошибкой (для CI).
+
+Коды выхода:
+
+| Код | Значение |
+|---:|---|
+| `0` | Ошибок нет (при `--strict` — нет и предупреждений). |
+| `1` | Есть хотя бы один `ERROR`. Сборку запускать нельзя. |
+| `2` | `ERROR` нет, но при `--strict` есть `WARNING`. |
+
+### Категории правил
+
+`CAT-*`, `GRAPH-*` и `XRAY-*` выдаёт `validate_project`; `MERGE-*` — отдельный
+`MergeValidator` на этапе объединения глав (§2.13).
+
+| Префикс | Что проверяет | Примеры кодов |
+|---|---|---|
+| `CAT-*` | Ассеты по БД: NPC/`specific_character`, смарты, предметы, отряды, фракции, диалоги. | `CAT-NPC-001`, `CAT-SMART-003`, `CAT-SQUAD-002`, `CAT-WARFARE-001` |
+| `GRAPH-*` | Связи PK/FK и логический граф: info, этапы, награды, очистка, смерть отряда. | `GRAPH-INFO-001`, `GRAPH-STAGE-002`, `GRAPH-REWARD-001`, `GRAPH-CLEAN-001` |
+| `XRAY-*` | Ловушки движка X-Ray/Anomaly: спавн, `meet`, порядок действий, режимы, локализация. | `XRAY-SPAWN-001`, `XRAY-MEET-001`, `XRAY-SPAWNITEM-001`, `XRAY-MODE-002` |
+| `MERGE-*` | Слияние глав: дубли ключей/`story_id`, общие поршни, единый префикс. | `MERGE-ID-001`, `MERGE-INFO-001`, `MERGE-NS-001` |
+
+> **Порядок работы.** Сначала `ModProject.merge` (§2.13) и
+> `MergeValidator`, затем `validate_project` для объединённого проекта,
+> и только после успешной проверки — `build_project(..., validate=True)`.
+
+## 3.7. Кодировка, BOM и переносы строк
 
 | Файл | Кодировка | BOM | Переносы |
 |---|---|---|---|
@@ -1793,7 +2104,7 @@ stage_complete        = 3
   `<?xml version="1.0" encoding="windows-1251"?>`.
 - Текст экранируется: `&`, `<`, `>`, `"`, `'` превращаются в XML-сущности.
 
-## 3.7. Ограничения идентификаторов и данных
+## 3.8. Ограничения идентификаторов и данных
 
 1. `Quest.id` и `Dialog.id` должны быть валидными Lua-идентификаторами:
    `[A-Za-z_][A-Za-z0-9_]*`.
@@ -1813,9 +2124,9 @@ stage_complete        = 3
     `squad_alias`) должны существовать в вашей сборке Anomaly/базе
     `data/anomaly_db.sqlite`. Ядро не подставляет их автоматически.
 
-## 3.8. Ошибки сборки и их причины
+## 3.9. Ошибки сборки и их причины
 
-`ModBuilder.build_project(project)` возвращает `bool`:
+`ModBuilder.build_project(project, *, validate=True)` возвращает `bool`:
 
 - `True` — сборка успешна;
 - `False` — критическая ошибка; подробности в `logs/app.log`.
@@ -1825,6 +2136,7 @@ stage_complete        = 3
 
 | Причина | Результат |
 |---|---|
+| `validate=True` и в отчёте есть `ERROR` | `False`, коды в `logs/app.log`; файлы не пишутся. |
 | Пустое `ModProject.name` | `False`, ERROR в лог. |
 | `quests`/`dialogs` не словари | `False`, ERROR в лог. |
 | Нет ванильного `_unpacked/configs/system.ltx` | `False`, ERROR в лог. |
@@ -1835,7 +2147,7 @@ stage_complete        = 3
 | У диалога есть `npc_id`, но нет `npc_location` | `False`, ERROR в лог. |
 | Ошибка записи файла / кодировки | `False`, ERROR в лог. |
 
-## 3.9. Публичный API сборщика
+## 3.10. Публичный API сборщика
 
 ```text
 ModBuilder(
@@ -1844,7 +2156,7 @@ ModBuilder(
     vanilla_root: Path = Path("_unpacked"),
 )
 
-ModBuilder.build_project(project: ModProject) -> bool
+ModBuilder.build_project(project: ModProject, *, validate: bool = True) -> bool
 ModBuilder.patch_system_ltx(
     text: str,
     mod_slug: str,
@@ -1865,17 +2177,19 @@ ModBuilder.patch_character_desc(
 | `db_client` | `GameDatabase \| None` | `None` | Необязательный клиент SQLite. Передаётся в `LuaGenerator`; сейчас не используется для проверок ассетов. |
 | `vanilla_root` | `Path` | `Path("_unpacked")` | Корень распакованной ванильной игры. Тесты обязаны передавать временное fake-дерево. |
 
-### `build_project(project) -> bool`
+### `build_project(project, *, validate=True) -> bool`
 
 Главная точка входа. Выполняет полный цикл:
 
 1. Проверяет `name`, `quests`, `dialogs`.
-2. Вычисляет slug и очищает `output/<slug>`.
-3. Создаёт структуру `gamedata`.
-4. Генерирует LTX/XML/Lua.
-5. Собирает привязки диалогов к NPC и патчит профили.
-6. Патчит `system.ltx`.
-7. Записывает все файлы в cp1251 и проверяет их физическое наличие.
+2. При `validate=True` запускает `validate_project`; при `ERROR` возвращает
+   `False` и пишет отчёт в `logs/app.log` (см. §3.6).
+3. Вычисляет slug и очищает `output/<slug>`.
+4. Создаёт структуру `gamedata`.
+5. Генерирует LTX/XML/Lua.
+6. Собирает привязки диалогов к NPC и патчит профили.
+7. Патчит `system.ltx`.
+8. Записывает все файлы в cp1251 и проверяет их физическое наличие.
 
 Возвращает `True` при успехе и `False` при любой критической ошибке. Исключения
 не выходят наружу: они журналируются в `logs/app.log`.
@@ -2007,7 +2321,9 @@ REWARD_MONEY = 50000
 
 # Секция вражеского отряда и алиас смарта. Оба значения должны существовать
 # в вашей сборке; проверьте их через `python main.py search <имя> -t squad/smart`.
-ENEMY_SQUAD = "squad.mercenary_advanced"
+# Валидный enemy-отряд Anomaly 1.5.3: squad.killer_advanced
+# (игровой ID merc_sim_squad_advanced). NPC-секция здесь недопустима.
+ENEMY_SQUAD = "squad.killer_advanced"
 TARGET_SMART = "deadcity.hospital"
 
 # Информационные поршни сценария.
@@ -2065,9 +2381,12 @@ def create_dushman_project() -> ModProject:
                 ),
                 target_alias=TARGET_SMART,
                 on_start_actions=[
+                    # Точка спавна не должна совпадать со смартом квестодателя.
+                    # target_alias — независимый маркер КПК, а не место спавна.
                     SpawnSquad(
                         squad_alias=ENEMY_SQUAD,
                         smart_alias=TARGET_SMART,
+                        mode="story",
                     ),
                 ],
             ),
@@ -2323,6 +2642,7 @@ from src.core.models import (
     SpawnSquad,
     SpawnNpcItem,
     RemoveSquad,
+    ClearSmart,
     SetTarget,
     GiveItem,
     RemoveItem,
@@ -2342,6 +2662,17 @@ from src.core.models import (
     Condition,
     OptionalId,
     RequiredId,
+)
+```
+
+Валидация и слияние глав:
+
+```python
+from src.validation import (
+    MergeValidator,
+    Severity,
+    ValidationReport,
+    validate_project,
 )
 ```
 
@@ -2414,6 +2745,18 @@ Story-квест использует `SpawnSquad(mode="story")` и `CustomSquad
 возвращает `BuildError`, поэтому такой сценарий разделяют на два квеста —
 Warfare-квест с `requires_warfare=True` и Story-квест со
 `SpawnSquad(mode="story")`.
+
+**Как объединить несколько глав мода?**
+Соберите каждую главу как отдельный `ModProject` с одним `mod_slug` и
+объедините через `ModProject.merge(ch1, ch2, side_quests, mod_slug=..., mod_title=...)`.
+Коллизии ключей и `story_id` дают `ValueError`; диагностику пространства имён
+и общих поршней показывает `MergeValidator` (см. §2.13).
+
+**Как проверить проект до сборки?**
+Вызовите `validate_project(project, db)` или CLI
+`python main.py validate <script.py> --json report.json --strict`.
+`ERROR` блокирует сборку; `build_project(..., validate=True)` делает это
+автоматически и пишет отчёт в `logs/app.log` (см. §3.6).
 
 **Можно ли использовать DLTX?**
 Нет. Ядро намеренно не генерирует `.dltx`, `.ext` и рантайм-инъекции диалогов.

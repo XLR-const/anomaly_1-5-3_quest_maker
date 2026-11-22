@@ -763,7 +763,11 @@ class TestStoryLuaRuntime(unittest.TestCase):
         return script[start:end]
 
     def test_spawn_story_squad_avoids_warfare_api(self) -> None:
-        """Story-спавн не трогает ``sim_squad_warfare`` и не ставит таймеры."""
+        """Story-спавн не трогает ``sim_squad_warfare``.
+
+        ``stay_time``/``force_online`` — поля A-Life, а не Warfare API; они
+        выставляются только для удержания отряда на точке спавна.
+        """
         script = self._build(
             on_init_actions=[
                 SpawnSquad(
@@ -784,8 +788,11 @@ class TestStoryLuaRuntime(unittest.TestCase):
         self.assertIn("register_story_squad(quest_id, squad)", body)
         self.assertNotIn("sim_squad_warfare", body)
         self.assertNotIn("set_target", body)
-        self.assertNotIn("stay_time", body)
-        self.assertNotIn("force_online", body)
+        self.assertIn("if hold then", body)
+        self.assertIn("squad.stay_time = game.get_game_time()", body)
+        self.assertIn(
+            "pcall(function() squad.force_online = true end)", body
+        )
 
     def test_spawn_story_squad_is_idempotent_and_resets(self) -> None:
         """Спавн защищён ``once_key`` и сбрасывается при отмене/повторе."""

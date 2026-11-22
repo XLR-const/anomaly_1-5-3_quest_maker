@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 from src.core.models import (
+    ClearSmart,
     CompleteTask,
     DontHasInfo,
     GiveInfo,
@@ -664,7 +665,7 @@ local function eval_conditions(list, actor)
 	return true
 end
 
-__NPC_ITEM_HELPERS____STORY_HELPERS__-- Executes a list of serialized action specs in order.
+__NPC_ITEM_HELPERS____STORY_HELPERS____CLEAR_SMART_HELPERS__-- Executes a list of serialized action specs in order.
 local function run_actions(actions, actor, npc, quest_id__STORY_RUN_ARGS__)
 	if not actions then return end
 	for _, spec in ipairs(actions) do
@@ -690,7 +691,7 @@ local function run_actions(actions, actor, npc, quest_id__STORY_RUN_ARGS__)
 			give_task(spec.task, actor, npc)
 		elseif kind == "complete_task" then
 			complete_task(spec.task)
-__NPC_ITEM_ACTION_BRANCH____STORY_ACTION_BRANCHES__		end
+__NPC_ITEM_ACTION_BRANCH____STORY_ACTION_BRANCHES____CLEAR_SMART_ACTION_BRANCH__		end
 	end
 end
 """
@@ -747,6 +748,10 @@ class LuaGenerator:
         if not isinstance(quests, dict) or not isinstance(dialogs, dict):
             raise TypeError("Проект должен содержать словари quests и dialogs.")
 
+        # Карта отрядов нужна _action_spec, чтобы понять, удерживать ли
+        # Story-отряд на точке спавна или он должен идти к target_smart.
+        self._project_squads = getattr(project, "squads", None) or {}
+
         module_name = (script_name or DEFAULT_SCRIPT_NAME).strip() or DEFAULT_SCRIPT_NAME
         prefix = (mod_prefix or "quests").strip() or "quests"
         quest_ids = sorted(str(key) for key in quests)
@@ -768,8 +773,14 @@ class LuaGenerator:
         blocks.append(self._build_quests_table(quest_data))
         needs_story = self._project_uses_story(quests, dialogs)
         needs_npc_item = self._project_uses_npc_item(quests, dialogs)
+        needs_clear_smart = self._project_uses_clear_smart(quests, dialogs)
         blocks.append(
-            self._build_helpers(module_name, needs_story, needs_npc_item)
+            self._build_helpers(
+                module_name,
+                needs_story,
+                needs_npc_item,
+                needs_clear_smart,
+            )
         )
 
         for quest_id, data in quest_data.items():
@@ -946,6 +957,57 @@ class LuaGenerator:
         return False
 
     @staticmethod
+    def _action_uses_clear_smart(action: Any) -> bool:
+        """True, если действие — :class:`ClearSmart`.
+
+        Args:
+            action (Any): Действие модели.
+
+        Returns:
+            bool: Действие очищает смарт перед спавном.
+        """
+        return isinstance(action, ClearSmart)
+
+    @classmethod
+    def _project_uses_clear_smart(
+        cls, quests: dict[str, Any], dialogs: dict[str, Any]
+    ) -> bool:
+        """Проверяет, нужен ли проекту Lua-хелпер ``clear_smart``.
+
+        Учитываются действия квестов (init/start/reward/fail) и действия
+        реплик диалогов. Если ``ClearSmart`` не используется, хелпер и ветка
+        не вставляются, поэтому вывод остаётся байт-идентичным прежнему.
+
+        Args:
+            quests (dict[str, Any]): Карта квестов проекта.
+            dialogs (dict[str, Any]): Карта диалогов проекта.
+
+        Returns:
+            bool: True, если найдено хотя бы одно ``ClearSmart``.
+        """
+        for quest in quests.values():
+            action_lists = [
+                getattr(quest, "on_init_actions", None) or [],
+                getattr(quest, "on_complete_actions", None) or [],
+                getattr(quest, "on_fail_actions", None) or [],
+            ]
+            for stage in (getattr(quest, "stages", None) or {}).values():
+                action_lists.append(getattr(stage, "on_start_actions", None) or [])
+            for actions in action_lists:
+                if any(
+                    cls._action_uses_clear_smart(action) for action in actions
+                ):
+                    return True
+        for dialog in dialogs.values():
+            for phrase in (getattr(dialog, "phrases", None) or {}).values():
+                actions = getattr(phrase, "actions", None) or []
+                if any(
+                    cls._action_uses_clear_smart(action) for action in actions
+                ):
+                    return True
+        return False
+
+    @staticmethod
     def _linked_quest_id(
         dialog_id: str,
         dialog: "Dialog",
@@ -1048,6 +1110,42 @@ class LuaGenerator:
         )
         return value
 
+    def _find_squad_entry(
+        self,
+        alias: str | None,
+        squads: dict[str, Any] | None = None,
+    ) -> Any | None:
+        """Ищет ``CustomSquad`` проекта по id, story_id или ключу карты.
+
+        Args:
+            alias (str | None): Алиас/секция/story id отряда.
+            squads (dict[str, Any] | None): Карта отрядов проекта. Если не
+                задана, используется карта текущей генерации.
+
+        Returns:
+            Any | None: Найденный ``CustomSquad`` либо ``None``.
+        """
+        if not alias:
+            return None
+        source = (
+            squads
+            if squads is not None
+            else getattr(self, "_project_squads", None)
+        )
+        if not isinstance(source, dict):
+            return None
+        value = str(alias).strip()
+        if not value:
+            return None
+        for key, squad in source.items():
+            if value in (
+                str(key),
+                str(getattr(squad, "id", "") or ""),
+                str(getattr(squad, "story_id", "") or ""),
+            ):
+                return squad
+        return None
+
     def _condition_spec(self, condition: "Condition") -> dict[str, Any]:
         """Преобразует Pydantic-условие в словарь для Lua.
 
@@ -1080,11 +1178,18 @@ class LuaGenerator:
             }
         raise TypeError(f"Неизвестный тип условия: {type(condition).__name__}")
 
-    def _action_spec(self, action: Any) -> dict[str, Any]:
+    def _action_spec(
+        self,
+        action: Any,
+        squads: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Преобразует Pydantic-действие в словарь для Lua.
 
         Args:
             action (Any): Действие модели.
+            squads (dict[str, Any] | None): Карта ``CustomSquad`` проекта.
+                Если не задана, используется карта, сохранённая
+                :meth:`generate_quests_script`.
 
         Returns:
             dict[str, Any]: Словарь ``{"kind": ..., ...}``.
@@ -1098,10 +1203,20 @@ class LuaGenerator:
             return {"kind": "remove_info", "info": action.info}
         if isinstance(action, SpawnSquad):
             if action.mode == "story":
+                squad = self._find_squad_entry(action.squad_alias, squads)
+                target_smart = str(
+                    getattr(squad, "target_smart", None) or ""
+                ).strip()
+                spawn_smart = str(action.smart_alias or "").strip()
+                # Отряд нужно удерживать на точке спавна, только если у него
+                # нет маршрута в LTX или маршрут совпадает с точкой спавна.
+                # Иначе Story-отряд обязан дойти до target_smart маршем.
+                hold = not target_smart or target_smart == spawn_smart
                 return {
                     "kind": "spawn_story_squad",
                     "squad": self._resolve_squad_section(action.squad_alias),
                     "smart": action.smart_alias,
+                    "hold": hold,
                 }
             return {
                 "kind": "spawn_squad",
@@ -1118,6 +1233,13 @@ class LuaGenerator:
                 "kind": "set_target",
                 "squad": action.squad_alias,
                 "smart": action.smart_alias,
+            }
+        if isinstance(action, ClearSmart):
+            return {
+                "kind": "clear_smart",
+                "smart": action.smart_alias,
+                "faction": action.faction or "",
+                "keep_story_ids": list(action.keep_story_ids),
             }
         if isinstance(action, SpawnNpcItem):
             return {
@@ -1360,18 +1482,20 @@ class LuaGenerator:
         script_name: str,
         needs_story: bool,
         needs_npc_item: bool = False,
+        needs_clear_smart: bool = False,
     ) -> str:
         """Подставляет имя модуля и константы в шаблон общих хелперов.
 
-        Story- и NPC-item-фрагменты вставляются только при соответствующих
-        флагах; для проектов без них шаблон остаётся байт-идентичным
-        прежнему.
+        Story-, NPC-item- и clear-smart-фрагменты вставляются только при
+        соответствующих флагах; для проектов без них шаблон остаётся
+        байт-идентичным прежнему.
 
         Args:
             script_name (str): Имя модуля для логов.
             needs_story (bool): Проект использует хотя бы одно Story-действие
                 (``SpawnSquad(mode="story")`` или ``RemoveSquad``).
             needs_npc_item (bool): Проект использует ``SpawnNpcItem``.
+            needs_clear_smart (bool): Проект использует ``ClearSmart``.
 
         Returns:
             str: Lua-код generic-хелперов.
@@ -1382,6 +1506,8 @@ class LuaGenerator:
         story_unmark = ""
         story_branches = ""
         story_run_args = ""
+        clear_smart_helpers = ""
+        clear_smart_branch = ""
         if needs_npc_item:
             npc_item_helpers = (
                 "\n"
@@ -1452,8 +1578,9 @@ local function register_story_squad(quest_id, squad)
 	vset(quest.key_prefix .. "_story_squad_" .. tostring(idx), squad.id)
 end
 
--- Spawns a story squad; movement is driven by target_smart in its LTX section.
-local function spawn_story_squad(base_name, section, quest_id, once_key)
+-- Spawns a story squad. When hold is true the squad is pinned to the spawn
+-- smart; otherwise its LTX target_smart drives the march.
+local function spawn_story_squad(base_name, section, quest_id, once_key, hold)
 	if once_key and vget(once_key, 0) == 1 then
 		return
 	end
@@ -1474,6 +1601,13 @@ local function spawn_story_squad(base_name, section, quest_id, once_key)
 
 	mark_task_squad(squad)
 	register_story_squad(quest_id, squad)
+	-- force_online keeps A-Life from re-assigning a freshly created story
+	-- squad to another smart while it is still offline. stay_time is set only
+	-- for squads that must hold the spawn point, so marching squads still move.
+	if hold then
+		squad.stay_time = game.get_game_time()
+	end
+	pcall(function() squad.force_online = true end)
 	if once_key then
 		vset(once_key, 1)
 	end
@@ -1530,12 +1664,146 @@ end"""
                 '"_init_spawn"\n'
                 "\t\t\t\tend\n"
                 "\t\t\t\tspawn_story_squad(spec.smart, spec.squad, "
-                "quest_id, once_key)\n"
+                "quest_id, once_key, spec.hold)\n"
                 "\t\t\tend\n"
                 '\t\telseif kind == "remove_squad" then\n'
                 "\t\t\tremove_story_squad(spec.squad)\n"
             )
             story_run_args = ", stage_idx"
+
+        if needs_clear_smart:
+            clear_smart_helpers = (
+                "\n"
+                + r"""-- Clears vanilla squads from a smart before a quest squad spawns
+-- there. Skips the actor, companions, offline-combat task squads, story
+-- squads and the explicitly allowed keep_story_ids list.
+local function clear_smart_is_kept(squad, keep_story_ids)
+	if not (squad and squad.id and keep_story_ids) then return false end
+	for _, keep in ipairs(keep_story_ids) do
+		if keep and keep ~= "" then
+			if squad.story_id == keep then return true end
+			if tostring(squad.id) == tostring(keep) then return true end
+			if get_object_story_id then
+				local ok, story_id = pcall(function()
+					return get_object_story_id(squad.id)
+				end)
+				if ok and story_id and tostring(story_id) == tostring(keep) then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
+-- True when the squad is bound to the requested smart. After loading a save,
+-- offline squads often keep the link in assigned_target_id/current_target_id
+-- instead of smart_id/m_smart_terrain_id.
+local function clear_smart_bound_to(squad, smart_id)
+	if not (squad and smart_id) then return false end
+	return squad.smart_id == smart_id
+		or squad.m_smart_terrain_id == smart_id
+		or squad.assigned_target_id == smart_id
+		or squad.current_target_id == smart_id
+end
+
+local function clear_smart(smart_name, faction, keep_story_ids)
+	local smart = get_smart(smart_name)
+	if not smart then
+		printe("[__SCRIPT_NAME__] ! clear_smart: smart [%s] not found",
+			tostring(smart_name))
+		return 0
+	end
+	local keep = keep_story_ids or {}
+	local actor_id = db.actor and db.actor:id() or nil
+	local seen = {}
+	local candidates = {}
+
+	local function consider(squad)
+		if not (squad and squad.id) then return end
+		if seen[squad.id] then return end
+		seen[squad.id] = true
+		if actor_id and squad.id == actor_id then return end
+		if squad.is_companion then return end
+		if clear_smart_is_kept(squad, keep) then return end
+		local task_squads = sim_offline_combat
+			and sim_offline_combat.task_squads
+		if task_squads and task_squads[squad.id] then return end
+		if get_object_story_id then
+			local ok, story_id = pcall(function()
+				return get_object_story_id(squad.id)
+			end)
+			if ok and story_id and story_id ~= 0 and story_id ~= "" then
+				return
+			end
+		end
+		if faction and faction ~= "" then
+			local ok, community = pcall(function()
+				return squad:get_squad_community()
+			end)
+			if not ok or community ~= faction then return end
+		end
+		candidates[#candidates + 1] = squad
+	end
+
+	pcall(function()
+		if smart.squads then
+			for _, squad in pairs(smart.squads) do
+				consider(squad)
+			end
+		end
+		if SIMBOARD and SIMBOARD.squads then
+			for _, squad in pairs(SIMBOARD.squads) do
+				if clear_smart_bound_to(squad, smart.id) then
+					consider(squad)
+				end
+			end
+		end
+	end)
+
+	local removed = 0
+	for _, squad in ipairs(candidates) do
+		if squad and squad.id then
+			local live = alife_object(squad.id) ~= nil
+			local release_ok = true
+			if live then
+				local task_squads = sim_offline_combat
+					and sim_offline_combat.task_squads
+				if task_squads then task_squads[squad.id] = nil end
+				release_ok = pcall(function()
+					SIMBOARD:remove_squad(squad)
+				end)
+				if release_ok then removed = removed + 1 end
+			end
+			-- remove_squad may leave a stale reference in smart.squads
+			-- (and an already released squad has no server object at all).
+			-- Drop every candidate reference immediately so the population
+			-- slot is free before the story squad is created by next action.
+			if release_ok and smart.squads then
+				local stale = {}
+				for key, value in pairs(smart.squads) do
+					if key == squad.id or value == squad then
+						stale[#stale + 1] = key
+					end
+				end
+				for _, key in ipairs(stale) do
+					smart.squads[key] = nil
+				end
+			end
+		end
+	end
+	printf("[__SCRIPT_NAME__] clear_smart [%s] faction=[%s] keep=%s removed=%s",
+		tostring(smart_name), tostring(faction or ""),
+		tostring(#keep), tostring(removed))
+	return removed
+end"""
+                + "\n\n"
+            )
+            clear_smart_branch = (
+                '\t\telseif kind == "clear_smart" then\n'
+                "\t\t\tclear_smart(spec.smart, spec.faction, "
+                "spec.keep_story_ids)\n"
+            )
 
         return (
             _HELPERS_TEMPLATE.replace("__SCRIPT_NAME__", script_name)
@@ -1548,6 +1816,10 @@ end"""
             .replace("__STORY_HELPERS__", story_helpers)
             .replace("__STORY_ACTION_BRANCHES__", story_branches)
             .replace("__STORY_RUN_ARGS__", story_run_args)
+            .replace("__CLEAR_SMART_HELPERS__", clear_smart_helpers)
+            .replace(
+                "__CLEAR_SMART_ACTION_BRANCH__", clear_smart_branch
+            )
             .strip()
         )
 

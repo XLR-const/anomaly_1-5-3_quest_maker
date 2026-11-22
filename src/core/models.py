@@ -318,6 +318,45 @@ class SetTarget(BaseAction):
     smart_alias: str = Field(description="Алиас смарта-цели.")
 
 
+class ClearSmart(BaseAction):
+    """Очистить смарт от ванильных отрядов перед спавном квестового.
+
+    Действие выполняется **до** :class:`SpawnSquad`: иначе оно удалит только
+    что созданный квестовый отряд. Хелпер ``clear_smart`` пропускает актора,
+    компаньонов, отряды из ``sim_offline_combat.task_squads``, сюжетные
+    отряды и явно перечисленные ``keep_story_ids``. Если задан ``faction``,
+    удаляются только отряды этой фракции.
+
+    Attributes:
+        smart_alias (str): Алиас смарт-террейна, который нужно очистить.
+        faction (str | None): Техническое имя фракции; ``None`` — все
+            не-сюжетные отряды.
+        keep_story_ids (list[str]): Story-ID отрядов, которые нельзя удалять.
+        allow_giver_smart (bool): Явное разрешение чистить смарт квестодателя.
+    """
+
+    type: Literal["clear_smart"] = Field(default="clear_smart")
+    smart_alias: str = Field(description="Алиас очищаемого смарт-террейна.")
+    faction: str | None = Field(
+        default=None,
+        description=(
+            "Удалять только отряды указанной фракции; None — все "
+            "не-сюжетные отряды."
+        ),
+    )
+    keep_story_ids: list[str] = Field(
+        default_factory=list,
+        description="Story-ID отрядов, которые запрещено удалять.",
+    )
+    allow_giver_smart: bool = Field(
+        default=False,
+        description=(
+            "Явно разрешает очистку смарта квестодателя. Без этого флага "
+            "XrayLinter сообщает ERROR XRAY-SPAWN-001."
+        ),
+    )
+
+
 class SpawnNpcItem(BaseAction):
     """Заспавнить предмет в инвентарь NPC или командира отряда.
 
@@ -430,6 +469,7 @@ Action: TypeAlias = Annotated[
         SpawnSquad,
         RemoveSquad,
         SetTarget,
+        ClearSmart,
         SpawnNpcItem,
         GiveItem,
         RemoveItem,
@@ -1190,6 +1230,117 @@ class ModProject(BaseModel):
                 )
         return self
 
+    @classmethod
+    def merge(
+        cls,
+        *projects: "ModProject",
+        mod_slug: str | None = None,
+        mod_title: str | None = None,
+    ) -> "ModProject":
+        """Объединяет несколько глав мода в один проект.
+
+        Главы считаются независимыми проектами: их карты ``quests``,
+        ``dialogs`` и ``squads`` объединяются без перезаписи. Любая
+        коллизия ключа или ``CustomSquad.story_id`` между главами является
+        ошибкой: молчаливая перезапись потеряла бы часть сюжета.
+
+        Args:
+            *projects (ModProject): Главы в порядке объединения.
+            mod_slug (str | None): Итоговый slug мода. Если ``None``,
+                берётся из первой главы (``mod_slug``).
+            mod_title (str | None): Итоговое имя мода. Если ``None``,
+                берётся из первой главы (``mod_title``), иначе из ``name``.
+
+        Returns:
+            ModProject: Новый проект с объединёнными картами.
+
+        Raises:
+            ValueError: Если не передано ни одной главы или обнаружена
+                коллизия ключей/``story_id`` между главами.
+        """
+        if not projects:
+            raise ValueError("Не передано ни одного проекта для слияния")
+
+        quests: dict[str, Quest] = {}
+        dialogs: dict[str, Dialog] = {}
+        squads: dict[str, CustomSquad] = {}
+        required_mods: list[str] = []
+
+        quest_origin: dict[str, int] = {}
+        dialog_origin: dict[str, int] = {}
+        squad_origin: dict[str, int] = {}
+        story_origin: dict[str, int] = {}
+
+        for chapter_index, project in enumerate(projects):
+            for quest_id, quest in project.quests.items():
+                if quest_id in quests:
+                    raise ValueError(
+                        f"Конфликт ключа квеста '{quest_id}' между главами "
+                        f"{quest_origin[quest_id]} и {chapter_index}."
+                    )
+                quests[quest_id] = quest
+                quest_origin[quest_id] = chapter_index
+
+            for dialog_id, dialog in project.dialogs.items():
+                if dialog_id in dialogs:
+                    raise ValueError(
+                        f"Конфликт ключа диалога '{dialog_id}' между главами "
+                        f"{dialog_origin[dialog_id]} и {chapter_index}."
+                    )
+                dialogs[dialog_id] = dialog
+                dialog_origin[dialog_id] = chapter_index
+
+            for squad_id, squad in project.squads.items():
+                if squad_id in squads:
+                    raise ValueError(
+                        f"Конфликт ключа отряда '{squad_id}' между главами "
+                        f"{squad_origin[squad_id]} и {chapter_index}."
+                    )
+                squads[squad_id] = squad
+                squad_origin[squad_id] = chapter_index
+
+                story_id = getattr(squad, "story_id", None)
+                if story_id:
+                    previous = story_origin.get(story_id)
+                    if previous is not None and previous != chapter_index:
+                        raise ValueError(
+                            f"Конфликт story_id отряда '{story_id}' между "
+                            f"главами {previous} и {chapter_index}."
+                        )
+                    story_origin.setdefault(story_id, chapter_index)
+
+            for required_mod in project.required_mods:
+                if required_mod not in required_mods:
+                    required_mods.append(required_mod)
+
+        first = projects[0]
+        resolved_slug = (
+            mod_slug
+            if mod_slug is not None
+            else getattr(first, "mod_slug", None)
+        )
+        resolved_title = (
+            mod_title
+            if mod_title is not None
+            else getattr(first, "mod_title", None)
+        )
+        name = resolved_title or getattr(first, "name", "") or "Merged mod"
+
+        extras: dict[str, Any] = {}
+        if resolved_slug is not None:
+            extras["mod_slug"] = resolved_slug
+        if resolved_title is not None:
+            extras["mod_title"] = resolved_title
+
+        return cls(
+            name=name,
+            required_mods=required_mods,
+            quests=quests,
+            dialogs=dialogs,
+            squads=squads,
+            **extras,
+        )
+
     def to_json(self) -> str:
         """Сериализует проект в JSON, сохраняя ``model_extra``.
 
@@ -1316,6 +1467,7 @@ __all__ = [
     "Action",
     "BaseAction",
     "BaseCondition",
+    "ClearSmart",
     "CompleteTask",
     "Condition",
     "CustomSquad",

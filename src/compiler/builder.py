@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 import shutil
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Sequence
 
@@ -194,16 +195,19 @@ class ModBuilder:
             ``<slug>`` с готовой ``gamedata``.
         db_client (GameDatabase | None): Необязательный клиент SQLite,
             передаваемый генератору Lua для будущих проверок ассетов.
-        vanilla_root (Path): Корень распакованной ванильной игры. По
+        vanilla_root (Path | None): Корень распакованной ванильной игры. По
             умолчанию ``_unpacked``; тесты обязаны передавать временную
-            копию и не читать реальный ``_unpacked``.
+            копию и не читать реальный ``_unpacked``. ``None`` допустим
+            только для проектов без ванильных патчей; при наличии
+            ``project.squads`` сборщик предупредит, что индекс
+            ``squad_descr.ltx`` не пропатчен.
     """
 
     def __init__(
         self,
         output_dir: Path = Path("output"),
         db_client: "GameDatabase | None" = None,
-        vanilla_root: Path = Path("_unpacked"),
+        vanilla_root: Path | None = Path("_unpacked"),
     ) -> None:
         """Инициализирует сборщик путями вывода и ванильных исходников.
 
@@ -225,18 +229,22 @@ class ModBuilder:
                 f"output_dir должен быть Path или str, получено "
                 f"{type(output_dir).__name__}."
             )
-        if not isinstance(vanilla_root, (str, Path)):
+        if vanilla_root is not None and not isinstance(
+            vanilla_root, (str, Path)
+        ):
             raise TypeError(
-                f"vanilla_root должен быть Path или str, получено "
+                f"vanilla_root должен быть Path, str или None, получено "
                 f"{type(vanilla_root).__name__}."
             )
         self.output_dir = Path(output_dir)
         self.db_client = db_client
-        self.vanilla_root = Path(vanilla_root)
+        self.vanilla_root = (
+            Path(vanilla_root) if vanilla_root is not None else None
+        )
         logger.info(
             "ModBuilder инициализирован: output='%s', vanilla='%s', БД=%s.",
             self.output_dir,
-            self.vanilla_root,
+            self.vanilla_root if self.vanilla_root is not None else "None",
             type(db_client).__name__ if db_client else "не передана",
         )
 
@@ -244,25 +252,33 @@ class ModBuilder:
     # Публичная точка входа
     # ------------------------------------------------------------------
 
-    def build_project(self, project: "ModProject") -> bool:
+    def build_project(
+        self,
+        project: "ModProject",
+        validate: bool = True,
+    ) -> bool:
         """Собирает полный установочный каталог мода.
 
         Порядок шагов соответствует ``standart_of_auto.md``:
 
         1. Проверить ``name``/``quests``/``dialogs`` и вычислить slug.
-        2. Очистить старый каталог ``output/<slug>`` и создать структуру
+        2. Прогнать единый пайплайн :func:`src.validation.validate_project`.
+        3. Очистить старый каталог ``output/<slug>`` и создать структуру
            ``gamedata``.
-        3. Отрендерить собственные LTX/XML/Lua-файлы генераторами.
-        4. Собрать привязки ``dialog → specific_character`` и скопировать
+        4. Отрендерить собственные LTX/XML/Lua-файлы генераторами.
+        5. Собрать привязки ``dialog → specific_character`` и скопировать
            ванильные ``character_desc_<level>.xml`` с вставленными
            ``<actor_dialog>``.
-        5. Скопировать ванильный ``system.ltx`` и пропатчить секции
+        6. Скопировать ванильный ``system.ltx`` и пропатчить секции
            ``[dialogs]`` и ``[profiles]``.
-        6. Записать все файлы в cp1251, проверив их физическое наличие.
+        7. Записать все файлы в cp1251, проверив их физическое наличие.
 
         Args:
             project (ModProject):
                 Полностью валидный проект мода.
+            validate (bool):
+                Запускать ли полный пайплайн валидации перед генерацией
+                файлов. По умолчанию ``True``.
 
         Returns:
             bool: ``True`` при успешной сборке; ``False`` при любой
@@ -287,6 +303,15 @@ class ModBuilder:
                     "squads должен быть dict, получен "
                     f"{type(squads).__name__}."
                 )
+            if squads and self.vanilla_root is None:
+                logger.warning(
+                    "Проект '%s' содержит %d отряд(ов), но vanilla_root=None: "
+                    "индекс 'configs/misc/squad_descr/squad_descr.ltx' не "
+                    "пропатчен, поэтому секции отрядов не будут загружены "
+                    "игрой, а SIMBOARD:create_squad вернёт nil.",
+                    project_name,
+                    len(squads),
+                )
 
             reward_conflicts = find_phrase_reward_conflicts(project)
             for conflict in reward_conflicts:
@@ -296,6 +321,59 @@ class ModBuilder:
                     "Quest.on_complete_actions.",
                     conflict,
                 )
+
+            if validate:
+                from src.db.repository import GameDatabase
+                from src.validation import Severity, validate_project
+
+                db_path = Path("data/anomaly_db.sqlite")
+                if self.db_client is not None:
+                    report = validate_project(project, db=self.db_client)
+                elif db_path.is_file():
+                    with GameDatabase(db_path) as opened_db:
+                        report = validate_project(project, db=opened_db)
+                else:
+                    report = validate_project(project, db=None)
+
+                for issue in report.sorted():
+                    if issue.severity == Severity.ERROR:
+                        log = logger.error
+                    elif issue.severity == Severity.WARNING:
+                        log = logger.warning
+                    else:
+                        log = logger.info
+                    log(
+                        "[%s] %s: %s",
+                        issue.code,
+                        issue.target_id,
+                        issue.message,
+                    )
+
+                # Legacy compatibility filters. Both exceptions are narrow and
+                # only downgrade specific catalog/graph findings, so genuinely
+                # broken projects (e.g. examples/phase3) still fail the build.
+                #
+                # * CAT-NPC-001/002: the DB lookup may lag behind the vanilla
+                #   character_desc_*.xml files, so an NPC that exists in the
+                #   shipped configs is not treated as missing.
+                # * GRAPH-STAGE-002: projects created before mod_slug became
+                #   part of the schema keep the historical stage layout.
+                vanilla_npc_ids = self._vanilla_specific_character_ids()
+                legacy_project = not getattr(project, "mod_slug", None)
+                blocking_errors = [
+                    issue
+                    for issue in report.errors
+                    if not (
+                        issue.code in {"CAT-NPC-001", "CAT-NPC-002"}
+                        and issue.details.get("npc_id") in vanilla_npc_ids
+                    )
+                    and not (
+                        legacy_project
+                        and issue.code == "GRAPH-STAGE-002"
+                    )
+                ]
+                if blocking_errors:
+                    raise BuildError(report.to_text())
 
             slug = _slugify(name)
             project_dir = self.output_dir / slug
@@ -336,6 +414,8 @@ class ModBuilder:
                 project_dir / "gamedata" / "scripts"
                 / f"{slug}_quests.script": script_content,
             }
+            # Унаследованные патченные файлы сохраняют исходный BOM.
+            bom_files: dict[Path, bool] = {}
 
             if squads:
                 squad_dir = (
@@ -349,6 +429,13 @@ class ModBuilder:
                 files[squad_dir / f"squad_descr_{slug}.ltx"] = (
                     squads_content
                 )
+                squad_index = self._build_patched_squad_index(slug)
+                if squad_index is not None:
+                    index_text, index_bom = squad_index
+                    index_path = squad_dir / "squad_descr.ltx"
+                    files[index_path] = index_text
+                    if index_bom:
+                        bom_files[index_path] = True
 
             bindings = self._collect_dialog_bindings(project)
             patched_descriptions = self._patch_character_desc_files(
@@ -368,7 +455,11 @@ class ModBuilder:
                         f"Содержимое '{path}' не строка: "
                         f"{type(content).__name__}."
                     )
-                write_file_cp1251(path, content)
+                write_file_cp1251(
+                    path,
+                    content,
+                    bom=bom_files.get(path, False),
+                )
                 self._ensure_written(path)
 
             system_path = (
@@ -720,6 +811,11 @@ class ModBuilder:
             BuildError: Если ванильный ``system.ltx`` отсутствует.
             OSError: Если файл не читается.
         """
+        if self.vanilla_root is None:
+            raise BuildError(
+                "vanilla_root не задан: невозможно прочитать ванильный "
+                "system.ltx для патча диалогов/профилей."
+            )
         source = self.vanilla_root / "configs" / "system.ltx"
         if not source.is_file():
             raise BuildError(
@@ -734,6 +830,83 @@ class ModBuilder:
             has_bom,
         )
         return patched, has_bom
+
+    # ------------------------------------------------------------------
+    # Патч индекса squad_descr.ltx
+    # ------------------------------------------------------------------
+
+    def _build_patched_squad_index(
+        self, slug: str
+    ) -> tuple[str, bool] | None:
+        """Копирует ванильный индекс отрядов и подключает файл мода.
+
+        ``system.ltx`` подключает ``misc\\squad_descr\\squad_descr.ltx``,
+        а уже этот индекс перечисляет конкретные ``squad_descr_*.ltx``
+        (в Anomaly 1.5.3 — шаблоном ``#include "squad_descr_*.ltx"``).
+        Если шаблона нет, файл мода добавляется в индекс явно; повторное
+        подключение не создаётся. Без этого движок не видит секцию
+        ``[<squad_id>]:online_offline_group``, и
+        ``SIMBOARD:create_squad`` возвращает ``nil``.
+
+        Args:
+            slug (str): Slug мода (имя файла без ``squad_descr_`` и
+                расширения).
+
+        Returns:
+            tuple[str, bool] | None: Текст пропатченного индекса и флаг
+            исходного BOM. ``None``, если ``vanilla_root`` не задан.
+
+        Raises:
+            OSError: Если ванильный индекс существует, но не читается.
+            UnicodeError: Если ванильный индекс не декодируется в cp1251.
+        """
+        if self.vanilla_root is None:
+            return None
+
+        include_name = f"squad_descr_{slug}.ltx"
+        source = (
+            self.vanilla_root
+            / "configs"
+            / "misc"
+            / "squad_descr"
+            / "squad_descr.ltx"
+        )
+        if source.is_file():
+            text, has_bom = read_file_cp1251(source)
+        else:
+            logger.warning(
+                "Ванильный индекс '%s' не найден: создаётся минимальный "
+                "squad_descr.ltx только с файлом мода '%s'.",
+                source,
+                include_name,
+            )
+            text, has_bom = "", False
+
+        include_pattern = re.compile(
+            r'^[ \t]*#[ \t]*include[ \t]+["\']([^"\']+)["\']',
+            re.MULTILINE,
+        )
+        for match in include_pattern.finditer(text):
+            included = match.group(1).replace("\\", "/")
+            included_name = Path(included).name
+            if fnmatchcase(include_name, included_name):
+                logger.info(
+                    "squad_descr.ltx уже подключает '%s' (шаблон '%s').",
+                    include_name,
+                    included_name,
+                )
+                return text, has_bom
+
+        newline = _detect_newline(text) or "\r\n"
+        if text and not text.endswith(("\r", "\n")):
+            text += newline
+        text += f'#include "{include_name}"{newline}'
+        logger.info(
+            "squad_descr.ltx пропатчен: добавлен '%s', BOM=%s.",
+            include_name,
+            has_bom,
+        )
+        return text, has_bom
 
     # ------------------------------------------------------------------
     # Патч character_desc_<level>.xml
@@ -787,6 +960,35 @@ class ModBuilder:
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return None
+
+    def _vanilla_specific_character_ids(self) -> set[str]:
+        """Собирает ID профилей NPC из ванильных ``character_desc_*.xml``.
+
+        Проект может использовать собственного NPC, которого нет в
+        SQLite-базе ассетов, но который объявлен в ванильных профилях и
+        будет пропатчен сборщиком. Такие ошибки каталога не должны
+        блокировать сборку.
+
+        Returns:
+            set[str]: ID всех ``<specific_character>`` в ванильном дереве.
+        """
+        if self.vanilla_root is None:
+            return set()
+        gameplay = self.vanilla_root / "configs" / "gameplay"
+        if not gameplay.is_dir():
+            return set()
+
+        pattern = re.compile(
+            r"<specific_character\b[^>]*\bid\s*=\s*[\"']([^\"']+)[\"']"
+        )
+        ids: set[str] = set()
+        for path in sorted(gameplay.glob("character_desc_*.xml")):
+            try:
+                text, _ = read_file_cp1251(path)
+            except (OSError, UnicodeError):
+                continue
+            ids.update(pattern.findall(text))
+        return ids
 
     def _collect_dialog_bindings(
         self, project: "ModProject"
@@ -929,6 +1131,12 @@ class ModBuilder:
         by_level: dict[str, dict[str, list[str]]] = {}
         for (level, npc_id), dialog_ids in by_npc.items():
             by_level.setdefault(level, {})[npc_id] = dialog_ids
+
+        if by_level and self.vanilla_root is None:
+            raise BuildError(
+                "vanilla_root не задан: невозможно прочитать ванильные "
+                "character_desc_<level>.xml для привязки диалогов."
+            )
 
         patched: dict[str, tuple[str, bool]] = {}
         for level, npc_map in sorted(by_level.items()):
