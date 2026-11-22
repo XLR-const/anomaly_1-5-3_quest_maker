@@ -264,6 +264,72 @@ class CatalogValidatorTests(unittest.TestCase):
             "CAT-SMART-003", _error_codes(report), _error_text(report)
         )
 
+    def test_xml_profile_suffix_rejected_in_custom_squad_npc(self) -> None:
+        """XML-профиль ``_default_N`` не является LTX spawn-секцией."""
+        squad = CustomSquad(
+            id="test_xml_profile_squad",
+            faction="monolith",
+            npc=["sim_default_monolith_3_default_0"],
+            npc_in_squad=[1, 1],
+            story_id="test_xml_profile_squad",
+        )
+        report = _validate(
+            ModProject(
+                name="xml profile squad",
+                squads={squad.id: squad},
+            )
+        )
+        issues = [
+            issue
+            for issue in report.errors
+            if issue.code == "CAT-SQUAD-004"
+        ]
+
+        self.assertEqual(len(issues), 1, _error_text(report))
+        self.assertIn("sim_default_monolith_3_default_0", issues[0].message)
+        self.assertIn("_default_N", issues[0].hint or "")
+
+    def test_xml_profile_suffix_rejected_in_custom_squad_npc_random(self) -> None:
+        """``npc_random`` валидируется так же, как ``npc``."""
+        squad = CustomSquad(
+            id="test_xml_profile_random_squad",
+            faction="monolith",
+            npc=[],
+            npc_random=["sim_default_monolith_3_default_0"],
+            npc_in_squad=[1, 1],
+            story_id="test_xml_profile_random_squad",
+        )
+        report = _validate(
+            ModProject(
+                name="xml profile random squad",
+                squads={squad.id: squad},
+            )
+        )
+
+        self.assertIn(
+            "CAT-SQUAD-004", _error_codes(report), _error_text(report)
+        )
+
+    def test_ltx_spawn_section_accepted_in_custom_squad(self) -> None:
+        """Базовая LTX-секция Монолита проходит ``CAT-SQUAD-004``."""
+        squad = CustomSquad(
+            id="test_ltx_spawn_squad",
+            faction="monolith",
+            npc=["sim_default_monolith_3"],
+            npc_in_squad=[1, 1],
+            story_id="test_ltx_spawn_squad",
+        )
+        report = _validate(
+            ModProject(
+                name="ltx spawn squad",
+                squads={squad.id: squad},
+            )
+        )
+
+        self.assertNotIn(
+            "CAT-SQUAD-004", _error_codes(report), _error_text(report)
+        )
+
     def test_story_squad_without_story_id_cat_squad_002(self) -> None:
         squad_id = "test_squad_without_story"
         squad = CustomSquad(

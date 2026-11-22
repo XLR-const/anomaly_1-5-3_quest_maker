@@ -312,6 +312,28 @@ class XrayLinter:
                 target_smart = str(
                     getattr(squad, "target_smart", None) or ""
                 ).strip()
+                if (
+                    getattr(action, "mode", "warfare") == "story"
+                    and not target_smart
+                ):
+                    self.report.add(
+                        "XRAY-SPAWN-004",
+                        Severity.WARNING,
+                        f"{owner}.spawn_squad[{index}]",
+                        (
+                            f"SpawnSquad(mode='story') для CustomSquad "
+                            f"'{squad.id}' без target_smart: A-Life может "
+                            "переназначить отряд на другой смарт, и он уйдёт "
+                            "с точки спавна."
+                        ),
+                        hint=(
+                            "Задайте CustomSquad.target_smart: тот же смарт, "
+                            "что и точка спавна, для удержания, либо другой "
+                            "смарт для марша."
+                        ),
+                        owner="squad",
+                        squad=squad.id,
+                    )
                 if target_smart and target_smart == str(action.smart_alias):
                     self.report.add(
                         "XRAY-SPAWN-002",

@@ -86,6 +86,11 @@ _GENERIC_NPC_TEMPLATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Суффикс XML-профиля ``<specific_character id="..._default_N">``.
+#: Такие ID — профили персонажей, а не LTX spawn-секции: движок X-Ray
+#: отвечает на них ``!ERROR: npc section ... does not exist!``.
+_SPAWN_PROFILE_SUFFIX_RE = re.compile(r"^(?P<base>.+)_default_\d+$", re.IGNORECASE)
+
 
 class _ActionContext:
     """Контекст одного действия проекта для формирования ``target_id``."""
@@ -119,6 +124,7 @@ class CatalogValidator:
         self.report = report
 
         self._npc_rows: dict[str, list[dict[str, Any]]] | None = None
+        self._npc_spawn_sections: set[str] | None = None
         self._smart_rows: dict[str, list[dict[str, Any]]] | None = None
         self._item_ids: set[str] | None = None
         self._squad_rows: dict[str, list[dict[str, Any]]] | None = None
@@ -167,6 +173,38 @@ class CatalogValidator:
                     index.setdefault(entity_id, []).append(row)
             self._npc_rows = index
         return self._npc_rows
+
+    def _npc_spawn_section_names(self) -> set[str]:
+        """Возвращает имена реальных LTX spawn-секций NPC.
+
+        В таблице ``npcs`` хранятся XML-профили ``<specific_character>``,
+        поэтому профили с суффиксом ``_default_N`` приводятся к базовой
+        spawn-секции (``sim_default_monolith_3_default_0`` ->
+        ``sim_default_monolith_3``). Дополнительно учитываются NPC-секции,
+        которые ванильные отряды используют в ``squads.npc_list``.
+        """
+        if self._npc_spawn_sections is None:
+            sections: set[str] = set()
+            for row in self._fetch_all("SELECT id FROM npcs"):
+                entity_id = self._normalize(row.get("id"))
+                if not entity_id:
+                    continue
+                match = _SPAWN_PROFILE_SUFFIX_RE.match(entity_id)
+                if match:
+                    sections.add(match.group("base"))
+                else:
+                    # Уникальные профили (esc_2_12_stalker_wolf) обычно
+                    # имеют одноимённую spawn-секцию.
+                    sections.add(entity_id)
+            for row in self._fetch_all("SELECT npc_list FROM squads"):
+                raw = row.get("npc_list")
+                if isinstance(raw, str):
+                    for part in raw.split(","):
+                        token = part.strip()
+                        if token:
+                            sections.add(token)
+            self._npc_spawn_sections = sections
+        return self._npc_spawn_sections
 
     def _smart_index(self) -> dict[str, list[dict[str, Any]]]:
         """Возвращает индекс смартов по ID."""
@@ -958,12 +996,34 @@ class CatalogValidator:
 
         for index, template in enumerate(templates):
             if not self._npc_template_exists(template):
+                profile_match = _SPAWN_PROFILE_SUFFIX_RE.match(template)
+                if profile_match:
+                    message = (
+                        f"NPC-секция '{template}' отряда '{squad.id}' — "
+                        "XML-профиль specific_character, а не LTX "
+                        "spawn-секция."
+                    )
+                    hint = (
+                        f"Укажите LTX spawn-секцию "
+                        f"'{profile_match.group('base')}' (без суффикса "
+                        "_default_N), иначе движок X-Ray напишет "
+                        "'npc section ... does not exist!'."
+                    )
+                else:
+                    message = (
+                        f"NPC-секция '{template}' отряда '{squad.id}' "
+                        "не найдена."
+                    )
+                    hint = (
+                        "Используйте существующую LTX spawn-секцию NPC "
+                        "(например, sim_default_monolith_3)."
+                    )
                 self.report.add(
                     "CAT-SQUAD-004",
                     Severity.ERROR,
                     f"{owner_target}.template[{index}]",
-                    f"NPC-секция '{template}' отряда '{squad.id}' не найдена.",
-                    hint="Используйте существующий профиль или sim_default_*.",
+                    message,
+                    hint=hint,
                     owner="squad",
                     squad_id=squad.id,
                     template=template,
@@ -1019,10 +1079,25 @@ class CatalogValidator:
                 )
 
     def _npc_template_exists(self, template: str) -> bool:
-        """``True`` для профиля БД или стандартного ``sim_default_*``."""
-        if self.resolve_npc(template) is not None:
+        """``True`` только для реальной LTX spawn-секции NPC.
+
+        XML-профили ``<specific_character id="..._default_N">`` не являются
+        spawn-секциями: движок X-Ray не находит их в ``spawn_sections`` и
+        пишет ``!ERROR: npc section ... does not exist!``. Поэтому такой ID
+        принимается только при наличии одноимённой LTX-секции в БД.
+        """
+        name = self._normalize(template)
+        if not name:
+            return False
+        sections = self._npc_spawn_section_names()
+        if name in sections:
             return True
-        return self._is_generic_npc_template(template)
+        row = self.resolve_npc(name)
+        if row is not None:
+            entity_id = self._normalize(row.get("id"))
+            if entity_id in sections:
+                return True
+        return False
 
     def _infer_template_faction(self, template: str) -> str | None:
         """Выводит фракцию NPC-шаблона по его ID, если это возможно."""

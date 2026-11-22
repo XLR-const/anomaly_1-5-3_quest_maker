@@ -60,11 +60,12 @@ ATP_SMART = "esc_smart_terrain_7_11"
 # SpawnNpcItem, RemoveSquad и Stage.target_squad_id.
 SQUAD_ID = "atp_monolith_clear_01_monolith_squad"
 
-# Проверенные NPC-секции Монолита из БД.
+# Проверенные LTX spawn-секции Монолита из БД (без суффиксов XML-профилей
+# _default_N). Именно такие имена ожидает движок X-Ray в squad_descr.
 MONOLITH_NPCS = [
-    "sim_default_monolith_3_default_0",
-    "sim_default_monolith_3_default_1",
-    "sim_default_monolith_3_default_2",
+    "sim_default_monolith_1",
+    "sim_default_monolith_2",
+    "sim_default_monolith_3",
 ]
 
 PDA_ITEM = "itm_pda_common"
@@ -259,6 +260,9 @@ def create_project() -> ModProject:
         npc=MONOLITH_NPCS,
         npc_in_squad=[3, 3],
         relationship="enemy",
+        # target_smart совпадает с точкой спавна: отряд должен закрепиться
+        # на АТП, а не уйти маршем на другой смарт.
+        target_smart=ATP_SMART,
         story_id=SQUAD_ID,
     )
 
