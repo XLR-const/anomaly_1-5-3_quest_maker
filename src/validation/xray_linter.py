@@ -23,6 +23,7 @@ from src.core.models import (
     GiveMoney,
     GiveTask,
     HasInfo,
+    HasItem,
     HasMoney,
     ModProject,
     Quest,
@@ -266,6 +267,7 @@ class XrayLinter:
         self._check_cleanup(quest)
         self._check_modes(quest)
         self._check_warfare(quest)
+        self._check_task_transfer(quest)
 
     def _check_clear_smart(self, quest: Quest) -> None:
         """``XRAY-SPAWN-001``: очистка смарта квестодателя и порядок действий."""
@@ -555,6 +557,44 @@ class XrayLinter:
                 owner="quest",
             )
 
+    def _check_task_transfer(self, quest: Quest) -> None:
+        """``XRAY-TASK-005``: переход этапа только по ``HasItem``.
+
+        В X-Ray статус этапа надёжнее продвигать по инфопоршню: предмет
+        может быть потерян или переложен, а ``*_status`` вызывается по
+        таймеру. Предупреждение не блокирует сборку.
+        """
+        stages = quest.stages or {}
+        if not stages:
+            return
+        last_stage = max(stages)
+        for stage_id in sorted(stages):
+            if stage_id >= last_stage:
+                continue
+            rules = (quest.transfer_conditions or {}).get(stage_id) or {}
+            conditions = [
+                condition
+                for values in rules.values()
+                for condition in (values or [])
+            ]
+            has_item = any(isinstance(c, HasItem) for c in conditions)
+            has_info = any(isinstance(c, HasInfo) for c in conditions)
+            if has_item and not has_info:
+                self.report.add(
+                    "XRAY-TASK-005",
+                    Severity.WARNING,
+                    f"{quest.id}.stage_{stage_id}.transfer_conditions",
+                    (
+                        "Переход с нефинального этапа привязан только к "
+                        "HasItem, без HasInfo."
+                    ),
+                    hint=(
+                        "Добавьте HasInfo(info): в X-Ray переходы через "
+                        "*_status надёжнее проверять по инфопоршню."
+                    ),
+                    owner="stage",
+                )
+
     # ------------------------------------------------------------------
     # Проверки диалогов
     # ------------------------------------------------------------------
@@ -568,6 +608,7 @@ class XrayLinter:
         self._check_meet(dialog, dialog_id)
         self._check_reward(dialog, dialog_id, role, linked_quest)
         self._check_dialog_gate(dialog, dialog_id, role, linked_quest)
+        self._check_dialog_turnin_preconditions(dialog, dialog_id, role)
         self._check_phrase_parity(dialog, dialog_id)
 
     def _check_meet(
@@ -696,6 +737,60 @@ class XrayLinter:
             hint=(
                 "Добавьте HasInfo(complete/death info) или задайте "
                 "Quest.return_to_giver_stage."
+            ),
+            owner="dialog",
+        )
+
+    def _check_dialog_turnin_preconditions(
+        self, dialog: Dialog, dialog_id: str, role: str
+    ) -> None:
+        """``XRAY-DLG-005``: item/info-гейт на корне диалога сдачи.
+
+        ``Dialog.preconditions`` с ``HasItem``/``HasInfo``/``HasMoney`` (без
+        ``TaskStage``) заставляют генератор повесить ``_can_take`` на корень
+        диалога. При активном квесте такой диалог блокируется, и
+        ``_can_turn_in`` не получает управления.
+        """
+        is_turnin = role in ("turnin", "turn_in")
+        if not is_turnin:
+            is_turnin = any(
+                isinstance(action, CompleteTask)
+                for phrase in (getattr(dialog, "phrases", None) or {}).values()
+                for action in (getattr(phrase, "actions", None) or [])
+            )
+        if not is_turnin:
+            return
+        root_conditions = list(getattr(dialog, "preconditions", None) or [])
+        if not root_conditions:
+            return
+        has_task_gate = any(
+            type(condition).__name__ in {"TaskStage", "TaskActive"}
+            or str(getattr(condition, "type", "")) in {
+                "task_stage",
+                "task_active",
+            }
+            for condition in root_conditions
+        )
+        if has_task_gate:
+            return
+        if not any(
+            isinstance(condition, (HasItem, HasInfo, HasMoney))
+            for condition in root_conditions
+        ):
+            return
+        self.report.add(
+            "XRAY-DLG-005",
+            Severity.WARNING,
+            dialog_id,
+            (
+                "Dialog.preconditions содержит HasItem/HasInfo/HasMoney "
+                "без TaskStage: компилятор повесит _can_take на корень "
+                "диалога и заблокирует сдачу при активном квесте."
+            ),
+            hint=(
+                "Перенесите условие на стартовую фразу "
+                "(DialogPhrase.preconditions), чтобы на корень встал "
+                "_can_turn_in."
             ),
             owner="dialog",
         )
@@ -887,6 +982,71 @@ class XrayLinter:
                         "text_ru",
                         "dialog",
                     )
+
+        self._check_fully_empty_texts(project)
+
+    def _check_fully_empty_texts(self, project: ModProject) -> None:
+        """``XRAY-TEXT-001``: оба языка пусты — недопустимый ``<text>``.
+
+        Правило проверяет только случай, когда пусты и ``rus``, и ``eng``.
+        Частично пустой перевод остаётся зоной ``XRAY-LOC-*`` и
+        обрабатывается fallback-генератором.
+        """
+
+        def check(
+            target_id: str,
+            field_ru: str,
+            field_en: str,
+            source: Any,
+            owner: str,
+        ) -> None:
+            ru = str(getattr(source, field_ru, "") or "")
+            en = str(getattr(source, field_en, "") or "")
+            if ru.strip() or en.strip():
+                return
+            self.report.add(
+                "XRAY-TEXT-001",
+                Severity.ERROR,
+                target_id,
+                (
+                    f"Оба языка пусты ({field_ru}/{field_en}): в игре "
+                    "будет пустая строка <text></text>."
+                ),
+                hint="Заполните хотя бы один язык: fallback подставит его во второй.",
+                owner=owner,
+                field=field_ru,
+            )
+
+        for quest in project.quests.values():
+            check(f"{quest.id}.title", "title_ru", "title_en", quest, "quest")
+            check(f"{quest.id}.descr", "descr_ru", "descr_en", quest, "quest")
+            for stage_id, stage in sorted((quest.stages or {}).items()):
+                owner_id = f"{quest.id}.stage_{stage_id}"
+                check(f"{owner_id}.title", "title_ru", "title_en", stage, "stage")
+                check(f"{owner_id}.descr", "descr_ru", "descr_en", stage, "stage")
+                for index, variant in enumerate(
+                    getattr(stage, "descr_variants", None) or []
+                ):
+                    check(
+                        f"{owner_id}.descr_variant_{index}",
+                        "text_ru",
+                        "text_en",
+                        variant,
+                        "stage",
+                    )
+
+        for dialog in project.dialogs.values():
+            dialog_id = self._dialog_id(dialog)
+            for phrase_id, phrase in sorted(
+                (getattr(dialog, "phrases", None) or {}).items()
+            ):
+                check(
+                    f"{dialog_id}.phrase_{phrase_id}.text",
+                    "text_ru",
+                    "text_en",
+                    phrase,
+                    "dialog",
+                )
 
     def _add_empty_text(
         self, target_id: str, field: str, owner: str

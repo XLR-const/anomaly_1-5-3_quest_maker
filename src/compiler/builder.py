@@ -435,6 +435,16 @@ class ModBuilder:
             if npcs:
                 resolved_templates = self._resolve_npc_templates(npcs)
                 npc_rus, npc_eng = build_npc_text_entries(project)
+                # CustomNpc: если задан только один язык имени, второй
+                # получает его, а не технический id.
+                for npc in npcs.values():
+                    key = f"{npc.id}_name"
+                    name_ru = str(getattr(npc, "name_ru", "") or "").strip()
+                    name_en = str(getattr(npc, "name_en", "") or "").strip()
+                    if name_ru and not name_en:
+                        npc_eng[key] = name_ru
+                    elif name_en and not name_ru:
+                        npc_rus[key] = name_en
                 rus = self._merge_string_entries(rus, npc_rus)
                 eng = self._merge_string_entries(eng, npc_eng)
 
@@ -556,6 +566,19 @@ class ModBuilder:
                 custom_desc_path.write_bytes(character_desc_bytes)
                 self._ensure_written(custom_desc_path)
                 custom_npc_files = 2
+
+            if validate and (
+                (project_dir / "gamedata" / "configs" / "text" / "rus"
+                 / f"st_{slug}.xml").is_file()
+            ):
+                from src.validation.post_build import verify_built_mod
+
+                problems = verify_built_mod(project_dir, slug)
+                if problems:
+                    raise BuildError(
+                        "Пост-проверка собранного мода не пройдена:\n"
+                        + "\n".join(problems)
+                    )
 
             total = (
                 len(files)

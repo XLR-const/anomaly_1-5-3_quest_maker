@@ -218,7 +218,13 @@ class XmlGenerator:
             raise ValueError(f"Неподдерживаемый язык: {language}")
         lines = [XML_DECLARATION, f"<{STRING_TABLE_TAG}>", ""]
         for entry_id, ru, en in entries:
-            text = ru if language == "rus" else en
+            # Двусторонний fallback: пустой перевод никогда не должен
+            # превращаться в <text></text>. Если заполнены оба языка, текст
+            # остаётся байт-в-байт прежним (эталон golden_shield).
+            if language == "rus":
+                text = ru if ru.strip() else en
+            else:
+                text = en if en.strip() else ru
             lines.append(f'\t<string id="{entry_id}">')
             lines.append(f"\t\t<text>{escape_xml_text(text)}</text>")
             lines.append("\t</string>")
