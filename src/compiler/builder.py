@@ -46,11 +46,11 @@ from src.compiler.npc_gen import (
     resolve_npc_template,
 )
 from src.compiler.xml_gen import XmlGenerator
-from src.core.models import find_phrase_reward_conflicts
+from src.core.models import CustomSquad, find_phrase_reward_conflicts
 from src.logger import get_logger
 
 if TYPE_CHECKING:
-    from src.core.models import CustomNpc, CustomSquad, Dialog, ModProject, Quest
+    from src.core.models import CustomNpc, Dialog, ModProject, Quest
     from src.db.repository import GameDatabase
 
 logger = get_logger("compiler.builder")
@@ -319,6 +319,16 @@ class ModBuilder:
                     "npcs должен быть dict, получен "
                     f"{type(npcs).__name__}."
                 )
+            solo_squads = self._build_custom_npc_solo_squads(npcs)
+            if solo_squads:
+                overlap = set(solo_squads) & set(squads)
+                for squad_id in sorted(overlap):
+                    logger.warning(
+                        "Отряд '%s' уже объявлен в проекте: автоматический "
+                        "solo-отряд кастомного NPC не создаётся.",
+                        squad_id,
+                    )
+                squads = {**solo_squads, **squads}
             if squads and self.vanilla_root is None:
                 logger.warning(
                     "Проект '%s' содержит %d отряд(ов), но vanilla_root=None: "
@@ -993,6 +1003,42 @@ class ModBuilder:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _build_custom_npc_solo_squads(
+        npcs: dict[str, "CustomNpc"],
+    ) -> dict[str, "CustomSquad"]:
+        """Создаёт одиночные Story-отряды для NPC с ``spawn_smart``.
+
+        Секция называется ``<npc.id>_solo_squad`` и содержит ровно одного
+        NPC. Story-отряд удерживается на смарте через ``target_smart`` и
+        исключается из ``ClearSmart`` благодаря непустому ``story_id``.
+
+        Args:
+            npcs (dict[str, CustomNpc]): Кастомные NPC проекта.
+
+        Returns:
+            dict[str, CustomSquad]: Синтетические отряды по ID секции.
+        """
+        squads: dict[str, "CustomSquad"] = {}
+        for npc in (npcs or {}).values():
+            npc_id = str(getattr(npc, "id", "") or "").strip()
+            spawn_smart = str(
+                getattr(npc, "spawn_smart", None) or ""
+            ).strip()
+            if not npc_id or not spawn_smart:
+                continue
+            squad_id = f"{npc_id}_solo_squad"
+            squads[squad_id] = CustomSquad(
+                id=squad_id,
+                faction=str(getattr(npc, "faction", "") or "").strip(),
+                npc=[npc_id],
+                npc_in_squad=[1, 1],
+                target_smart=spawn_smart,
+                relationship="friend",
+                story_id=squad_id,
+            )
+        return squads
+
+    @staticmethod
     def _apply_squad_template_inheritance(
         content: str,
         squads: dict[str, "CustomSquad"],
@@ -1273,9 +1319,14 @@ class ModBuilder:
             BuildError: Если у диалога есть ``npc_id``, но нет локации.
         """
         custom_npc_ids = {
-            str(getattr(npc, "id", "") or "").strip()
+            value
             for npc in (getattr(project, "npcs", None) or {}).values()
-            if str(getattr(npc, "id", "") or "").strip()
+            for value in (
+                str(getattr(npc, "id", "") or "").strip(),
+                str(getattr(npc, "character_profile", "") or "").strip(),
+                str(getattr(npc, "story_id", "") or "").strip(),
+            )
+            if value
         }
 
         quest_by_dialog: dict[str, "Quest"] = {}

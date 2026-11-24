@@ -281,15 +281,27 @@ def resolve_npc_template(
 
     template_path = Path(vanilla_root) / "configs" / "gameplay" / source_file
     if not template_path.is_file():
+        # В anomaly_db.sqlite source_file иногда хранится как
+        # ``gameplay\character_desc_escape.xml``. Такой путь уже содержит
+        # каталог относительно configs.
+        relative = Path(str(source_file).replace("\\", "/"))
+        if len(relative.parts) > 1:
+            candidate = Path(vanilla_root) / "configs" / relative
+            if candidate.is_file():
+                template_path = candidate
+    if not template_path.is_file():
         raise ValueError(
             f"NPC '{npc.id}': файл шаблона не найден: {template_path} "
             "(CAT-CUSTOM-011)."
         )
 
-    raw_text = template_path.read_bytes().decode(
+    raw_bytes = template_path.read_bytes()
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        raw_bytes = raw_bytes[3:]
+    raw_text = raw_bytes.decode(
         "windows-1251", errors="replace"
     )
-    xml_text = _XML_DECLARATION_RE.sub("", raw_text, count=1)
+    xml_text = _XML_DECLARATION_RE.sub("", raw_text, count=1).lstrip()
     try:
         root = ElementTree.fromstring(xml_text)
     except ElementTree.ParseError as exc:
@@ -345,12 +357,26 @@ def resolve_npc_template(
         else []
     )
 
+    common_actor_dialogs: list[str] = []
+    for element in specific.findall("actor_dialog"):
+        dialog_id = "".join(element.itertext()).strip()
+        if dialog_id.startswith("dm_ordered_task_"):
+            continue
+        if dialog_id and re.match(
+            r"^(?:actor_break_dialog|dm_.+|hello_dialog|meet_.+)$",
+            dialog_id,
+            re.IGNORECASE,
+        ):
+            if dialog_id not in common_actor_dialogs:
+                common_actor_dialogs.append(dialog_id)
+
     resolved: dict[str, Any] = {
         "source_file": source_file,
         "template_npc_id": template_id,
         "visual": child_text("visual"),
         "icon": child_text("icon"),
         "bio": child_text("bio"),
+        "common_actor_dialogs": common_actor_dialogs,
         "rank": _as_int(child_text("rank"), 0)
         if child_text("rank") is not None
         else None,
@@ -437,6 +463,12 @@ def build_spawn_sections_ltx(project: ModProject) -> str:
         lines.append(_ltx_line("character_profile", profile))
         lines.append(_ltx_line("spec_rank", npc.spec_rank))
         lines.append(_ltx_line("community", npc.faction))
+        lines.append(
+            _ltx_line(
+                "trade_config",
+                r"misc\trade\trade_generic.ltx",
+            )
+        )
         if npc.story_id:
             lines.append(_ltx_line("story_id", npc.story_id))
         immunities_sect = npc.immunities_sect
@@ -484,8 +516,13 @@ def build_npc_profile_xml(project: ModProject) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def _collect_actor_dialogs(project: ModProject, npc: CustomNpc) -> list[str]:
-    """Объединяет явные ``actor_dialogs`` с диалогами проекта.
+def _collect_actor_dialogs(
+    project: ModProject,
+    npc: CustomNpc,
+    template_dialogs: Any = (),
+    leading: Any = (),
+) -> list[str]:
+    """Объединяет системные, шаблонные и кастомные ``actor_dialog``.
 
     Диалог считается привязанным к NPC, если его ``npc_id`` совпадает с
     ``CustomNpc.id`` или ``character_profile``.
@@ -493,6 +530,8 @@ def _collect_actor_dialogs(project: ModProject, npc: CustomNpc) -> list[str]:
     Args:
         project (ModProject): Проект мода.
         npc (CustomNpc): Модель NPC.
+        template_dialogs (Any): Общие диалоги из шаблона (``dm_*`` и т. п.).
+        leading (Any): Обязательные системные диалоги в начале списка.
 
     Returns:
         list[str]: Уникальные id диалогов в порядке объявления.
@@ -511,6 +550,10 @@ def _collect_actor_dialogs(project: ModProject, npc: CustomNpc) -> list[str]:
             seen.add(cleaned)
             result.append(cleaned)
 
+    for dialog_id in leading or ():
+        add(dialog_id)
+    for dialog_id in template_dialogs or ():
+        add(dialog_id)
     for dialog_id in npc.actor_dialogs:
         add(dialog_id)
 
@@ -657,12 +700,20 @@ def build_character_desc_xml(
             lines.append(
                 f"\t\t<crouch_type>{npc.crouch_type}</crouch_type>"
             )
-        if npc.start_dialog:
-            lines.append(
-                f"\t\t<start_dialog>{_xml_text(npc.start_dialog)}"
-                "</start_dialog>"
-            )
-        for dialog_id in _collect_actor_dialogs(project, npc):
+        start_dialog = npc.start_dialog or "hello_dialog"
+        lines.append(
+            f"\t\t<start_dialog>{_xml_text(start_dialog)}</start_dialog>"
+        )
+        for dialog_id in _collect_actor_dialogs(
+            project,
+            npc,
+            template.get("common_actor_dialogs"),
+            (
+                "dm_init_stalker_trade",
+                "dm_universal_dialog",
+                "actor_break_dialog",
+            ),
+        ):
             lines.append(
                 f"\t\t<actor_dialog>{_xml_text(dialog_id)}</actor_dialog>"
             )

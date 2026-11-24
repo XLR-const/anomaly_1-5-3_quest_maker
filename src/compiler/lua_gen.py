@@ -665,7 +665,7 @@ local function eval_conditions(list, actor)
 	return true
 end
 
-__NPC_ITEM_HELPERS____STORY_HELPERS____CLEAR_SMART_HELPERS__-- Executes a list of serialized action specs in order.
+__NPC_ITEM_HELPERS____STORY_HELPERS____CLEAR_SMART_HELPERS____CUSTOM_NPC_HELPERS__-- Executes a list of serialized action specs in order.
 local function run_actions(actions, actor, npc, quest_id__STORY_RUN_ARGS__)
 	if not actions then return end
 	for _, spec in ipairs(actions) do
@@ -754,6 +754,10 @@ class LuaGenerator:
 
         module_name = (script_name or DEFAULT_SCRIPT_NAME).strip() or DEFAULT_SCRIPT_NAME
         prefix = (mod_prefix or "quests").strip() or "quests"
+        custom_npc_spawns = self._collect_custom_npc_spawns(project, prefix)
+        self._custom_npc_solo_ids = [
+            entry["section"] for entry in custom_npc_spawns
+        ]
         quest_ids = sorted(str(key) for key in quests)
 
         quest_data: dict[str, dict[str, Any]] = {}
@@ -780,6 +784,8 @@ class LuaGenerator:
                 needs_story,
                 needs_npc_item,
                 needs_clear_smart,
+                bool(custom_npc_spawns),
+                custom_npc_spawns,
             )
         )
 
@@ -818,7 +824,11 @@ class LuaGenerator:
                 )
 
         blocks.append(
-            self._build_registration(registrations, module_name)
+            self._build_registration(
+                registrations,
+                module_name,
+                bool(custom_npc_spawns),
+            )
         )
         blocks.append(
             f"-- End of auto-generated {module_name}.script"
@@ -1006,6 +1016,35 @@ class LuaGenerator:
                 ):
                     return True
         return False
+
+    @staticmethod
+    def _collect_custom_npc_spawns(
+        project: "ModProject", mod_prefix: str
+    ) -> list[dict[str, str]]:
+        """Собирает данные автоспавна для NPC с ``spawn_smart``.
+
+        Returns:
+            list[dict[str, str]]: ``section``/``smart``/``info`` для Lua.
+        """
+        entries: list[dict[str, str]] = []
+        for npc in (getattr(project, "npcs", None) or {}).values():
+            npc_id = str(getattr(npc, "id", "") or "").strip()
+            spawn_smart = str(
+                getattr(npc, "spawn_smart", None) or ""
+            ).strip()
+            if not npc_id or not spawn_smart:
+                continue
+            entries.append(
+                {
+                    "section": f"{npc_id}_solo_squad",
+                    "smart": spawn_smart,
+                    "info": f"{mod_prefix}_npc_{npc_id}_spawned",
+                    "npc_story_id": str(
+                        getattr(npc, "story_id", None) or npc_id
+                    ).strip(),
+                }
+            )
+        return entries
 
     @staticmethod
     def _linked_quest_id(
@@ -1235,11 +1274,19 @@ class LuaGenerator:
                 "smart": action.smart_alias,
             }
         if isinstance(action, ClearSmart):
+            keep_story_ids = [
+                str(value).strip()
+                for value in (action.keep_story_ids or [])
+                if str(value).strip()
+            ]
+            for extra in getattr(self, "_custom_npc_solo_ids", ()):
+                if extra and extra not in keep_story_ids:
+                    keep_story_ids.append(extra)
             return {
                 "kind": "clear_smart",
                 "smart": action.smart_alias,
                 "faction": action.faction or "",
-                "keep_story_ids": list(action.keep_story_ids),
+                "keep_story_ids": keep_story_ids,
             }
         if isinstance(action, SpawnNpcItem):
             return {
@@ -1483,6 +1530,8 @@ class LuaGenerator:
         needs_story: bool,
         needs_npc_item: bool = False,
         needs_clear_smart: bool = False,
+        needs_custom_npc_spawn: bool = False,
+        custom_npc_spawns: Sequence[dict[str, str]] = (),
     ) -> str:
         """Подставляет имя модуля и константы в шаблон общих хелперов.
 
@@ -1508,6 +1557,7 @@ class LuaGenerator:
         story_run_args = ""
         clear_smart_helpers = ""
         clear_smart_branch = ""
+        custom_npc_helpers = ""
         if needs_npc_item:
             npc_item_helpers = (
                 "\n"
@@ -1563,7 +1613,7 @@ end"""
                 '\t\telseif kind == "spawn_npc_item" then\n'
                 "\t\t\tspawn_npc_item(spec.item, spec.target, spec.count)\n"
             )
-        if needs_story:
+        if needs_story or needs_custom_npc_spawn:
             story_helpers = (
                 "\n"
                 + r"""-- Story squads: separate namespace, no sim_squad_warfare calls.
@@ -1670,6 +1720,10 @@ end"""
                 "\t\t\tremove_story_squad(spec.squad)\n"
             )
             story_run_args = ", stage_idx"
+            if not needs_story:
+                story_unmark = ""
+                story_branches = ""
+                story_run_args = ""
 
         if needs_clear_smart:
             clear_smart_helpers = (
@@ -1805,6 +1859,47 @@ end"""
                 "spec.keep_story_ids)\n"
             )
 
+        if needs_custom_npc_spawn and custom_npc_spawns:
+            rows = "\n".join(
+                "\t\t{ section = %s, smart = %s, info = %s, npc_story_id = %s },"
+                % (
+                    self._lua_string(entry["section"]),
+                    self._lua_string(entry["smart"]),
+                    self._lua_string(entry["info"]),
+                    self._lua_string(entry.get("npc_story_id", "")),
+                )
+                for entry in custom_npc_spawns
+            )
+            custom_npc_helpers = (
+                "\n"
+                + "-- Custom NPC solo story squads. Idempotence uses a persistent\n"
+                + "-- info portion so a loaded save never duplicates the NPC.\n"
+                + "local function spawn_custom_npc_squads()\n"
+                + "\tlocal entries = {\n"
+                + rows
+                + "\n\t}\n"
+                + "\tfor _, item in ipairs(entries) do\n"
+                + "\t\tif not has_alife_info(item.info) then\n"
+                + "\t\t\tlocal squad = spawn_story_squad(\n"
+                + "\t\t\t\titem.smart, item.section, nil, nil, true\n"
+                + "\t\t\t)\n"
+                + "\t\t\tif squad and register_story_id then\n"
+                + "\t\t\t\tpcall(function()\n"
+                + "\t\t\t\t\tfor k in squad:squad_members() do\n"
+                + "\t\t\t\t\t\tregister_story_id(k.id, item.npc_story_id)\n"
+                + "\t\t\t\t\t\tbreak\n"
+                + "\t\t\t\t\tend\n"
+                + "\t\t\t\tend)\n"
+                + "\t\t\tend\n"
+                + "\t\t\tif squad and db.actor then\n"
+                + "\t\t\t\tdb.actor:give_info_portion(item.info)\n"
+                + "\t\t\tend\n"
+                + "\t\tend\n"
+                + "\tend\n"
+                + "end"
+                + "\n\n"
+            )
+
         return (
             _HELPERS_TEMPLATE.replace("__SCRIPT_NAME__", script_name)
             .replace("__PDA_SOUND__", DEFAULT_PDA_SOUND)
@@ -1820,6 +1915,7 @@ end"""
             .replace(
                 "__CLEAR_SMART_ACTION_BRANCH__", clear_smart_branch
             )
+            .replace("__CUSTOM_NPC_HELPERS__", custom_npc_helpers)
             .strip()
         )
 
@@ -2366,6 +2462,7 @@ end"""
         self,
         registrations: Sequence[tuple[str, str, str]],
         script_name: str,
+        needs_custom_npc_spawn: bool = False,
     ) -> str:
         """Формирует ``register()`` и callback-обвязку модуля.
 
@@ -2418,7 +2515,25 @@ end"""
                 "",
                 "pcall(function()",
                 '\tRegisterScriptCallback("on_game_load", function(binder) register() end)',
-                '\tRegisterScriptCallback("actor_on_first_update", function(binder, delta) register() end)',
+            ]
+        )
+        if needs_custom_npc_spawn:
+            lines.extend(
+                [
+                    '\tRegisterScriptCallback("actor_on_first_update", '
+                    "function(binder, delta)",
+                    "\t\tregister()",
+                    "\t\tspawn_custom_npc_squads()",
+                    "\tend)",
+                ]
+            )
+        else:
+            lines.append(
+                '\tRegisterScriptCallback("actor_on_first_update", '
+                "function(binder, delta) register() end)"
+            )
+        lines.extend(
+            [
                 "end)",
                 "",
                 "register()",

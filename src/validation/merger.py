@@ -112,6 +112,7 @@ class MergeValidator:
         quest_origins: dict[str, int] = {}
         dialog_origins: dict[str, int] = {}
         squad_origins: dict[str, int] = {}
+        npc_origins: dict[str, int] = {}
         story_origins: dict[str, int] = {}
         info_origins: dict[str, list[tuple[int, str]]] = {}
 
@@ -217,6 +218,54 @@ class MergeValidator:
                             f"главах {previous} и {chapter_index}.",
                             hint="Сделайте story_id уникальным.",
                             owner="squad",
+                            chapter_a=previous,
+                            chapter_b=chapter_index,
+                        )
+                    else:
+                        story_origins.setdefault(story_id, chapter_index)
+
+            for npc_id, npc in (
+                getattr(chapter, "npcs", None) or {}
+            ).items():
+                previous = npc_origins.get(npc_id)
+                if previous is not None:
+                    self.report.add(
+                        "MERGE-ID-001",
+                        Severity.ERROR,
+                        npc_id,
+                        f"Ключ NPC '{npc_id}' встречается в главах "
+                        f"{previous} и {chapter_index}.",
+                        hint="Переименуйте NPC в одной из глав.",
+                        owner="npc",
+                        chapter_a=previous,
+                        chapter_b=chapter_index,
+                    )
+                else:
+                    npc_origins[npc_id] = chapter_index
+
+                if not str(npc.id).startswith(prefix):
+                    self.report.add(
+                        "MERGE-NS-001",
+                        Severity.WARNING,
+                        str(npc.id),
+                        f"ID NPC '{npc.id}' не начинается с префикса "
+                        f"'{prefix}'.",
+                        hint=f"Используйте ID вида '{prefix}<name>'.",
+                        owner="npc",
+                    )
+
+                story_id = getattr(npc, "story_id", None)
+                if story_id:
+                    previous = story_origins.get(story_id)
+                    if previous is not None and previous != chapter_index:
+                        self.report.add(
+                            "MERGE-ID-001",
+                            Severity.ERROR,
+                            str(story_id),
+                            f"story_id NPC '{story_id}' встречается в "
+                            f"главах {previous} и {chapter_index}.",
+                            hint="Сделайте story_id уникальным.",
+                            owner="npc",
                             chapter_a=previous,
                             chapter_b=chapter_index,
                         )

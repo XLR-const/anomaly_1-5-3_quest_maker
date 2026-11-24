@@ -161,7 +161,14 @@ class LtxGenerator:
             npc_random_values = self._clean_values(
                 getattr(squad, "npc_random", None)
             )
-            if not faction or (not npc_values and not npc_random_values):
+            template_squad_id = str(
+                getattr(squad, "template_squad_id", None) or ""
+            ).strip()
+            if not faction or (
+                not npc_values
+                and not npc_random_values
+                and not template_squad_id
+            ):
                 logger.warning(
                     "Кастомный отряд '%s' пропущен: faction/npc/npc_random "
                     "не заданы.",
@@ -185,6 +192,16 @@ class LtxGenerator:
                 int(value)
                 for value in (getattr(squad, "npc_in_squad", None) or [])
             ]
+            manual_min = getattr(squad, "npc_in_squad_min", None)
+            manual_max = getattr(squad, "npc_in_squad_max", None)
+            if (
+                not npc_in_squad
+                and npc_values
+                and template_squad_id
+                and manual_min is None
+                and manual_max is None
+            ):
+                npc_in_squad = [len(npc_values), len(npc_values)]
             if npc_in_squad:
                 lines.append(
                     "npc_in_squad = "
