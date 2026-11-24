@@ -27,20 +27,30 @@ import shutil
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 from src.compiler.encoding import (
+    escape_xml_text,
     read_file_cp1251,
     write_file_cp1251,
 )
 from src.compiler.ltx_gen import LtxGenerator
 from src.compiler.lua_gen import LuaGenerator
+from src.compiler.npc_gen import (
+    build_character_desc_xml,
+    build_npc_profile_xml,
+    build_npc_text_entries,
+    build_spawn_sections_ltx,
+    patch_spawn_sections_index,
+    patch_system_ltx_profiles,
+    resolve_npc_template,
+)
 from src.compiler.xml_gen import XmlGenerator
 from src.core.models import find_phrase_reward_conflicts
 from src.logger import get_logger
 
 if TYPE_CHECKING:
-    from src.core.models import Dialog, ModProject, Quest
+    from src.core.models import CustomNpc, CustomSquad, Dialog, ModProject, Quest
     from src.db.repository import GameDatabase
 
 logger = get_logger("compiler.builder")
@@ -303,6 +313,12 @@ class ModBuilder:
                     "squads должен быть dict, получен "
                     f"{type(squads).__name__}."
                 )
+            npcs = getattr(project, "npcs", None) or {}
+            if not isinstance(npcs, dict):
+                raise TypeError(
+                    "npcs должен быть dict, получен "
+                    f"{type(npcs).__name__}."
+                )
             if squads and self.vanilla_root is None:
                 logger.warning(
                     "Проект '%s' содержит %d отряд(ов), но vanilla_root=None: "
@@ -385,6 +401,9 @@ class ModBuilder:
 
             tasks_content = ltx.generate_tasks_ltx(quests)
             squads_content = ltx.generate_squads_ltx(squads)
+            squads_content = self._apply_squad_template_inheritance(
+                squads_content, squads
+            )
             dialogs_content = xml.generate_dialogs_xml(dialogs)
             string_tables = xml.generate_string_tables(project)
             script_content = lua.generate_quests_script(
@@ -401,6 +420,13 @@ class ModBuilder:
                 raise ValueError(
                     "Генератор локализации не вернул 'rus' и 'eng'."
                 )
+
+            resolved_templates: dict[str, Any] = {}
+            if npcs:
+                resolved_templates = self._resolve_npc_templates(npcs)
+                npc_rus, npc_eng = build_npc_text_entries(project)
+                rus = self._merge_string_entries(rus, npc_rus)
+                eng = self._merge_string_entries(eng, npc_eng)
 
             files: dict[Path, str] = {
                 project_dir / "gamedata" / "configs" / "misc" / "task"
@@ -437,6 +463,25 @@ class ModBuilder:
                     if index_bom:
                         bom_files[index_path] = True
 
+            if npcs:
+                creatures_dir = (
+                    project_dir
+                    / "gamedata"
+                    / "configs"
+                    / "creatures"
+                )
+                creatures_dir.mkdir(parents=True, exist_ok=True)
+                files[
+                    creatures_dir / f"spawn_sections_{slug}.ltx"
+                ] = build_spawn_sections_ltx(project)
+                spawn_index = self._build_patched_spawn_sections_index(slug)
+                if spawn_index is not None:
+                    index_text, index_bom = spawn_index
+                    index_path = creatures_dir / "spawn_sections.ltx"
+                    files[index_path] = index_text
+                    if index_bom:
+                        bom_files[index_path] = True
+
             bindings = self._collect_dialog_bindings(project)
             patched_descriptions = self._patch_character_desc_files(
                 bindings
@@ -447,6 +492,7 @@ class ModBuilder:
                     f"character_desc_{level}"
                     for level in patched_descriptions
                 ),
+                register_npc_profile=bool(npcs),
             )
 
             for path, content in files.items():
@@ -480,10 +526,32 @@ class ModBuilder:
                 write_file_cp1251(target, content, bom=has_bom)
                 self._ensure_written(target)
 
+            custom_npc_files = 0
+            if npcs:
+                try:
+                    npc_profile_bytes = build_npc_profile_xml(project)
+                    character_desc_bytes = build_character_desc_xml(
+                        project, resolved_templates
+                    )
+                except ValueError as exc:
+                    raise BuildError(str(exc)) from exc
+
+                npc_profile_path = gameplay_dir / f"npc_profile_{slug}.xml"
+                npc_profile_path.write_bytes(npc_profile_bytes)
+                self._ensure_written(npc_profile_path)
+
+                custom_desc_path = (
+                    gameplay_dir / f"character_desc_{slug}.xml"
+                )
+                custom_desc_path.write_bytes(character_desc_bytes)
+                self._ensure_written(custom_desc_path)
+                custom_npc_files = 2
+
             total = (
                 len(files)
                 + 1
                 + len(patched_descriptions)
+                + custom_npc_files
             )
             logger.info(
                 "Сборка '%s' завершена: файлов=%d, каталог='%s'.",
@@ -796,6 +864,7 @@ class ModBuilder:
         self,
         slug: str,
         character_desc_files: Sequence[str],
+        register_npc_profile: bool = False,
     ) -> tuple[str, bool]:
         """Читает ванильный ``system.ltx`` и возвращает патченую копию.
 
@@ -803,6 +872,11 @@ class ModBuilder:
             slug (str): Slug мода.
             character_desc_files (Sequence[str]):
                 Патченные ``character_desc_<level>`` без расширения.
+            register_npc_profile (bool):
+                Зарегистрировать ``npc_profile_<slug>`` в ``[profiles]
+                files`` и ``character_desc_<slug>`` в ``[profiles]
+                specific_characters_files``. Используется только при
+                непустом ``project.npcs``.
 
         Returns:
             tuple[str, bool]: Текст без BOM и исходный флаг BOM.
@@ -823,10 +897,16 @@ class ModBuilder:
             )
         text, has_bom = read_file_cp1251(source)
         patched = self.patch_system_ltx(text, slug, character_desc_files)
+        if register_npc_profile:
+            try:
+                patched = patch_system_ltx_profiles(patched, slug)
+            except ValueError as exc:
+                raise BuildError(str(exc)) from exc
         logger.info(
-            "system.ltx пропатчен: dialogs_%s, profiles=%s, BOM=%s.",
+            "system.ltx пропатчен: dialogs_%s, profiles=%s, NPC=%s, BOM=%s.",
             slug,
             ", ".join(character_desc_files) or "нет",
+            register_npc_profile,
             has_bom,
         )
         return patched, has_bom
@@ -907,6 +987,173 @@ class ModBuilder:
             has_bom,
         )
         return text, has_bom
+
+    # ------------------------------------------------------------------
+    # Кастомные NPC и наследование отрядов
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_squad_template_inheritance(
+        content: str,
+        squads: dict[str, "CustomSquad"],
+    ) -> str:
+        """Меняет родителя секции отряда на ``template_squad_id``.
+
+        Генератор ``LtxGenerator`` всегда пишет секцию как
+        ``[<id>]:online_offline_group``. Если у ``CustomSquad`` задан
+        ``template_squad_id``, заголовок заменяется на
+        ``[<id>]:<template_squad_id>``; остальные строки (заданные поля)
+        остаются без изменений и перекрывают унаследованные. Для отрядов без
+        шаблона текст возвращается байт-в-байт без изменений.
+
+        Args:
+            content (str): Результат ``generate_squads_ltx``.
+            squads (dict[str, CustomSquad]): Отряды проекта.
+
+        Returns:
+            str: LTX с учётом наследования.
+        """
+        if not content or not squads:
+            return content
+        updated = content
+        for squad in squads.values():
+            squad_id = str(getattr(squad, "id", "") or "").strip()
+            template_id = str(
+                getattr(squad, "template_squad_id", None) or ""
+            ).strip()
+            if not squad_id or not template_id:
+                continue
+            pattern = re.compile(
+                rf"^([ \t]*\[{re.escape(squad_id)}\]:)[^\r\n]*",
+                re.MULTILINE,
+            )
+            updated = pattern.sub(
+                lambda match: f"{match.group(1)}{template_id}",
+                updated,
+                count=1,
+            )
+        return updated
+
+    def _resolve_npc_templates(
+        self, npcs: dict[str, "CustomNpc"]
+    ) -> dict[str, Any]:
+        """Разрешает ``template_npc_id`` всех NPC проекта.
+
+        Args:
+            npcs (dict[str, CustomNpc]): Кастомные NPC проекта.
+
+        Returns:
+            dict[str, Any]: Карта ``CustomNpc.id -> теги шаблона``.
+
+        Raises:
+            BuildError: Если шаблон не найден (``ValueError`` резолвера).
+        """
+        resolved: dict[str, Any] = {}
+        for npc in npcs.values():
+            if not str(getattr(npc, "template_npc_id", None) or "").strip():
+                continue
+            try:
+                resolved[npc.id] = resolve_npc_template(
+                    npc, self.db_client, self.vanilla_root
+                )
+            except ValueError as exc:
+                raise BuildError(str(exc)) from exc
+        return resolved
+
+    @staticmethod
+    def _merge_string_entries(
+        xml_text: str,
+        entries: dict[str, str],
+    ) -> str:
+        """Вливает строки NPC в ``st_<slug>.xml`` без дублирования ключей.
+
+        Args:
+            xml_text (str): Готовый XML таблицы строк.
+            entries (dict[str, str]): Карта ``id -> текст``.
+
+        Returns:
+            str: XML с добавленными отсутствующими строками.
+
+        Raises:
+            BuildError: Если в XML нет закрывающего ``</string_table>``.
+        """
+        if not entries:
+            return xml_text
+        existing = set(
+            re.findall(r'<string\s+id="([^"]+)"', xml_text)
+        )
+        blocks: list[str] = []
+        for entry_id, text in entries.items():
+            if entry_id in existing:
+                continue
+            blocks.append(
+                f'\t<string id="{escape_xml_text(entry_id)}">\n'
+                f"\t\t<text>{escape_xml_text(text)}</text>\n"
+                "\t</string>"
+            )
+        if not blocks:
+            return xml_text
+
+        closing = "</string_table>"
+        index = xml_text.rfind(closing)
+        if index < 0:
+            raise BuildError(
+                "В таблице строк нет закрывающего </string_table>."
+            )
+        prefix = xml_text[:index]
+        suffix = xml_text[index:]
+        separator = "" if prefix.endswith("\n") else "\n"
+        joined = "\n".join(blocks)
+        return f"{prefix}{separator}{joined}\n{suffix}"
+
+    def _build_patched_spawn_sections_index(
+        self, slug: str
+    ) -> tuple[str, bool] | None:
+        """Копирует ванильный индекс spawn-секций и подключает файл мода.
+
+        Args:
+            slug (str): Slug мода (имя файла без расширения).
+
+        Returns:
+            tuple[str, bool] | None: Текст индекса и флаг исходного BOM.
+            ``None``, если ``vanilla_root`` не задан.
+
+        Raises:
+            OSError: Если ванильный индекс существует, но не читается.
+            UnicodeError: Если ванильный индекс не декодируется в cp1251.
+        """
+        if self.vanilla_root is None:
+            logger.warning(
+                "vanilla_root=None: 'configs/creatures/spawn_sections.ltx' "
+                "не пропатчен, кастомные NPC не будут загружены игрой."
+            )
+            return None
+
+        source = (
+            self.vanilla_root
+            / "configs"
+            / "creatures"
+            / "spawn_sections.ltx"
+        )
+        if source.is_file():
+            text, has_bom = read_file_cp1251(source)
+        else:
+            logger.warning(
+                "Ванильный индекс '%s' не найден: создаётся минимальный "
+                "spawn_sections.ltx только с файлом мода '%s'.",
+                source,
+                f"spawn_sections_{slug}.ltx",
+            )
+            text, has_bom = "", False
+
+        patched = patch_spawn_sections_index(text, slug)
+        logger.info(
+            "spawn_sections.ltx пропатчен: добавлен "
+            "'spawn_sections_%s.ltx', BOM=%s.",
+            slug,
+            has_bom,
+        )
+        return patched, has_bom
 
     # ------------------------------------------------------------------
     # Патч character_desc_<level>.xml
@@ -1025,6 +1272,12 @@ class ModBuilder:
         Raises:
             BuildError: Если у диалога есть ``npc_id``, но нет локации.
         """
+        custom_npc_ids = {
+            str(getattr(npc, "id", "") or "").strip()
+            for npc in (getattr(project, "npcs", None) or {}).values()
+            if str(getattr(npc, "id", "") or "").strip()
+        }
+
         quest_by_dialog: dict[str, "Quest"] = {}
         for quest in project.quests.values():
             if quest.dialog_id:
@@ -1076,6 +1329,14 @@ class ModBuilder:
                     "Диалог '%s' не привязан к NPC: npc_id не задан ни в "
                     "диалоге, ни в связанном квесте.",
                     dialog_id,
+                )
+                continue
+            if str(npc_id).strip() in custom_npc_ids:
+                logger.info(
+                    "Диалог '%s' привязан к CustomNpc '%s': ванильный "
+                    "character_desc не патчится.",
+                    dialog_id,
+                    npc_id,
                 )
                 continue
             level = self._normalize_level(level)
