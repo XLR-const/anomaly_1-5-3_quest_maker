@@ -73,6 +73,8 @@ class XrayLinter:
         self.db = db
         self.report = report
         self._project: ModProject | None = None
+        self._custom_npc_aliases: set[str] = set()
+        self._custom_npc_spawn_smarts: set[str] = set()
 
     # ------------------------------------------------------------------
     # Публичная точка входа
@@ -85,6 +87,22 @@ class XrayLinter:
             project (ModProject): Проверяемый проект мода.
         """
         self._project = project
+        self._custom_npc_aliases: set[str] = set()
+        self._custom_npc_spawn_smarts: set[str] = set()
+        for npc in (getattr(project, "npcs", None) or {}).values():
+            for value in (
+                getattr(npc, "id", None),
+                getattr(npc, "character_profile", None),
+                getattr(npc, "story_id", None),
+            ):
+                name = str(value or "").strip()
+                if name:
+                    self._custom_npc_aliases.add(name)
+            spawn_smart = str(
+                getattr(npc, "spawn_smart", None) or ""
+            ).strip()
+            if spawn_smart:
+                self._custom_npc_spawn_smarts.add(spawn_smart)
         self._check_names(project)
 
         for quest in project.quests.values():
@@ -201,15 +219,9 @@ class XrayLinter:
                 list(getattr(phrase, "actions", None) or []),
             )
 
-    @staticmethod
-    def _giver_smarts(quest: Quest) -> set[str]:
-        """Возвращает смарты, которые проект использует как маркер квестодателя.
-
-        В модели нет отдельного поля ``giver_smart``, поэтому кандидатами
-        считаются значения ``Stage.target_alias`` и ``TargetVariant.value``:
-        именно туда сценаристы кладут смарт возврата к квестодателю.
-        """
-        values: set[str] = set()
+    def _giver_smarts(self, quest: Quest) -> set[str]:
+        """Возвращает смарты, которые проект использует как маркер квестодателя."""
+        values: set[str] = set(self._custom_npc_spawn_smarts)
         for stage in (getattr(quest, "stages", None) or {}).values():
             target = str(getattr(stage, "target_alias", "") or "").strip()
             if target:
@@ -564,6 +576,10 @@ class XrayLinter:
         """``XRAY-MEET-001``: уникальный ``meet``-NPC и ``actor_dialog``."""
         npc_id = str(getattr(dialog, "npc_id", None) or "").strip()
         if not npc_id:
+            return
+        # Диалог кастомного NPC привязан через файлы мода, а не через
+        # ванильный meet/actor_dialog.
+        if npc_id in self._custom_npc_aliases:
             return
         if not self._is_unique_meet_npc(npc_id):
             return

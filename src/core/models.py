@@ -1059,6 +1059,14 @@ class CustomSquad(BaseModel):
     faction: str = Field(
         description="Фракция отряда, например 'bandit' или 'army'."
     )
+    template_squad_id: str | None = Field(
+        default=None,
+        description=(
+            "ID ванильного отряда из таблицы squads БД. Если задан, секция "
+            "генерируется как наследование [<id>]:<template_squad_id>, а "
+            "состав npc/npc_random может быть пустым."
+        ),
+    )
     npc: list[str] = Field(
         default_factory=list,
         description=(
@@ -1129,10 +1137,11 @@ class CustomSquad(BaseModel):
             if str(value).strip()
         ]
         if not npc_values and not random_values:
-            raise ValueError(
-                f"Отряд '{self.id}': должен быть задан хотя бы один из "
-                "списков npc или npc_random."
-            )
+            if not self.template_squad_id:
+                raise ValueError(
+                    f"Отряд '{self.id}': должен быть задан хотя бы один из "
+                    "списков npc или npc_random, либо template_squad_id."
+                )
         if len(self.npc_in_squad) > 2:
             raise ValueError(
                 f"Отряд '{self.id}': npc_in_squad принимает 0, 1 или 2 "
@@ -1150,6 +1159,148 @@ class CustomSquad(BaseModel):
             raise ValueError(
                 f"Отряд '{self.id}': в npc_in_squad min={self.npc_in_squad[0]} "
                 f"больше max={self.npc_in_squad[1]}."
+            )
+        return self
+
+
+class CustomNpc(BaseModel):
+    """Кастомный NPC: spawn-секция и профиль ``<specific_character>``.
+
+    Модель описывает уникального NPC мода. Компилятор создаёт из неё:
+
+    * секцию ``[<id>]:<parent_section>`` в ``spawn_sections_<slug>.ltx``;
+    * запись ``<character>`` в ``npc_profile_<slug>.xml`` (UTF-8);
+    * запись ``<specific_character>`` в ``character_desc_<slug>.xml``
+      (windows-1251).
+
+    Если задан :attr:`template_npc_id`, недостающие теги внешности
+    (``visual/icon/bio/rank/reputation/money/supplies``) копируются из
+    ванильного профиля. Файл шаблона берётся **только** из колонки
+    ``npcs.source_file`` базы ``anomaly_db.sqlite``; сканирование
+    ``_unpacked/`` запрещено.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    id: RequiredId = Field(
+        description="Имя spawn-секции, например '<mod_slug>_guide'."
+    )
+    character_profile: OptionalId = Field(
+        default=None,
+        description="ID профиля; по умолчанию совпадает с id.",
+    )
+    template_npc_id: str | None = Field(
+        default=None,
+        description=(
+            "ID ванильного NPC из таблицы npcs БД — донор тегов "
+            "visual/icon/bio/rank/reputation/money/supplies."
+        ),
+    )
+    name_ru: str = Field(default="", description="Русское имя NPC.")
+    name_en: str = Field(default="", description="Английское имя NPC.")
+
+    faction: str = Field(description="Техническое имя фракции (community).")
+    spec_rank: Literal["novice", "regular", "veteran", "master"] = Field(
+        default="regular",
+        description="Метка ранга в spawn-секции (spec_rank).",
+    )
+    parent_section: str = Field(
+        default="stalker",
+        description="Родительская spawn-секция, например 'stalker_strong'.",
+    )
+
+    npc_class: str | None = Field(
+        default=None,
+        alias="class",
+        description="Тег <class>; по умолчанию совпадает с id.",
+    )
+    visual: str | None = Field(
+        default=None,
+        description=(
+            "Путь модели, например 'actors\\stalker_...'. Обязателен, если "
+            "не задан template_npc_id."
+        ),
+    )
+    icon: str | None = Field(default=None, description="ID иконки профиля.")
+    bio: str | None = Field(default=None, description="Текст/ID биографии.")
+    terrain_sect: str = Field(
+        default="stalker_terrain",
+        description="Секция поведения на местности (<terrain_sect>).",
+    )
+    snd_config: str | None = Field(
+        default=None, description="Опциональная секция звуков NPC."
+    )
+    crouch_type: int | None = Field(
+        default=None, description="Опциональный тип приседания."
+    )
+
+    rank: int = Field(
+        default=0, ge=0, description="Абсолютное значение <rank>."
+    )
+    reputation: int = Field(default=0, description="Значение <reputation>.")
+    money_min: int = Field(default=0, ge=0, description="Минимум денег NPC.")
+    money_max: int = Field(default=0, ge=0, description="Максимум денег NPC.")
+    money_infinitive: bool = Field(
+        default=False, description="Флаг infinitive у тега <money>."
+    )
+    supplies: list[str] = Field(
+        default_factory=list,
+        description="Секции предметов стартового инвентаря (<supplies>).",
+    )
+
+    story_id: OptionalId = Field(
+        default=None, description="Опциональный story_id spawn-секции."
+    )
+    immortal: bool = Field(
+        default=False,
+        description=(
+            "Если True и immunities_sect не задан, компилятор создаёт "
+            "секцию [<mod_slug>_immunities_immortal] со всеми 0.0."
+        ),
+    )
+    immunities_sect: str | None = Field(
+        default=None, description="Явная секция иммунитетов."
+    )
+
+    spawn_smart: str | None = Field(
+        default=None, description="Алиас смарта, на котором спавнится NPC."
+    )
+    start_dialog: str | None = Field(
+        default=None, description="Диалог, открываемый по умолчанию."
+    )
+    actor_dialogs: list[str] = Field(
+        default_factory=list,
+        description="Список диалогов актора (<actor_dialog>).",
+    )
+
+    @model_validator(mode="after")
+    def _apply_defaults(self) -> Self:
+        """Заполняет производные идентификаторы и проверяет инварианты.
+
+        ``validate_assignment=True`` может повторно вызывать валидатор после
+        присваивания, поэтому значения записываются через
+        ``object.__setattr__``, чтобы не уйти в рекурсию.
+
+        Returns:
+            Self: NPC с заполненными ``character_profile`` и ``npc_class``.
+
+        Raises:
+            ValueError: Если ``money_max < money_min`` или не задан ни
+                ``visual``, ни ``template_npc_id``.
+        """
+        if not self.character_profile:
+            object.__setattr__(self, "character_profile", self.id)
+        if not self.npc_class:
+            object.__setattr__(self, "npc_class", self.id)
+        if self.money_max < self.money_min:
+            raise ValueError(
+                f"NPC '{self.id}': money_max={self.money_max} меньше "
+                f"money_min={self.money_min}."
+            )
+        if not self.visual and not self.template_npc_id:
+            raise ValueError(
+                f"NPC '{self.id}': должен быть задан visual или "
+                "template_npc_id."
             )
         return self
 
@@ -1177,6 +1328,14 @@ class ModProject(BaseModel):
     dialogs: dict[str, Dialog] = Field(
         default_factory=dict,
         description="Карта диалогов: ключ может отличаться от Dialog.id.",
+    )
+    npcs: dict[str, CustomNpc] = Field(
+        default_factory=dict,
+        description=(
+            "Кастомные NPC: ключ обязан совпадать с CustomNpc.id. При "
+            "непустой карте сборщик создаёт spawn_sections_<slug>.ltx, "
+            "npc_profile_<slug>.xml и character_desc_<slug>.xml."
+        ),
     )
     squads: dict[str, CustomSquad] = Field(
         default_factory=dict,
@@ -1228,6 +1387,33 @@ class ModProject(BaseModel):
                     f"Ключ карты отрядов '{squad_key}' не совпадает "
                     f"с CustomSquad.id='{squad.id}'."
                 )
+        for npc_key, npc in self.npcs.items():
+            if npc_key != npc.id:
+                raise ValueError(
+                    f"Ключ карты NPC '{npc_key}' не совпадает "
+                    f"с CustomNpc.id='{npc.id}'."
+                )
+
+        story_ids: dict[str, str] = {}
+        for squad in self.squads.values():
+            story_id = getattr(squad, "story_id", None)
+            if not story_id:
+                continue
+            # Дубли squad↔squad исторически ловит XrayLinter, а не модель;
+            # здесь важно зарезервировать story_id ванильных/кастомных
+            # отрядов, чтобы NPC не переиспользовал его.
+            story_ids.setdefault(story_id, f"отряда '{squad.id}'")
+        for npc in self.npcs.values():
+            story_id = getattr(npc, "story_id", None)
+            if not story_id:
+                continue
+            owner = f"NPC '{npc.id}'"
+            if story_id in story_ids:
+                raise ValueError(
+                    f"story_id '{story_id}' дублируется у "
+                    f"{story_ids[story_id]} и у {owner}."
+                )
+            story_ids[story_id] = owner
         return self
 
     @classmethod
@@ -1240,8 +1426,8 @@ class ModProject(BaseModel):
         """Объединяет несколько глав мода в один проект.
 
         Главы считаются независимыми проектами: их карты ``quests``,
-        ``dialogs`` и ``squads`` объединяются без перезаписи. Любая
-        коллизия ключа или ``CustomSquad.story_id`` между главами является
+        ``dialogs``, ``npcs`` и ``squads`` объединяются без перезаписи. Любая
+        коллизия ключа или ``story_id`` (NPC/отряд) между главами является
         ошибкой: молчаливая перезапись потеряла бы часть сюжета.
 
         Args:
@@ -1263,11 +1449,13 @@ class ModProject(BaseModel):
 
         quests: dict[str, Quest] = {}
         dialogs: dict[str, Dialog] = {}
+        npcs: dict[str, CustomNpc] = {}
         squads: dict[str, CustomSquad] = {}
         required_mods: list[str] = []
 
         quest_origin: dict[str, int] = {}
         dialog_origin: dict[str, int] = {}
+        npc_origin: dict[str, int] = {}
         squad_origin: dict[str, int] = {}
         story_origin: dict[str, int] = {}
 
@@ -1309,6 +1497,25 @@ class ModProject(BaseModel):
                         )
                     story_origin.setdefault(story_id, chapter_index)
 
+            for npc_id, npc in project.npcs.items():
+                if npc_id in npcs:
+                    raise ValueError(
+                        f"Конфликт ключа NPC '{npc_id}' между главами "
+                        f"{npc_origin[npc_id]} и {chapter_index}."
+                    )
+                npcs[npc_id] = npc
+                npc_origin[npc_id] = chapter_index
+
+                story_id = getattr(npc, "story_id", None)
+                if story_id:
+                    previous = story_origin.get(story_id)
+                    if previous is not None and previous != chapter_index:
+                        raise ValueError(
+                            f"Конфликт story_id NPC '{story_id}' между "
+                            f"главами {previous} и {chapter_index}."
+                        )
+                    story_origin.setdefault(story_id, chapter_index)
+
             for required_mod in project.required_mods:
                 if required_mod not in required_mods:
                     required_mods.append(required_mod)
@@ -1337,6 +1544,7 @@ class ModProject(BaseModel):
             required_mods=required_mods,
             quests=quests,
             dialogs=dialogs,
+            npcs=npcs,
             squads=squads,
             **extras,
         )
@@ -1470,6 +1678,7 @@ __all__ = [
     "ClearSmart",
     "CompleteTask",
     "Condition",
+    "CustomNpc",
     "CustomSquad",
     "DescrVariant",
     "Dialog",

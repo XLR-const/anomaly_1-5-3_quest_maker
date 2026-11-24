@@ -91,6 +91,12 @@ _GENERIC_NPC_TEMPLATE_RE = re.compile(
 #: отвечает на них ``!ERROR: npc section ... does not exist!``.
 _SPAWN_PROFILE_SUFFIX_RE = re.compile(r"^(?P<base>.+)_default_\d+$", re.IGNORECASE)
 
+#: Допустимый технический ID кастомного NPC/отряда (``CAT-CUSTOM-001``).
+_CUSTOM_ID_RE = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
+
+#: Допустимые ранги ``CustomNpc.spec_rank``.
+_CUSTOM_SPEC_RANKS = {"novice", "regular", "veteran", "master"}
+
 
 class _ActionContext:
     """Контекст одного действия проекта для формирования ``target_id``."""
@@ -130,6 +136,9 @@ class CatalogValidator:
         self._squad_rows: dict[str, list[dict[str, Any]]] | None = None
         self._aliases: dict[tuple[str, str], str] | None = None
         self._factions: set[str] | None = None
+        self._project: ModProject | None = None
+        self._project_npc_aliases: set[str] | None = None
+        self._vanilla_aliases_cache: set[str] | None = None
 
     # ------------------------------------------------------------------
     # Низкоуровневый доступ к БД
@@ -363,6 +372,78 @@ class CatalogValidator:
             return ""
         return str(value).strip()
 
+    # ------------------------------------------------------------------
+    # Кастомные NPC/отряды: общие помощники
+    # ------------------------------------------------------------------
+
+    def _custom_npc_aliases(self) -> set[str]:
+        """Возвращает ID/профили/story_id кастомных NPC проекта."""
+        if self._project_npc_aliases is None:
+            aliases: set[str] = set()
+            for npc in (
+                getattr(self._project, "npcs", None) or {}
+            ).values():
+                for value in (
+                    getattr(npc, "id", None),
+                    getattr(npc, "character_profile", None),
+                    getattr(npc, "story_id", None),
+                ):
+                    name = self._normalize(value)
+                    if name:
+                        aliases.add(name)
+            self._project_npc_aliases = aliases
+        return self._project_npc_aliases
+
+    def _find_custom_npc(self, alias: str | None):
+        """Ищет ``CustomNpc`` проекта по id, профилю или ``story_id``."""
+        name = self._normalize(alias)
+        if not name or self._project is None:
+            return None
+        for npc in (getattr(self._project, "npcs", None) or {}).values():
+            for value in (
+                getattr(npc, "id", None),
+                getattr(npc, "character_profile", None),
+                getattr(npc, "story_id", None),
+            ):
+                if self._normalize(value) == name:
+                    return npc
+        return None
+
+    @staticmethod
+    def _project_slug(project: ModProject) -> str:
+        """Возвращает ``mod_slug`` проекта или безопасный slug из ``name``."""
+        slug = CatalogValidator._normalize(
+            getattr(project, "mod_slug", None)
+        ).lower()
+        if slug:
+            return slug
+        raw = CatalogValidator._normalize(getattr(project, "name", "")).lower()
+        slug = re.sub(r"[^a-z0-9_]+", "_", raw)
+        slug = re.sub(r"_+", "_", slug).strip("_")
+        return slug
+
+    def _vanilla_aliases(self) -> set[str]:
+        """Собирает известные ванильные алиасы для ``CAT-CUSTOM-001/005``."""
+        if self._vanilla_aliases_cache is None:
+            aliases: set[str] = set()
+            if self.db is not None:
+                getter = getattr(self.db, "get_all_valid_aliases", None)
+                if callable(getter):
+                    try:
+                        aliases.update(
+                            self._normalize(value)
+                            for value in (getter() or set())
+                            if self._normalize(value)
+                        )
+                    except Exception:  # noqa: BLE001 - БД не должна ронять валидатор
+                        pass
+            if not aliases:
+                aliases.update(
+                    alias for (_type, alias) in self._alias_index().items()
+                )
+            self._vanilla_aliases_cache = aliases
+        return self._vanilla_aliases_cache
+
     @staticmethod
     def _select_by_location(
         rows: list[dict[str, Any]], location: str | None
@@ -579,6 +660,10 @@ class CatalogValidator:
 
     def validate(self, project: ModProject) -> None:
         """Проверяет проект по всем правилам ``CAT-*``."""
+        self._project = project
+        self._project_npc_aliases = None
+        self._vanilla_aliases_cache = None
+        self._validate_custom_entities(project)
         self._validate_npcs(project)
         self._validate_smarts(project)
         self._validate_items(project)
@@ -586,6 +671,283 @@ class CatalogValidator:
         self._validate_warfare(project)
         self._validate_factions(project)
         self._validate_dialogs(project)
+
+    # ------------------------------------------------------------------
+    # CAT-CUSTOM-001..012
+    # ------------------------------------------------------------------
+
+    def _validate_custom_entities(self, project: ModProject) -> None:
+        """Проверяет ``project.npcs`` и ``template_squad_id`` отрядов."""
+        npcs = list((getattr(project, "npcs", None) or {}).values())
+        squads = list((getattr(project, "squads", None) or {}).values())
+        if not npcs and not squads:
+            return
+
+        slug = self._project_slug(project)
+        prefix = f"{slug}_" if slug else ""
+        vanilla_aliases = self._vanilla_aliases()
+        story_owners: dict[str, list[str]] = {}
+        profiles: dict[str, str] = {}
+
+        giver_ids: set[str] = set()
+        for quest in (project.quests or {}).values():
+            for value in (quest.npc_id, quest.giver_npc_id):
+                name = self._normalize(value)
+                if name:
+                    giver_ids.add(name)
+        for dialog in (project.dialogs or {}).values():
+            name = self._normalize(getattr(dialog, "npc_id", None))
+            if name:
+                giver_ids.add(name)
+
+        for npc in npcs:
+            npc_id = self._normalize(getattr(npc, "id", None))
+            target_id = f"npc:{npc_id or '<unknown>'}"
+            if not npc_id:
+                continue
+
+            # CAT-CUSTOM-001: синтаксис, префикс slug и коллизия с ванилью.
+            if not _CUSTOM_ID_RE.match(npc_id):
+                self.report.add(
+                    "CAT-CUSTOM-001",
+                    Severity.ERROR,
+                    target_id,
+                    f"ID кастомного NPC '{npc_id}' не соответствует "
+                    "^[a-z][a-z0-9_]{2,63}$.",
+                    hint="Используйте нижний регистр, цифры и '_'.",
+                    owner="npc",
+                    npc_id=npc_id,
+                )
+            elif prefix and not npc_id.startswith(prefix):
+                self.report.add(
+                    "CAT-CUSTOM-001",
+                    Severity.ERROR,
+                    target_id,
+                    f"ID кастомного NPC '{npc_id}' не начинается с "
+                    f"префикса '{prefix}'.",
+                    hint=f"Используйте ID вида '{prefix}<name>'.",
+                    owner="npc",
+                    npc_id=npc_id,
+                )
+            if npc_id in vanilla_aliases or npc_id in self._npc_index():
+                self.report.add(
+                    "CAT-CUSTOM-001",
+                    Severity.ERROR,
+                    target_id,
+                    f"ID кастомного NPC '{npc_id}' совпадает с ванильным "
+                    "алиасом/ID из БД.",
+                    hint="Переименуйте NPC: он не должен перезаписывать ваниль.",
+                    owner="npc",
+                    npc_id=npc_id,
+                )
+
+            # CAT-CUSTOM-007: $spawn строится только из id.
+            if npc_id.startswith("respawn_"):
+                self.report.add(
+                    "CAT-CUSTOM-007",
+                    Severity.ERROR,
+                    target_id,
+                    f"ID '{npc_id}' переиспользует ванильный respawn-путь.",
+                    hint="Уберите префикс 'respawn_': $spawn строится из id.",
+                    owner="npc",
+                    npc_id=npc_id,
+                )
+
+            # CAT-CUSTOM-003: community и spec_rank.
+            if self.resolve_faction(getattr(npc, "faction", None)) is None:
+                self.report.add(
+                    "CAT-CUSTOM-003",
+                    Severity.ERROR,
+                    f"{target_id}.faction",
+                    f"Неизвестная фракция кастомного NPC '{npc_id}': "
+                    f"'{getattr(npc, 'faction', '')}'.",
+                    hint="Используйте техническое имя: stalker, bandit, army, ...",
+                    owner="npc",
+                    npc_id=npc_id,
+                    faction=getattr(npc, "faction", ""),
+                )
+            spec_rank = self._normalize(getattr(npc, "spec_rank", ""))
+            if spec_rank and spec_rank not in _CUSTOM_SPEC_RANKS:
+                self.report.add(
+                    "CAT-CUSTOM-003",
+                    Severity.ERROR,
+                    f"{target_id}.spec_rank",
+                    f"Недопустимый spec_rank '{spec_rank}'.",
+                    hint="novice, regular, veteran или master.",
+                    owner="npc",
+                    npc_id=npc_id,
+                )
+
+            # CAT-CUSTOM-009: visual/icon/bio (WARN, шаблон считается донором).
+            template_id = self._normalize(
+                getattr(npc, "template_npc_id", None)
+            )
+            visual = self._normalize(getattr(npc, "visual", None))
+            if not template_id:
+                if not visual:
+                    self.report.add(
+                        "CAT-CUSTOM-009",
+                        Severity.WARNING,
+                        f"{target_id}.visual",
+                        f"У NPC '{npc_id}' не задан visual и нет шаблона.",
+                        hint="Задайте visual='actors\\\\...' или template_npc_id.",
+                        owner="npc",
+                        npc_id=npc_id,
+                    )
+                elif not visual.startswith("actors\\"):
+                    self.report.add(
+                        "CAT-CUSTOM-009",
+                        Severity.WARNING,
+                        f"{target_id}.visual",
+                        f"visual NPC '{npc_id}' не начинается с 'actors\\'.",
+                        hint="Путь модели обычно начинается с 'actors\\\\'.",
+                        owner="npc",
+                        npc_id=npc_id,
+                    )
+                if not self._normalize(getattr(npc, "icon", None)):
+                    self.report.add(
+                        "CAT-CUSTOM-009",
+                        Severity.WARNING,
+                        f"{target_id}.icon",
+                        f"У NPC '{npc_id}' не задан icon.",
+                        hint="Задайте icon или template_npc_id.",
+                        owner="npc",
+                        npc_id=npc_id,
+                    )
+                if not self._normalize(getattr(npc, "bio", None)):
+                    self.report.add(
+                        "CAT-CUSTOM-009",
+                        Severity.WARNING,
+                        f"{target_id}.bio",
+                        f"У NPC '{npc_id}' не задан bio.",
+                        hint="Задайте bio или template_npc_id.",
+                        owner="npc",
+                        npc_id=npc_id,
+                    )
+
+            # CAT-CUSTOM-011: template_npc_id обязан быть в npcs БД.
+            if template_id and self.resolve_npc(template_id) is None:
+                self.report.add(
+                    "CAT-CUSTOM-011",
+                    Severity.ERROR,
+                    f"{target_id}.template_npc_id",
+                    f"template_npc_id '{template_id}' не найден в таблице "
+                    "npcs БД.",
+                    hint="Проверьте ID донора через main.py search.",
+                    owner="npc",
+                    npc_id=npc_id,
+                    template_npc_id=template_id,
+                )
+
+            # CAT-CUSTOM-008: spawn_smart — существующий алиас смарта.
+            spawn_smart = self._normalize(
+                getattr(npc, "spawn_smart", None)
+            )
+            if spawn_smart and self.resolve_smart(spawn_smart) is None:
+                self.report.add(
+                    "CAT-CUSTOM-008",
+                    Severity.ERROR,
+                    f"{target_id}.spawn_smart",
+                    f"spawn_smart '{spawn_smart}' не найден в БД смартов.",
+                    hint="Укажите существующий ID/алиас смарта.",
+                    owner="npc",
+                    npc_id=npc_id,
+                    smart_alias=spawn_smart,
+                )
+
+            # CAT-CUSTOM-002: профиль обязан быть уникален (тройная связка
+            # проверяется после сборки, здесь ловятся дубли до эмита).
+            profile = self._normalize(
+                getattr(npc, "character_profile", None)
+            ) or npc_id
+            if profile in profiles:
+                self.report.add(
+                    "CAT-CUSTOM-002",
+                    Severity.ERROR,
+                    f"{target_id}.character_profile",
+                    f"character_profile '{profile}' уже занят NPC "
+                    f"'{profiles[profile]}'.",
+                    hint="Профиль должен быть уникален в проекте.",
+                    owner="npc",
+                    npc_id=npc_id,
+                    character_profile=profile,
+                )
+            else:
+                profiles[profile] = npc_id
+
+            # CAT-CUSTOM-006: бессмертный квестодатель обязан иметь story_id.
+            story_id = self._normalize(getattr(npc, "story_id", None))
+            aliases = {
+                npc_id,
+                profile,
+                self._normalize(getattr(npc, "character_profile", None)),
+                story_id,
+            }
+            is_giver = bool(aliases & giver_ids)
+            if getattr(npc, "immortal", False) and is_giver and not story_id:
+                self.report.add(
+                    "CAT-CUSTOM-006",
+                    Severity.ERROR,
+                    f"{target_id}.story_id",
+                    f"Бессмертный квестодатель '{npc_id}' не имеет story_id.",
+                    hint="Задайте CustomNpc.story_id: гайд должен быть найден "
+                    "скриптом.",
+                    owner="npc",
+                    npc_id=npc_id,
+                )
+            if story_id:
+                story_owners.setdefault(story_id, []).append(
+                    f"NPC '{npc_id}'"
+                )
+
+        for squad in squads:
+            squad_id = self._normalize(getattr(squad, "id", None))
+            if not squad_id:
+                continue
+            template_squad_id = self._normalize(
+                getattr(squad, "template_squad_id", None)
+            )
+            if template_squad_id and self.resolve_squad(template_squad_id) is None:
+                self.report.add(
+                    "CAT-CUSTOM-012",
+                    Severity.ERROR,
+                    f"squad:{squad_id}.template_squad_id",
+                    f"template_squad_id '{template_squad_id}' не найден в "
+                    "таблице squads БД.",
+                    hint="Проверьте ID отряда через main.py search -t squad.",
+                    owner="squad",
+                    squad_id=squad_id,
+                    template_squad_id=template_squad_id,
+                )
+            story_id = self._normalize(getattr(squad, "story_id", None))
+            if story_id:
+                story_owners.setdefault(story_id, []).append(
+                    f"отряд '{squad_id}'"
+                )
+
+        # CAT-CUSTOM-005: story_id уникален и не пересекается с ванилью.
+        for story_id, owners in story_owners.items():
+            if len(owners) > 1:
+                self.report.add(
+                    "CAT-CUSTOM-005",
+                    Severity.ERROR,
+                    f"story_id:{story_id}",
+                    f"story_id '{story_id}' дублируется у: "
+                    f"{', '.join(sorted(owners))}.",
+                    hint="story_id обязан быть уникальным в проекте.",
+                    owner="project",
+                    story_id=story_id,
+                )
+            if story_id in vanilla_aliases:
+                self.report.add(
+                    "CAT-CUSTOM-005",
+                    Severity.ERROR,
+                    f"story_id:{story_id}",
+                    f"story_id '{story_id}' совпадает с ванильным алиасом.",
+                    hint="Переименуйте story_id, чтобы не перезаписать ваниль.",
+                    owner="project",
+                    story_id=story_id,
+                )
 
     # ------------------------------------------------------------------
     # CAT-NPC-001..004, CAT-LOC-001
@@ -619,6 +981,11 @@ class CatalogValidator:
         """Проверяет один NPC-профиль и его локацию."""
         name = self._normalize(npc_id)
         if not name:
+            return
+        # Кастомный NPC живёт в файлах мода, а не в ванильном
+        # character_desc_<level>.xml, поэтому CAT-NPC-001/002 к нему не
+        # применяются.
+        if name in self._custom_npc_aliases():
             return
 
         rows = self._npc_index().get(name, [])
@@ -802,6 +1169,8 @@ class CatalogValidator:
         name = self._normalize(value)
         if not name:
             return
+        if self._find_custom_npc(name) is not None:
+            return
         smart = self.resolve_smart(name)
         if smart is not None:
             if quest is not None and quest.npc_location:
@@ -921,7 +1290,7 @@ class CatalogValidator:
     def _validate_squads(self, project: ModProject) -> None:
         """Проверяет отряды проекта и все ссылки на них."""
         for squad in (project.squads or {}).values():
-            self._validate_custom_squad(squad)
+            self._validate_custom_squad(project, squad)
 
         for context in self._iter_actions(project):
             action = context.action
@@ -974,7 +1343,9 @@ class CatalogValidator:
                         f"quest:{quest.id}.stage:{stage.id}.target_squad_id",
                     )
 
-    def _validate_custom_squad(self, squad: CustomSquad) -> None:
+    def _validate_custom_squad(
+        self, project: ModProject, squad: CustomSquad
+    ) -> None:
         """Проверяет состав и метаданные ``CustomSquad``."""
         templates = [
             self._normalize(value)
@@ -982,19 +1353,26 @@ class CatalogValidator:
             if self._normalize(value)
         ]
         owner_target = f"squad:{squad.id}"
-
-        if not templates:
+        has_custom_npcs = bool(getattr(project, "npcs", None))
+        # Пустой состав допустим только при наследовании от ванильного
+        # шаблона (CAT-CUSTOM-004, §3.1).
+        if not templates and not self._normalize(squad.template_squad_id):
             self.report.add(
-                "CAT-SQUAD-003",
+                "CAT-CUSTOM-004" if has_custom_npcs else "CAT-SQUAD-003",
                 Severity.ERROR,
                 f"{owner_target}.npc",
                 f"У отряда '{squad.id}' пусты и npc, и npc_random.",
-                hint="Задайте хотя бы один NPC-шаблон.",
+                hint=(
+                    "Задайте хотя бы один NPC-шаблон или "
+                    "CustomSquad.template_squad_id."
+                ),
                 owner="squad",
                 squad_id=squad.id,
             )
 
         for index, template in enumerate(templates):
+            if self._find_custom_npc(template) is not None:
+                continue
             if not self._npc_template_exists(template):
                 profile_match = _SPAWN_PROFILE_SUFFIX_RE.match(template)
                 if profile_match:
@@ -1016,10 +1394,10 @@ class CatalogValidator:
                     )
                     hint = (
                         "Используйте существующую LTX spawn-секцию NPC "
-                        "(например, sim_default_monolith_3)."
+                        "или CustomNpc.id (например, sim_default_monolith_3)."
                     )
                 self.report.add(
-                    "CAT-SQUAD-004",
+                    "CAT-CUSTOM-004" if has_custom_npcs else "CAT-SQUAD-004",
                     Severity.ERROR,
                     f"{owner_target}.template[{index}]",
                     message,

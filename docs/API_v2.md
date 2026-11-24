@@ -2620,6 +2620,127 @@ output/dead_city_dushmans_debt/gamedata/
 
 ---
 
+## 4.5. Кастомные NPC и отряды-наследники
+
+### `CustomNpc`
+
+`ModProject.npcs` объявляет уникального NPC мода. Сборщик создаёт
+`spawn_sections_<slug>.ltx`, `npc_profile_<slug>.xml` и
+`character_desc_<slug>.xml`, а диалоги с `npc_id=<CustomNpc.id>` привязывает
+к профилю мода (ванильный `character_desc_<level>.xml` не патчится).
+
+```python
+from src.core.models import CustomNpc
+
+envoy = CustomNpc(
+    id="mymod_envoy",                 # секция spawn и профиль по умолчанию
+    faction="stalker",
+    template_npc_id="esc_2_12_stalker_wolf",  # донор visual/icon/bio/rank/...
+    immortal=True,                    # секция <slug>_immunities_immortal
+    story_id="mymod_envoy",           # обязателен для квестодателя
+    spawn_smart="esc_smart_terrain_2_12",
+    name_ru="Связной",
+    name_en="Envoy",
+)
+```
+
+* `template_npc_id` — ID из таблицы `npcs` БД. Недостающие
+  `visual/icon/bio/rank/reputation/money/supplies` копируются из
+  `<vanilla_root>/configs/gameplay/<source_file>`.
+* Из шаблона также переносятся базовые диалоги взаимодействия:
+  `<start_dialog>` и общие `<actor_dialog>` (`actor_break_dialog`, `dm_*`,
+  `hello_dialog`, `meet_*`); чужие сюжетные диалоги шаблона не копируются.
+  Если `CustomNpc.start_dialog` не задан, используется шаблонный, иначе
+  `hello_dialog`. В `<specific_character>` всегда добавляется
+  `<actor_dialog>actor_break_dialog</actor_dialog>` (кнопка «До встречи»),
+  затем общие диалоги шаблона, затем `actor_dialogs` из модели и
+  `project.dialogs` — без дублей.
+* `immortal=True` генерирует `[<slug>_immunities_immortal]` (все 9 полей +
+  `wound_2_immunity` = `0.0`) и `immunities_sect` в spawn-секции.
+* `money_infinitive=True` выставляет `infinitive="1"` у `<money>`; для
+  торговца/квестодателя это даёт бесконечные деньги.
+* `spawn_smart` включает автоспавн: для NPC создаётся Story-отряд
+  `[<npc_id>_solo_squad]` (`faction`, `npc`, `npc_in_squad = 1, 1`,
+  `target_smart`, `story_id = <npc_id>_solo_squad`, `relationship = friend`).
+  Lua-генератор вызывает его в `actor_on_first_update` и помечает факт
+  спавна инфопоршнем `<mod_slug>_npc_<npc_id>_spawned`; повторный спавн после
+  загрузки сейва не выполняется. `ClearSmart` всегда сохраняет этот отряд.
+  После спавна `story_id` регистрируется **на самом NPC** (первый член
+  отряда), поэтому `target_alias="<npc.story_id>"` ставит маркер КПК ровно на
+  персонажа, а не на центр смарта.
+* Валидация: `CAT-CUSTOM-001..012` (ID/префикс, фракция, story_id,
+  `template_npc_id`, `spawn_smart`, бессмертие и т. д.).
+
+### `CustomSquad.template_squad_id`
+
+```python
+from src.core.models import CustomSquad
+
+squad = CustomSquad(
+    id="mymod_atp_squad",
+    faction="bandit",
+    template_squad_id="bandit_sim_squad_advanced",
+    target_smart="esc_smart_terrain_7_11",
+    story_id="mymod_atp_squad",
+)
+```
+
+Секция генерируется как `[<id>]:<template_squad_id>`, поэтому состав
+`npc`/`npc_random` может быть пустым: он наследуется от ванильного отряда.
+`template_squad_id` обязан существовать в таблице `squads` БД
+(`CAT-CUSTOM-012`). Ссылки `npc`/`npc_random` на `CustomNpc.id` допустимы
+(`CAT-CUSTOM-004`).
+
+**Командир отряда:** первый элемент списка `CustomSquad.npc` всегда является
+лидером (командиром) отряда. Именно к нему привязываются диалоги с отрядом,
+выдача предметов в рюкзак через `SpawnNpcItem` и маркер `target_squad_id`.
+Поэтому именной `CustomNpc`-командир должен стоять первым:
+
+```python
+squad = CustomSquad(
+    id="mymod_freedom_squad",
+    faction="freedom",
+    npc=["mymod_freedom_leader", "sim_default_freedom_1"],
+    npc_in_squad=[2, 2],
+    target_smart="esc_smart_terrain_7_11",
+    relationship="neutral",
+    story_id="mymod_freedom_squad",
+)
+```
+
+**Неквестовые диалоги и пункты взаимодействия (скупка/обмен/лор):**
+`Dialog` может работать без квеста: `task_id=None`. Такой диалог привязывается
+к `CustomNpc` через `npc_id` и может проверять предмет, забирать его и выдавать
+деньги/информацию.
+
+```python
+from src.core.models import Dialog, GiveInfo, GiveMoney, HasItem, Phrase, RemoveItem
+
+trade_dialog = Dialog(
+    id="mymod_envoy_trade",
+    dialog_id="mymod_envoy_trade",
+    npc_id="mymod_envoy",
+    npc_location="escape",
+    task_id=None,                     # не создаёт квест
+    role="",
+    preconditions=[HasItem(item_alias="itm_pda_common", count=1)],
+    phrases={
+        0: Phrase(id=0, text_ru="Хочешь продать КПК?", next_phrases=[1]),
+        1: Phrase(
+            id=1,
+            text_ru="Держи, мне он больше не нужен.",
+            actions=[
+                RemoveItem(item_alias="itm_pda_common", count=1),
+                GiveMoney(amount=3000),
+                GiveInfo(info="mymod_envoy_pda_sold"),
+            ],
+        ),
+    },
+)
+```
+
+---
+
 ## Приложение. Минимальная шпаргалка по импортам
 
 ```python
