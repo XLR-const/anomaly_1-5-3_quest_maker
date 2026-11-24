@@ -792,7 +792,8 @@ class QuestCondlist(BaseModel):
 
     Условия сериализуются в строку ``condlist_N`` файла ``tm_<mod>.ltx``.
     Поддерживаются ``HasInfo``, ``DontHasInfo`` и ``HasItem``; остальные
-    типы условий в Фазе 2 не представимы в LTX и дают ``BuildError``.
+    типы условий в LTX не представимы и дают ``BuildError`` — для них
+    используйте :attr:`Quest.transfer_conditions`.
 
     Attributes:
         when (list[Condition]): Непустой список условий condlist.

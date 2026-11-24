@@ -33,8 +33,6 @@ from src.core.models import (
     SmartOwner,
     SpawnNpcItem,
     SpawnSquad,
-    Stage,
-    WarfareCapture,
 )
 from src.db.repository import GameDatabase
 from src.validation.report import Severity, ValidationReport
@@ -204,20 +202,6 @@ class XrayLinter:
             yield (
                 f"{quest.id}.stage_{stage_id}.on_start_actions",
                 list(getattr(stage, "on_start_actions", None) or []),
-            )
-
-    @staticmethod
-    def _dialog_action_lists(
-        dialog: Dialog,
-    ) -> Iterator[tuple[str, list[Any]]]:
-        """Итерирует списки действий реплик диалога."""
-        dialog_id = XrayLinter._dialog_id(dialog)
-        for phrase_id, phrase in sorted(
-            (getattr(dialog, "phrases", None) or {}).items()
-        ):
-            yield (
-                f"{dialog_id}.phrase_{phrase_id}",
-                list(getattr(phrase, "actions", None) or []),
             )
 
     def _giver_smarts(self, quest: Quest) -> set[str]:

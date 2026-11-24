@@ -14,12 +14,12 @@ from typing import TYPE_CHECKING, Any, Iterator
 from src.core.models import (
     BaseAction,
     BaseCondition,
+    ClearSmart,
     CustomSquad,
     Dialog,
     GiveItem,
     HasItem,
     ModProject,
-    Phrase,
     Quest,
     RemoveItem,
     RemoveSquad,
@@ -548,7 +548,7 @@ class CatalogValidator:
         return None
 
     def _iter_actions(self, project: ModProject) -> Iterator[_ActionContext]:
-        """Перебирает все действия квестов, этапов и реплик."""
+        """Перебирает все действия проекта с контекстом владельца."""
         for quest in (project.quests or {}).values():
             for field_name in (
                 "on_init_actions",
@@ -1110,6 +1110,12 @@ class CatalogValidator:
                             quest_id=quest.id,
                         )
                 elif isinstance(action, SetTarget):
+                    self._check_smart(
+                        action.smart_alias,
+                        f"{context.owner}.smart_alias",
+                        "quest",
+                    )
+                elif isinstance(action, ClearSmart):
                     self._check_smart(
                         action.smart_alias,
                         f"{context.owner}.smart_alias",
@@ -1716,6 +1722,14 @@ class CatalogValidator:
                     condition.faction,
                     f"{target_id}.faction",
                     "condition",
+                )
+        for context in self._iter_actions(project):
+            action = context.action
+            if isinstance(action, ClearSmart) and action.faction:
+                self._check_faction(
+                    action.faction,
+                    f"{context.owner}.faction",
+                    "action",
                 )
 
     def _check_faction(

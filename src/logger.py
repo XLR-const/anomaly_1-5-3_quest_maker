@@ -1,14 +1,31 @@
-﻿import logging
+﻿"""Централизованная настройка логирования проекта.
+
+Модуль создаёт общий логгер ``aqb`` с консольным обработчиком Rich и
+ротируемым файлом ``logs/app.log``. Все пакеты ``src`` получают дочерние
+логгеры через :func:`get_logger`.
+"""
+
+import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from rich.logging import RichHandler
 
+#: Каталог и файл журнала, создаваемые при первой инициализации.
 LOGS_DIR = Path("logs")
 LOG_FILE = LOGS_DIR / "app.log"
+#: Признак того, что обработчики уже добавлены к корневому логгеру ``aqb``.
 _INITIALIZED = False
 
 
 def setup_logging(level: int = logging.INFO) -> None:
+    """Инициализирует консольный и файловый обработчики логгера ``aqb``.
+
+    Повторные вызовы безопасны: обработчики добавляются только один раз.
+
+    Args:
+        level (int): Минимальный уровень сообщений для консольного вывода.
+            Файл всегда пишется на уровне ``DEBUG``.
+    """
     global _INITIALIZED
     if _INITIALIZED:
         return
@@ -45,5 +62,13 @@ def setup_logging(level: int = logging.INFO) -> None:
 
 
 def get_logger(name: str) -> logging.Logger:
+    """Возвращает именованный дочерний логгер проекта.
+
+    Args:
+        name (str): Суффикс имени, например ``"compiler.builder"``.
+
+    Returns:
+        logging.Logger: Логгер ``aqb.<name>`` после инициализации обработчиков.
+    """
     setup_logging()
     return logging.getLogger(f"aqb.{name}")

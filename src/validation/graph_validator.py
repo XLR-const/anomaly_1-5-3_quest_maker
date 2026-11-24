@@ -30,7 +30,6 @@ from src.core.models import (
     ModProject,
     RemoveInfo,
     RemoveItem,
-    RemoveSquad,
     SpawnNpcItem,
     SpawnSquad,
     TakeItem,
