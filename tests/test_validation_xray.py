@@ -5,7 +5,7 @@
 * модель ``ClearSmart`` и условная генерация Lua-хелпера ``clear_smart``;
 * неизменность SHA-256 эталонного Warfare-проекта (замок
   ``tests/test_warfare_regression.py``);
-* ключевые правила :class:`~src.validation.xray_linter.XrayLinter`;
+* ключевые правила :class:`~aqm.validation.xray_linter.XrayLinter`;
 * отсутствие ``ERROR`` на обоих эталонных проектах.
 
 Запуск::
@@ -27,8 +27,8 @@ for _path in (str(PROJECT_ROOT), str(TESTS_DIR)):
 
 from examples.build_golden_test import create_golden_shield_project  # noqa: E402
 from examples.build_story_relay import build_project as build_story_relay  # noqa: E402
-from src.compiler.lua_gen import LuaGenerator  # noqa: E402
-from src.core.models import (  # noqa: E402
+from aqm.compiler.lua_gen import LuaGenerator  # noqa: E402
+from aqm.core.models import (  # noqa: E402
     ClearSmart,
     CompleteTask,
     CustomSquad,
@@ -47,11 +47,12 @@ from src.core.models import (  # noqa: E402
     Stage,
     WarfareCapture,
 )
-from src.db.repository import GameDatabase  # noqa: E402
-from src.validation.report import Severity, ValidationReport  # noqa: E402
-from src.validation.xray_linter import XrayLinter  # noqa: E402
+from aqm.db.repository import GameDatabase  # noqa: E402
+from aqm.paths import get_default_db_path
+from aqm.validation.report import Severity, ValidationReport  # noqa: E402
+from aqm.validation.xray_linter import XrayLinter  # noqa: E402
 
-DB_PATH = PROJECT_ROOT / "data" / "anomaly_db.sqlite"
+DB_PATH = get_default_db_path()
 
 
 # ---------------------------------------------------------------------------

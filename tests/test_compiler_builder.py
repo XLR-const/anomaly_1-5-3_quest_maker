@@ -29,12 +29,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.compiler.builder import (  # noqa: E402
+from aqm.compiler.builder import (  # noqa: E402
     BuildError,
     ModBuilder,
     _slugify,
 )
-from src.core.models import (  # noqa: E402
+from aqm.core.models import (  # noqa: E402
     CompleteTask,
     CustomSquad,
     Dialog,
@@ -504,7 +504,7 @@ class TestModBuilderIntegration(unittest.TestCase):
 
     def test_write_failure_returns_false_and_logs(self) -> None:
         """Ошибка записи журналируется и даёт ``False``."""
-        failing = "src.compiler.builder.write_file_cp1251"
+        failing = "aqm.compiler.builder.write_file_cp1251"
         with patch(failing, side_effect=OSError("диск недоступен")):
             with self.assertLogs(
                 BUILDER_LOGGER_NAME, level="ERROR"

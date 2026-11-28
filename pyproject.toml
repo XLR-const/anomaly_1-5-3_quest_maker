@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aqm"
+version = "1.0.0"
+description = "Конструктор сюжетных квестов для S.T.A.L.K.E.R. Anomaly 1.5.3"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "AQM contributors" }]
+dependencies = [
+    "pydantic>=2.14",
+    "PyYAML>=6.0",
+    "rich>=15.0",
+    "typer>=0.28",
+]
+
+[project.scripts]
+aqm = "aqm.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["aqm*"]
+
+[tool.setuptools.package-data]
+aqm = [
+    "data/*.sqlite",
+    "data/vanilla/**/*",
+    "data/vanilla/configs/*.ltx",
+    "data/vanilla/configs/*/*.ltx",
+    "templates/*",
+]

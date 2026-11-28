@@ -10,8 +10,8 @@ Build: python this_file.py
 
 from pathlib import Path
 
-from src.compiler.builder import ModBuilder
-from src.core.models import (
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import (
     CompleteTask,
     CustomSquad,
     Dialog,

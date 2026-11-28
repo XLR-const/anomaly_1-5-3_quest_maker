@@ -33,11 +33,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.compiler.builder import BuildError, ModBuilder  # noqa: E402
-from src.compiler.ltx_gen import LtxGenerator  # noqa: E402
-from src.compiler.lua_gen import LuaGenerator  # noqa: E402
-from src.compiler.xml_gen import XmlGenerator  # noqa: E402
-from src.core.models import (  # noqa: E402
+from aqm.compiler.builder import BuildError, ModBuilder  # noqa: E402
+from aqm.compiler.ltx_gen import LtxGenerator  # noqa: E402
+from aqm.compiler.lua_gen import LuaGenerator  # noqa: E402
+from aqm.compiler.xml_gen import XmlGenerator  # noqa: E402
+from aqm.core.models import (  # noqa: E402
     Action,
     CustomSquad,
     DescrVariant,
@@ -60,7 +60,7 @@ from src.core.models import (  # noqa: E402
     TargetVariant,
     WarfareCapture,
 )
-from src.core.validator import ProjectValidator  # noqa: E402
+from aqm.core.validator import ProjectValidator  # noqa: E402
 
 QUEST_ID = "mymod_story_quest"
 SQUAD_ID = "mymod_story_squad"

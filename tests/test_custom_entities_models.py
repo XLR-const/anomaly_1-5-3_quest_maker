@@ -2,7 +2,7 @@
 
 Проверяются только изолированные артефакты Фазы 3.5 (Итерация 1):
 модели ``CustomNpc``/``CustomSquad``/``ModProject`` и функции
-``src.compiler.npc_gen``. Сборочный конвейер и Lua-генератор не
+``aqm.compiler.npc_gen``. Сборочный конвейер и Lua-генератор не
 затрагиваются.
 """
 
@@ -16,8 +16,8 @@ from xml.etree import ElementTree
 
 from pydantic import ValidationError
 
-from src.compiler import npc_gen
-from src.core.models import (
+from aqm.compiler import npc_gen
+from aqm.core.models import (
     CustomNpc,
     CustomSquad,
     Dialog,

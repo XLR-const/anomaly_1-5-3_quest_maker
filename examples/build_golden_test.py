@@ -1,8 +1,8 @@
 """Golden Shield Test — сюжетный мод для S.T.A.L.K.E.R. Anomaly 1.5.3.
 
 Сценарий написан исключительно по публичному контракту ``docs/API_v2.md``.
-Никакие внутренние модули ядра, кроме ``src.compiler.builder`` и
-``src.core.models``, не используются.
+Никакие внутренние модули ядра, кроме ``aqm.compiler.builder`` и
+``aqm.core.models``, не используются.
 
 Сюжет:
     Майор Журов на Южном блокпосту Кордона выдаёт два связанных квеста:
@@ -28,13 +28,13 @@ from pathlib import Path
 
 # Запуск вида ``python examples/build_golden_test.py`` кладёт в sys.path
 # каталог examples, а не корень проекта. Добавляем корень явно, чтобы
-# документированные импорты ``src.*`` работали из любой точки.
+# документированные импорты ``aqm.*`` работали из любой точки.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from src.compiler.builder import ModBuilder
-from src.core.models import (
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import (
     CompleteTask,
     CustomSquad,
     Dialog,

@@ -13,8 +13,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from src.compiler.builder import ModBuilder
-from src.core.models import (
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import (
     CustomSquad,
     Dialog,
     DontHasInfo,

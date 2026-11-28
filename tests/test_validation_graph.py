@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.core.models import (
+from aqm.core.models import (
     CompleteTask,
     CustomSquad,
     Dialog,
@@ -28,8 +28,8 @@ from src.core.models import (
     Stage,
     TakeMoney,
 )
-from src.validation.graph_validator import GraphIndex, GraphValidator
-from src.validation.report import Severity, ValidationReport
+from aqm.validation.graph_validator import GraphIndex, GraphValidator
+from aqm.validation.report import Severity, ValidationReport
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = PROJECT_ROOT / "examples"

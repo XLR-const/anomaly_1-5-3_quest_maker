@@ -13,7 +13,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from examples.build_golden_test import create_golden_shield_project
 from examples.build_story_relay import build_project as build_story_relay_project
-from src.core.models import (
+from aqm.core.models import (
     CustomSquad,
     GiveItem,
     ModProject,
@@ -24,8 +24,9 @@ from src.core.models import (
     Stage,
     WarfareCapture,
 )
-from src.db.repository import GameDatabase
-from src.validation import (
+from aqm.db.repository import GameDatabase
+from aqm.paths import get_default_db_path
+from aqm.validation import (
     CatalogValidator,
     Severity,
     ValidationIssue,
@@ -33,11 +34,11 @@ from src.validation import (
     ValidationReportError,
 )
 
-_DB_PATH = _PROJECT_ROOT / "data" / "anomaly_db.sqlite"
+_DB_PATH = get_default_db_path()
 
 
 def _validate(project: ModProject) -> ValidationReport:
-    """Запускает CatalogValidator на реальной базе ``data/anomaly_db.sqlite``."""
+    """Запускает CatalogValidator на реальной базе ``aqm/data/anomaly_db.sqlite``."""
     report = ValidationReport()
     with GameDatabase(_DB_PATH) as db:
         CatalogValidator(db, report).validate(project)
