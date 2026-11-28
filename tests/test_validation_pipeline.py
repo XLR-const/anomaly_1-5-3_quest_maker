@@ -12,8 +12,8 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from main import DEFAULT_DB_PATH, _load_project_from_script
-from src.compiler.builder import ModBuilder
-from src.core.models import (
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import (
     CustomSquad,
     Dialog,
     GiveInfo,
@@ -22,8 +22,8 @@ from src.core.models import (
     Quest,
     Stage,
 )
-from src.db.repository import GameDatabase
-from src.validation import (
+from aqm.db.repository import GameDatabase
+from aqm.validation import (
     MergeValidator,
     Severity,
     ValidationReport,

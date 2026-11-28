@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from aqm.paths import get_default_db_path
 from aqm.cli.main import (
     _find_project_factory,
     _is_modproject_annotation,
@@ -25,7 +26,7 @@ from aqm.cli.main import (
 #: Корень репозитория (историческое имя из ``main.py``).
 PROJECT_ROOT = Path(__file__).resolve().parent
 #: Основная SQLite-база ассетов (историческое имя из ``main.py``).
-DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "anomaly_db.sqlite"
+DEFAULT_DB_PATH = get_default_db_path()
 
 if __name__ == "__main__":
     main()

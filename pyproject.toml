@@ -12,6 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "AQM contributors" }]
 dependencies = [
     "pydantic>=2.14",
+    "PyYAML>=6.0",
     "rich>=15.0",
     "typer>=0.28",
 ]

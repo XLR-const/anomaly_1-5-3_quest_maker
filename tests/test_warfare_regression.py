@@ -3,7 +3,7 @@
 Эталонный проект ``examples/build_golden_test.py`` генерируется **в памяти**:
 тест не читает и не пишет каталог ``output/`` и не обращается к
 ``_unpacked/``. Для каждого файла считается SHA-256 от тех же байтов,
-которые записал бы :class:`src.compiler.builder.ModBuilder`
+которые записал бы :class:`aqm.compiler.builder.ModBuilder`
 (Windows-1251 без BOM).
 
 Хэши ``SHA256_BEFORE`` сняты до правок Фазы 2, итерации 1, а
@@ -32,10 +32,10 @@ from examples.build_golden_test import (  # noqa: E402
     PROJECT_NAME,
     create_golden_shield_project,
 )
-from src.compiler.builder import _slugify  # noqa: E402
-from src.compiler.ltx_gen import LtxGenerator  # noqa: E402
-from src.compiler.lua_gen import LuaGenerator  # noqa: E402
-from src.compiler.xml_gen import XmlGenerator  # noqa: E402
+from aqm.compiler.builder import _slugify  # noqa: E402
+from aqm.compiler.ltx_gen import LtxGenerator  # noqa: E402
+from aqm.compiler.lua_gen import LuaGenerator  # noqa: E402
+from aqm.compiler.xml_gen import XmlGenerator  # noqa: E402
 
 #: Хэши, снятые до любых изменений ``src/`` (эталон Фазы 1).
 SHA256_BEFORE: dict[str, str] = {

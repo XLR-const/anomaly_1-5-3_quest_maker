@@ -16,8 +16,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.compiler.builder import ModBuilder
-from src.core.models import Dialog, ModProject, Phrase, Quest, Stage
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import Dialog, ModProject, Phrase, Quest, Stage
 
 # Константы идентификаторов для Мёртвого города по базе игры
 PROJECT_NAME = "Dead City Merc Test"

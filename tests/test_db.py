@@ -21,9 +21,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.db.repository import GameDatabase  # noqa: E402
+from aqm.db.repository import GameDatabase  # noqa: E402
+from aqm.paths import get_default_db_path
 
-DB_PATH = PROJECT_ROOT / "data" / "anomaly_db.sqlite"
+DB_PATH = get_default_db_path()
 
 
 class TestGameDatabase(unittest.TestCase):

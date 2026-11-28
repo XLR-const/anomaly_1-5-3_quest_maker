@@ -8,7 +8,7 @@
 * диалог взятия второго квеста с ветвлением «штурм с отрядом» / «соло».
 
 Проект создаётся исключительно через строгие Pydantic-модели
-:mod:`src.core.models`. Все строки содержат обязательные русскую и английскую
+:mod:`aqm.core.models`. Все строки содержат обязательные русскую и английскую
 версии, а карты этапов и реплик используют целочисленные ключи.
 
 Запуск из корня проекта::
@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.core.models import (  # noqa: E402
+from aqm.core.models import (  # noqa: E402
     Dialog,
     GiveInfo,
     GiveItem,
@@ -37,7 +37,7 @@ from src.core.models import (  # noqa: E402
     SpawnSquad,
     Stage,
 )
-from src.logger import get_logger  # noqa: E402
+from aqm.logger import get_logger  # noqa: E402
 
 logger = get_logger("examples.cordon_warfare_demo")
 
@@ -85,7 +85,7 @@ def create_demo_project() -> ModProject:
     Notes:
         Модели сохраняют неизвестные колонки SQLite (``extra="allow"``),
         поэтому все действия и условия всё равно создаются конкретными
-        классами из :mod:`src.core.models`, а не словарями.
+        классами из :mod:`aqm.core.models`, а не словарями.
     """
     logger.info("Создание демо-проекта '%s'.", PROJECT_NAME)
 

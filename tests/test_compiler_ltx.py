@@ -25,13 +25,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.compiler.encoding import (  # noqa: E402
+from aqm.compiler.encoding import (  # noqa: E402
     escape_xml_text,
     read_file_cp1251,
     write_file_cp1251,
 )
-from src.compiler.ltx_gen import LtxGenerator  # noqa: E402
-from src.core.models import CustomSquad, Quest, Stage  # noqa: E402
+from aqm.compiler.ltx_gen import LtxGenerator  # noqa: E402
+from aqm.core.models import CustomSquad, Quest, Stage  # noqa: E402
 
 VALID_QUEST_ID = "mymod_test_quest"
 BROKEN_QUEST_ID = "mymod_broken_quest"

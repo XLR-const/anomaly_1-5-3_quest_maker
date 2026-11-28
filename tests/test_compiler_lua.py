@@ -25,9 +25,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.compiler.lua_gen import LuaGenerator  # noqa: E402
-from src.compiler.xml_gen import XmlGenerator  # noqa: E402
-from src.core.models import (  # noqa: E402
+from aqm.compiler.lua_gen import LuaGenerator  # noqa: E402
+from aqm.compiler.xml_gen import XmlGenerator  # noqa: E402
+from aqm.core.models import (  # noqa: E402
     CompleteTask,
     Dialog,
     DontHasInfo,

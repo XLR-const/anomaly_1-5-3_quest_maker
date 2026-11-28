@@ -1,6 +1,6 @@
 """Интеграционные тесты сборки кастомных NPC и наследования отрядов.
 
-Проверяется полный проход :meth:`src.compiler.builder.ModBuilder.build_project`
+Проверяется полный проход :meth:`aqm.compiler.builder.ModBuilder.build_project`
 (``validate=False``) на временном ``vanilla_root`` и мок-базе ассетов:
 
 * генерация ``spawn_sections_<slug>.ltx``, ``npc_profile_<slug>.xml`` и
@@ -29,9 +29,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.compiler.builder import BuildError, ModBuilder  # noqa: E402
-from src.compiler.npc_gen import patch_spawn_sections_index  # noqa: E402
-from src.core.models import (  # noqa: E402
+from aqm.compiler.builder import BuildError, ModBuilder  # noqa: E402
+from aqm.compiler.npc_gen import patch_spawn_sections_index  # noqa: E402
+from aqm.core.models import (  # noqa: E402
     CustomNpc,
     CustomSquad,
     Dialog,

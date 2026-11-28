@@ -16,8 +16,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from src.compiler.builder import ModBuilder
-from src.core.models import (
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import (
     CompleteTask,
     Dialog,
     DontHasInfo,

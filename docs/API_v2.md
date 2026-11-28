@@ -1,13 +1,85 @@
 # API справочник ядра квестов S.T.A.L.K.E.R. Anomaly
 
 > **Статус документа:** единственный источник правды для внешних разработчиков и сторонних LLM.
-> **Версия ядра:** стабилизированное ядро `src/core/models.py` + `src/compiler/*`.
-> **Область применения:** Python 3.10+, Pydantic 2.x, S.T.A.L.K.E.R. Anomaly (X-Ray, Lua 5.1).
+> **Версия ядра:** стабилизированное ядро `aqm/core/models.py` + `aqm/compiler/*`.
+> **Область применения:** Python 3.11+, Pydantic 2.x, S.T.A.L.K.E.R. Anomaly (X-Ray, Lua 5.1).
 
 Этот файл описывает **весь публичный контракт** конструктора квестов: модели данных,
 правила генерации игровых файлов, ограничения рантайма X-Ray и эталонный шаблон
 сложного сюжета. Прочитав только `API_v2.md`, можно писать новые Python-скрипты квестов
 без изучения исходников ядра.
+
+---
+
+# 1. Установка и быстрый старт (SDK `aqm`)
+
+## Установка пакета
+
+SDK поставляется одним wheel-файлом `aqm-1.0.0-py3-none-any.whl`, внутри которого
+уже лежат SQLite-база ассетов (`aqm/data/anomaly_db.sqlite`) и шаблоны
+(`aqm/templates/*`). Установите wheel в любое виртуальное окружение:
+
+```powershell
+pip install aqm-1.0.0-py3-none-any.whl
+aqm --help
+```
+
+Публичный Python API доступен напрямую из пакета:
+
+```python
+from aqm import (
+    Dialog, ModBuilder, ModProject, Phrase, Quest, Stage,
+)
+```
+
+## Инициализация рабочего пространства
+
+Создайте отдельное рабочее пространство проекта и перейдите в него:
+
+```powershell
+aqm init my_story_mod
+cd my_story_mod
+```
+
+Команда создаёт:
+
+```text
+my_story_mod/
+├── scripts/
+│   └── example_quest.py   # валидный стартовый квест
+├── output/                # сюда собираются готовые моды
+├── doc.md                 # копия этого API-справочника
+└── aqm.json               # настройки рабочего пространства
+```
+
+Файл `aqm.json` по умолчанию содержит:
+
+```json
+{"output_dir": "output", "db_path": null, "vanilla_dir": null}
+```
+
+* `db_path: null` — используется вшитая в пакет `aqm/data/anomaly_db.sqlite`;
+* `vanilla_dir: null` — сборка работает автономно, без папки `_unpacked`;
+* существующие файлы `aqm init` не перезаписывает (для перезаписи: `--force`).
+
+## Основные команды CLI
+
+| Команда | Назначение |
+|---|---|
+| `aqm init [target_dir]` | Создать `scripts/`, `output/`, `doc.md`, `aqm.json` и шаблонный квест. |
+| `aqm validate <script.py>` | Проверить проект единым пайплайном (`--strict`, `--json`). |
+| `aqm build [script.py]` | Собрать мод в `output/<slug>/gamedata`. |
+| `aqm merge <chapter.py>...` | Объединить независимые главы мода и собрать результат. |
+| `aqm search <query>` | Найти предметы, NPC, смарты и отряды в базе Anomaly. |
+
+```powershell
+aqm validate scripts/example_quest.py --strict
+aqm build scripts/example_quest.py
+aqm merge chapter_01.py chapter_02.py --slug my_story_mod
+aqm search wolf --type npc
+```
+
+---
 
 ## Единая архитектура и режимы применения
 
@@ -37,26 +109,27 @@
 
 ## Содержание
 
-1. [Краткий гайд быстрого старта](#1-краткий-гайд-быстрого-старта-quick-start-guide)
-2. [Полное обоснование и анатомия моделей](#2-полное-обоснование-и-анатомия-моделей-srccoremodelspy)
-3. [Правила и ограничения сталкерского рантайма](#3-правила-и-ограничения-сталкерского-рантайма-x-ray--gamedata)
-4. [Практический шаблон-руководство для сложных сюжетов](#4-практический-шаблон-руководство-для-сложных-сюжетов)
+- [Установка и быстрый старт (SDK `aqm`)](#1-установка-и-быстрый-старт-sdk-aqm)
+- [Краткий гайд быстрого старта](#краткий-гайд-быстрого-старта-quick-start-guide)
+- [Полное обоснование и анатомия моделей](#2-полное-обоснование-и-анатомия-моделей-aqmcoremodelspy)
+- [Правила и ограничения сталкерского рантайма](#3-правила-и-ограничения-сталкерского-рантайма-x-ray--gamedata)
+- [Практический шаблон-руководство для сложных сюжетов](#4-практический-шаблон-руководство-для-сложных-сюжетов)
 
 ---
 
-# 1. Краткий гайд быстрого старта (Quick Start Guide)
+# Краткий гайд быстрого старта (Quick Start Guide)
 
 Ниже — пять шагов, после которых у вас есть валидный проект и готовый установочный
-каталог мода. Все шаги выполняются в одном Python-файле, запускаемом из корня
-проекта (там, где лежат каталоги `src/` и `examples/`).
+каталог мода. Все шаги выполняются в одном Python-файле внутри рабочего пространства,
+созданного командой `aqm init my_story_mod` (см. раздел 1).
 
 ## Шаг 1. Импортируйте модели и сборщик
 
 ```python
 from pathlib import Path
 
-from src.compiler.builder import ModBuilder
-from src.core.models import (
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import (
     Dialog,
     DontHasInfo,
     GiveInfo,
@@ -69,8 +142,8 @@ from src.core.models import (
 )
 ```
 
-- `src.core.models` — строгие Pydantic-модели предметной области.
-- `src.compiler.builder.ModBuilder` — оркестратор сборки: генерирует файлы мода,
+- `aqm.core.models` — строгие Pydantic-модели предметной области.
+- `aqm.compiler.builder.ModBuilder` — оркестратор сборки: генерирует файлы мода,
   копирует и текстово патчит ванильные `system.ltx` и `character_desc_*.xml`.
 
 ## Шаг 2. Объявите квест и его этапы
@@ -176,11 +249,10 @@ project = ModProject(
 ## Шаг 5. Запустите сборку
 
 ```python
-builder = ModBuilder(
-    output_dir=Path("output"),
-    vanilla_root=Path("_unpacked"),  # распакованная ванильная игра
-)
+builder = ModBuilder(output_dir=Path("output"))
 
+# vanilla_root берётся из aqm.json. Если он не задан и папки _unpacked нет,
+# сборка выполняется автономно, без патча ванильных конфигов.
 if not builder.build_project(project):
     raise SystemExit("Сборка не удалась: смотрите logs/app.log.")
 
@@ -225,7 +297,7 @@ print(f"Готовый мод: {builder.output_dir}")
 
 ---
 
-# 2. Полное обоснование и анатомия моделей (`src/core/models.py`)
+# 2. Полное обоснование и анатомия моделей (`aqm/core/models.py`)
 
 ## 2.1. Общая конфигурация и типы идентификаторов
 
@@ -341,7 +413,7 @@ RequiredId: TypeAlias = Annotated[
 Примеры:
 
 ```python
-from src.core.models import (
+from aqm.core.models import (
     ClearSmart,
     CompleteTask,
     GiveInfo,
@@ -451,7 +523,7 @@ task_actions = [GiveTask(task_id="my_quest")]  # или CompleteTask(task_id=...
 Пример:
 
 ```python
-from src.core.models import (
+from aqm.core.models import (
     DontHasInfo,
     HasInfo,
     HasItem,
@@ -813,7 +885,7 @@ Stage(
 возвращает `"complete"`.
 
 ```python
-from src.core.models import Quest, Stage
+from aqm.core.models import Quest, Stage
 
 quest = Quest(
     id="my_kill_quest",
@@ -953,7 +1025,7 @@ class QuestCondlist(BaseModel):
 > поддерживаются** и дают `BuildError` (см. таблицу ниже).
 >
 > ```python
-> from src.core.models import HasInfo, QuestCondlist
+> from aqm.core.models import HasInfo, QuestCondlist
 >
 > extra_condlists=[
 >     QuestCondlist(when=[HasInfo(info="mymod_merc_dead")], result="complete"),
@@ -1307,7 +1379,7 @@ class CustomSquad(BaseModel):
 Пример проекта `[Story]`:
 
 ```python
-from src.core.models import CustomSquad, ModProject
+from aqm.core.models import CustomSquad, ModProject
 
 project = ModProject(
     name="My Mod",
@@ -1404,7 +1476,7 @@ on_death = %+mymod_relay_merc_dead%
 `ModProject`: если его не задать, слаг выводится из `name`.
 
 ```python
-from src.core.models import (
+from aqm.core.models import (
     CustomSquad, GiveInfo, GiveTask, HasInfo, ModProject, Quest,
     QuestCondlist, RemoveSquad, SpawnSquad, Stage,
 )
@@ -1530,8 +1602,8 @@ class ModProject(BaseModel):
 они берутся из первой главы (`mod_slug`/`mod_title`, иначе `name`).
 
 ```python
-from src.core.models import ModProject
-from src.validation import MergeValidator, ValidationReport
+from aqm.core.models import ModProject
+from aqm.validation import MergeValidator, ValidationReport
 
 # Каждая глава — самостоятельный ModProject со своим mod_slug.
 ch1 = ModProject(name="My Mod — Chapter 1", mod_slug="mymod", quests={...}, dialogs={...})
@@ -2019,10 +2091,10 @@ stage_complete        = 3
 
 ## 3.6. Предполётная валидация (`validate_project` и CLI `main.py validate`)
 
-До записи файлов проект проверяется пакетом `src/validation/`. Точка входа:
+До записи файлов проект проверяется пакетом `aqm/validation/`. Точка входа:
 
 ```python
-from src.validation import validate_project
+from aqm.validation import validate_project
 
 report = validate_project(project, db)   # db: GameDatabase | None
 if report.has_errors:
@@ -2213,7 +2285,7 @@ ModBuilder.patch_character_desc(
 ### `BuildError`
 
 ```python
-from src.compiler.builder import BuildError
+from aqm.compiler.builder import BuildError
 ```
 
 Внутреннее исключение патчеров. Наружу из `build_project` не выходит; если вы
@@ -2282,8 +2354,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.compiler.builder import ModBuilder
-from src.core.models import (
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import (
     CompleteTask,
     Dialog,
     DontHasInfo,
@@ -2630,7 +2702,7 @@ output/dead_city_dushmans_debt/gamedata/
 к профилю мода (ванильный `character_desc_<level>.xml` не патчится).
 
 ```python
-from src.core.models import CustomNpc
+from aqm.core.models import CustomNpc
 
 envoy = CustomNpc(
     id="mymod_envoy",                 # секция spawn и профиль по умолчанию
@@ -2674,7 +2746,7 @@ envoy = CustomNpc(
 ### `CustomSquad.template_squad_id`
 
 ```python
-from src.core.models import CustomSquad
+from aqm.core.models import CustomSquad
 
 squad = CustomSquad(
     id="mymod_atp_squad",
@@ -2714,7 +2786,7 @@ squad = CustomSquad(
 деньги/информацию.
 
 ```python
-from src.core.models import Dialog, GiveInfo, GiveMoney, HasItem, Phrase, RemoveItem
+from aqm.core.models import Dialog, GiveInfo, GiveMoney, HasItem, Phrase, RemoveItem
 
 trade_dialog = Dialog(
     id="mymod_envoy_trade",
@@ -2744,8 +2816,8 @@ trade_dialog = Dialog(
 ## Приложение. Минимальная шпаргалка по импортам
 
 ```python
-from src.compiler.builder import ModBuilder
-from src.core.models import (
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import (
     # Корневые модели
     ModProject,
     Quest,
@@ -2789,7 +2861,7 @@ from src.core.models import (
 Валидация и слияние глав:
 
 ```python
-from src.validation import (
+from aqm.validation import (
     MergeValidator,
     Severity,
     ValidationReport,

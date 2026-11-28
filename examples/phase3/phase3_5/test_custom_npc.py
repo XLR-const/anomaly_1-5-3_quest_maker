@@ -23,8 +23,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from src.compiler.builder import ModBuilder
-from src.core.models import (
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import (
     ClearSmart,
     CompleteTask,
     CustomNpc,
@@ -44,7 +44,7 @@ from src.core.models import (
     Stage,
     TargetVariant,
 )
-from src.db.repository import GameDatabase
+from aqm.db.repository import GameDatabase
 
 MOD_SLUG = "custom_npc_test"
 PROJECT_NAME = "Custom NPC Test"

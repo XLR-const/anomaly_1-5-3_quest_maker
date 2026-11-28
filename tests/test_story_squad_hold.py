@@ -25,10 +25,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from examples.phase3.phase3_2.test_remove_squad import create_project  # noqa: E402
-from src.compiler.lua_gen import LuaGenerator  # noqa: E402
-from src.core.models import CustomSquad, SpawnSquad  # noqa: E402
-from src.validation.report import ValidationReport  # noqa: E402
-from src.validation.xray_linter import XrayLinter  # noqa: E402
+from aqm.compiler.lua_gen import LuaGenerator  # noqa: E402
+from aqm.core.models import CustomSquad, SpawnSquad  # noqa: E402
+from aqm.validation.report import ValidationReport  # noqa: E402
+from aqm.validation.xray_linter import XrayLinter  # noqa: E402
 
 SPAWN_SMART = "esc_smart_terrain_7_11"
 OTHER_SMART = "esc_smart_terrain_2_12"

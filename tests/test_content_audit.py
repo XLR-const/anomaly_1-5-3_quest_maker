@@ -11,8 +11,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.compiler.xml_gen import XmlGenerator  # noqa: E402
-from src.core.models import (  # noqa: E402
+from aqm.compiler.xml_gen import XmlGenerator  # noqa: E402
+from aqm.core.models import (  # noqa: E402
     CompleteTask,
     DescrVariant,
     Dialog,
@@ -23,9 +23,9 @@ from src.core.models import (  # noqa: E402
     Quest,
     Stage,
 )
-from src.validation.post_build import verify_built_mod  # noqa: E402
-from src.validation.report import Severity, ValidationReport  # noqa: E402
-from src.validation.xray_linter import XrayLinter  # noqa: E402
+from aqm.validation.post_build import verify_built_mod  # noqa: E402
+from aqm.validation.report import Severity, ValidationReport  # noqa: E402
+from aqm.validation.xray_linter import XrayLinter  # noqa: E402
 
 
 def make_stage(stage_id: int = 0, **kwargs) -> Stage:

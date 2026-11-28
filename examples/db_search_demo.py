@@ -20,12 +20,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from rich.console import Console  # noqa: E402
 
-from src.db.repository import GameDatabase  # noqa: E402
+from aqm.db.repository import GameDatabase  # noqa: E402
+from aqm.paths import get_default_db_path
 
 
 def main() -> None:
     console = Console()
-    db_path = PROJECT_ROOT / "data" / "anomaly_db.sqlite"
+    db_path = get_default_db_path()
 
     with GameDatabase(db_path) as db:
         console.print(

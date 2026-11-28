@@ -17,9 +17,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.compiler.builder import ModBuilder
-from src.db.repository import GameDatabase
-from src.core.models import (
+from aqm.compiler.builder import ModBuilder
+from aqm.db.repository import GameDatabase
+from aqm.core.models import (
     ClearSmart,
     CompleteTask,
     CustomSquad,
@@ -37,7 +37,7 @@ from src.core.models import (
     SpawnSquad,
     Stage,
 )
-from src.validation import validate_project
+from aqm.validation import validate_project
 
 # ---------------------------------------------------------------------------
 # Параметры сценария

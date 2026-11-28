@@ -8,8 +8,8 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from examples.build_story_relay import build_project as build_relay_ch1
-from src.compiler.builder import ModBuilder
-from src.core.models import (
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import (
     ClearSmart,
     CompleteTask,
     CustomSquad,
@@ -25,7 +25,7 @@ from src.core.models import (
     SpawnSquad,
     Stage,
 )
-from src.validation import MergeValidator, ValidationReport
+from aqm.validation import MergeValidator, ValidationReport
 
 MERGED_SLUG = "boroda_merged_test"
 NPC_ID = "zat_a2_stalker_barmen"

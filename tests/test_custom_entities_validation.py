@@ -26,10 +26,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from src.compiler.builder import ModBuilder  # noqa: E402
-from src.compiler.ltx_gen import LtxGenerator  # noqa: E402
-from src.compiler.lua_gen import LuaGenerator  # noqa: E402
-from src.core.models import (  # noqa: E402
+from aqm.compiler.builder import ModBuilder  # noqa: E402
+from aqm.compiler.ltx_gen import LtxGenerator  # noqa: E402
+from aqm.compiler.lua_gen import LuaGenerator  # noqa: E402
+from aqm.core.models import (  # noqa: E402
     ClearSmart,
     CustomNpc,
     CustomSquad,
@@ -39,8 +39,9 @@ from src.core.models import (  # noqa: E402
     Quest,
     Stage,
 )
-from src.db.repository import GameDatabase  # noqa: E402
-from src.validation import (  # noqa: E402
+from aqm.db.repository import GameDatabase  # noqa: E402
+from aqm.paths import get_default_db_path
+from aqm.validation import (  # noqa: E402
     CatalogValidator,
     MergeValidator,
     Severity,
@@ -48,7 +49,7 @@ from src.validation import (  # noqa: E402
     XrayLinter,
 )
 
-_DB_PATH = _PROJECT_ROOT / "data" / "anomaly_db.sqlite"
+_DB_PATH = get_default_db_path()
 
 VALID_TEMPLATE = "esc_2_12_stalker_wolf"
 VALID_SMART = "esc_smart_terrain_2_12"
