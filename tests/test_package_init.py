@@ -78,16 +78,49 @@ class TestPackageInit(unittest.TestCase):
         self.assertNotIn("WARNING", build.stdout + build.stderr)
 
         project_dir = self.root / "output" / "aqm_example_quest"
+        gamedata = project_dir / "gamedata"
+        system_path = gamedata / "configs" / "system.ltx"
+        self.assertTrue(system_path.is_file())
         self.assertTrue(
-            (project_dir / "gamedata" / "configs" / "system.ltx").is_file()
+            (gamedata / "scripts" / "aqm_example_quest_quests.script").is_file()
+        )
+
+        # Вшитые ванильные индексы должны давать полноценный system.ltx,
+        # а не минимальную заглушку.
+        system_text = system_path.read_text(
+            encoding="windows-1251", errors="replace"
+        )
+        self.assertGreater(len(system_text), 50_000)
+        self.assertIn("[dialogs]", system_text)
+        self.assertIn("[profiles]", system_text)
+        self.assertIn("dialogs_aqm_example_quest", system_text)
+        self.assertIn("npc_profile_aqm_example_quest", system_text)
+        self.assertIn("character_desc_aqm_example_quest", system_text)
+        self.assertIn("dialogs_bar", system_text)
+
+        configs = gamedata / "configs"
+        squad_index = (
+            configs / "misc" / "squad_descr" / "squad_descr.ltx"
+        ).read_text(encoding="windows-1251", errors="replace")
+        spawn_index = (
+            configs / "creatures" / "spawn_sections.ltx"
+        ).read_text(encoding="windows-1251", errors="replace")
+        self.assertTrue(
+            "squad_descr_aqm_example_quest.ltx" in squad_index
+            or 'squad_descr_*.ltx' in squad_index
+        )
+        self.assertIn(
+            "spawn_sections_aqm_example_quest.ltx", spawn_index
         )
         self.assertTrue(
-            (
-                project_dir
-                / "gamedata"
-                / "scripts"
-                / "aqm_example_quest_quests.script"
-            ).is_file()
+            (configs / "misc" / "squad_descr"
+             / "squad_descr_aqm_example_quest.ltx").is_file()
+        )
+        self.assertTrue(
+            (configs / "gameplay" / "character_desc_aqm_example_quest.xml").is_file()
+        )
+        self.assertTrue(
+            (configs / "gameplay" / "npc_profile_aqm_example_quest.xml").is_file()
         )
 
 

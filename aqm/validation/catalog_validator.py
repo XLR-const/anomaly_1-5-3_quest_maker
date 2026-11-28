@@ -136,6 +136,7 @@ class CatalogValidator:
         self._squad_rows: dict[str, list[dict[str, Any]]] | None = None
         self._aliases: dict[tuple[str, str], str] | None = None
         self._factions: set[str] | None = None
+        self._npc_visuals: set[str] | None = None
         self._project: ModProject | None = None
         self._project_npc_aliases: set[str] | None = None
         self._vanilla_aliases_cache: set[str] | None = None
@@ -371,6 +372,37 @@ class CatalogValidator:
         if value is None:
             return ""
         return str(value).strip()
+
+    @staticmethod
+    def _normalize_visual(value: Any) -> str:
+        """Нормализует путь модели: слэши, регистр и суффикс ``.ogf``."""
+        cleaned = CatalogValidator._normalize(value).replace("\\", "/")
+        cleaned = cleaned.removeprefix("./").strip()
+        if cleaned.lower().endswith(".ogf"):
+            cleaned = cleaned[:-4]
+        return cleaned.lower()
+
+    def _npc_visual_set(self) -> set[str]:
+        """Возвращает нормализованный список ванильных ``visual``.
+
+        Returns:
+            set[str]: Уникальные модели из ``npcs.visual``; пустое множество,
+            если БД не содержит таких данных.
+        """
+        if self._npc_visuals is None:
+            values: set[str] = set()
+            getter = getattr(self.db, "get_unique_npc_visuals", None)
+            if callable(getter):
+                try:
+                    values.update(
+                        self._normalize_visual(value)
+                        for value in (getter() or set())
+                        if self._normalize(value)
+                    )
+                except Exception:  # noqa: BLE001 - БД не должна ронять валидацию
+                    values.clear()
+            self._npc_visuals = values
+        return self._npc_visuals
 
     # ------------------------------------------------------------------
     # Кастомные NPC/отряды: общие помощники
@@ -783,6 +815,26 @@ class CatalogValidator:
                 getattr(npc, "template_npc_id", None)
             )
             visual = self._normalize(getattr(npc, "visual", None))
+            if visual:
+                vanilla_visuals = self._npc_visual_set()
+                if (
+                    vanilla_visuals
+                    and self._normalize_visual(visual) not in vanilla_visuals
+                ):
+                    self.report.add(
+                        "CAT-CUSTOM-014",
+                        Severity.ERROR,
+                        f"{target_id}.visual",
+                        f"visual NPC '{npc_id}' не найден среди моделей "
+                        f"таблицы npcs: '{visual}'.",
+                        hint=(
+                            "Проверьте путь .ogf или оставьте visual=None, "
+                            "чтобы унаследовать модель от template_npc_id."
+                        ),
+                        owner="npc",
+                        npc_id=npc_id,
+                        visual=visual,
+                    )
             if not template_id:
                 if not visual:
                     self.report.add(

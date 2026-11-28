@@ -51,6 +51,7 @@ from aqm.logger import get_logger
 from aqm.paths import (
     find_workspace_root,
     get_default_db_path,
+    get_default_vanilla_dir,
     load_workspace_config,
 )
 
@@ -281,6 +282,10 @@ class ModBuilder:
                 vanilla_root = Path(str(configured_vanilla))
                 if not vanilla_root.is_absolute():
                     vanilla_root = workspace_root / vanilla_root
+            else:
+                default_vanilla = get_default_vanilla_dir()
+                if default_vanilla.is_dir():
+                    vanilla_root = default_vanilla
         if vanilla_root is not None and not Path(vanilla_root).is_dir():
             logger.info(
                 "Каталог vanilla_root '%s' не найден: сборка выполняется "

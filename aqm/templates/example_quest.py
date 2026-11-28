@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from aqm import (
     CompleteTask,
+    CustomNpc,
     Dialog,
     DontHasInfo,
     GiveTask,
@@ -24,9 +25,9 @@ from aqm import (
 QUEST_ID = "aqm_example_quest"
 TAKE_DIALOG_ID = "aqm_example_take"
 TURNIN_DIALOG_ID = "aqm_example_turnin"
-NPC_ID = "bar_arena_stalker_4_4"
+NPC_ID = "aqm_example_guide"
 NPC_LOCATION = "bar"
-NPC_ALIAS = "bar.bar_arena_stalker_4_4"
+NPC_ALIAS = NPC_ID
 TAKEN_INFO = "aqm_example_taken"
 
 
@@ -148,6 +149,18 @@ def build_project() -> ModProject:
         },
     )
 
+    guide = CustomNpc(
+        id=NPC_ID,
+        character_profile=NPC_ID,
+        template_npc_id="bar_arena_stalker_4_4",
+        faction="stalker",
+        npc_location=NPC_LOCATION,
+        name_ru="????????? AQM",
+        name_en="AQM Guide",
+        story_id=NPC_ID,
+        spawn_smart="bar.yuzhnaya_zastava",
+    )
+
     return ModProject(
         name="AQM Example Quest",
         mod_slug="aqm_example",
@@ -157,4 +170,5 @@ def build_project() -> ModProject:
             take_dialog.id: take_dialog,
             turnin_dialog.id: turnin_dialog,
         },
+        npcs={guide.id: guide},
     )

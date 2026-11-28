@@ -31,6 +31,7 @@ from aqm.core.models import (
 )
 from aqm.db.repository import GameDatabase
 from aqm.paths import get_default_db_path
+from aqm.validation import CatalogValidator, merge_projects
 from aqm.validation.report import Severity, ValidationReport
 from aqm.validation.xray_linter import XrayLinter
 
@@ -239,6 +240,121 @@ class TestDirectSectionResolution(unittest.TestCase):
         self.assertIn("itm_pda_common", script)
         self.assertIn(db_squad_id, script)
         self.assertIn(custom.id, script)
+
+
+class TestMergeProjectsNpcs(unittest.TestCase):
+    """``merge_projects`` объединяет CustomNpc всех глав."""
+
+    @staticmethod
+    def _npc(npc_id: str, story_id: str) -> CustomNpc:
+        return CustomNpc(
+            id=npc_id,
+            faction="stalker",
+            visual="actors\\stalker_bandit\\stalker_bandit_1",
+            story_id=story_id,
+        )
+
+    def test_merge_combines_npcs_from_all_chapters(self) -> None:
+        first_npc = self._npc("sdkmerge_guide", "sdkmerge_guide_story")
+        second_npc = self._npc("sdkmerge_guide_2", "sdkmerge_guide_2_story")
+        first = ModProject(
+            name="SDK Merge 1",
+            mod_slug="sdkmerge",
+            npcs={first_npc.id: first_npc},
+        )
+        second = ModProject(
+            name="SDK Merge 2",
+            mod_slug="sdkmerge",
+            npcs={second_npc.id: second_npc},
+        )
+        merged = merge_projects(first, second, mod_slug="sdkmerge")
+        self.assertEqual(
+            set(merged.npcs), {first_npc.id, second_npc.id}
+        )
+        self.assertEqual(
+            merged.npcs[second_npc.id].story_id,
+            second_npc.story_id,
+        )
+
+    def test_merge_rejects_duplicate_npc_id_and_story_id(self) -> None:
+        first_npc = self._npc("sdkmerge_dup", "sdkmerge_dup_story")
+        first = ModProject(
+            name="SDK Dup 1",
+            mod_slug="sdkmerge",
+            npcs={first_npc.id: first_npc},
+        )
+        with self.assertRaises(ValueError):
+            merge_projects(
+                first,
+                ModProject(
+                    name="SDK Dup 2",
+                    mod_slug="sdkmerge",
+                    npcs={
+                        "sdkmerge_dup": self._npc(
+                            "sdkmerge_dup", "sdkmerge_dup_story_2"
+                        )
+                    },
+                ),
+                mod_slug="sdkmerge",
+            )
+
+        second_npc = self._npc("sdkmerge_story_dup", "sdkmerge_shared")
+        third_npc = self._npc("sdkmerge_story_dup_2", "sdkmerge_shared")
+        with self.assertRaises(ValueError):
+            merge_projects(
+                ModProject(
+                    name="SDK Story 1",
+                    mod_slug="sdkmerge",
+                    npcs={second_npc.id: second_npc},
+                ),
+                ModProject(
+                    name="SDK Story 2",
+                    mod_slug="sdkmerge",
+                    npcs={third_npc.id: third_npc},
+                ),
+                mod_slug="sdkmerge",
+            )
+
+
+class TestCustomNpcVisualValidation(unittest.TestCase):
+    """``CAT-CUSTOM-014`` проверяет explicit visual по таблице npcs."""
+
+    def test_unknown_visual_is_error(self) -> None:
+        npc = CustomNpc(
+            id="sdkvisual_bad",
+            faction="stalker",
+            template_npc_id="esc_2_12_stalker_wolf",
+            visual="actors\\missing_mod\\missing_model.ogf",
+        )
+        project = ModProject(
+            name="SDK Visual Bad",
+            mod_slug="sdkvisual",
+            npcs={npc.id: npc},
+        )
+        with GameDatabase(get_default_db_path()) as db:
+            report = ValidationReport()
+            CatalogValidator(db, report).validate(project)
+        self.assertIn("CAT-CUSTOM-014", _codes(report, Severity.ERROR))
+
+    def test_known_visual_and_template_are_accepted(self) -> None:
+        with GameDatabase(get_default_db_path()) as db:
+            visuals = sorted(db.get_unique_npc_visuals())
+            self.assertTrue(visuals)
+            npc = CustomNpc(
+                id="sdkvisual_good",
+                faction="stalker",
+                visual=visuals[0],
+            )
+            project = ModProject(
+                name="SDK Visual Good",
+                mod_slug="sdkvisual",
+                npcs={npc.id: npc},
+            )
+            report = ValidationReport()
+            CatalogValidator(db, report).validate(project)
+        self.assertNotIn(
+            "CAT-CUSTOM-014", _codes(report, Severity.ERROR)
+        )
 
 
 if __name__ == "__main__":

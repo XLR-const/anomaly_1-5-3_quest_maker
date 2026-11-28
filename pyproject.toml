@@ -24,4 +24,10 @@ aqm = "aqm.cli.main:main"
 include = ["aqm*"]
 
 [tool.setuptools.package-data]
-aqm = ["data/*.sqlite", "templates/*"]
+aqm = [
+    "data/*.sqlite",
+    "data/vanilla/**/*",
+    "data/vanilla/configs/*.ltx",
+    "data/vanilla/configs/*/*.ltx",
+    "templates/*",
+]

@@ -303,4 +303,32 @@ class MergeValidator:
             )
 
 
-__all__ = ["MergeValidator"]
+def merge_projects(
+    *projects: ModProject,
+    mod_slug: str | None = None,
+    mod_title: str | None = None,
+) -> ModProject:
+    """Объединяет главы в один проект, включая их ``npcs``.
+
+    Функция делегирует :meth:`ModProject.merge`: карты ``quests``,
+    ``dialogs``, ``npcs`` и ``squads`` объединяются без перезаписи, а
+    дубликаты ``id``/``story_id`` между главами дают ``ValueError``.
+
+    Args:
+        *projects (ModProject): Главы мода в порядке объединения.
+        mod_slug (str | None): Итоговый slug мода.
+        mod_title (str | None): Итоговое имя мода.
+
+    Returns:
+        ModProject: Объединённый проект со всеми ``CustomNpc`` глав.
+
+    Raises:
+        ValueError: Если не передано ни одной главы или обнаружены
+            дубликаты ``id``/``story_id``.
+    """
+    return ModProject.merge(
+        *projects, mod_slug=mod_slug, mod_title=mod_title
+    )
+
+
+__all__ = ["MergeValidator", "merge_projects"]

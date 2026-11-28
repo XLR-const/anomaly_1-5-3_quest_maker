@@ -654,6 +654,34 @@ class GameDatabase:
             logger.exception("Ошибка экспорта множества алиасов")
             return set()
 
+    def get_unique_npc_visuals(self) -> set[str]:
+        """Возвращает уникальные ``visual`` из таблицы ``npcs``.
+
+        Если схема БД ещё не содержит колонку ``visual``, возвращается
+        пустое множество: валидатор не сможет проверить модели и не должен
+        блокировать сборку.
+
+        Returns:
+            set[str]: Уникальные пути ``.ogf`` без нормализации.
+        """
+        try:
+            rows = self._query(
+                "SELECT DISTINCT visual FROM npcs "
+                "WHERE visual IS NOT NULL AND TRIM(visual) <> ''"
+            )
+        except sqlite3.Error:
+            return set()
+        values: set[str] = set()
+        for row in rows:
+            try:
+                value = row["visual"]
+            except (KeyError, IndexError, TypeError):
+                value = dict(row).get("visual") if row else None
+            cleaned = str(value).strip() if value else ""
+            if cleaned:
+                values.add(cleaned)
+        return values
+
     # ------------------------------------------------------------------
     # Визуализация
     # ------------------------------------------------------------------
@@ -688,6 +716,7 @@ class GameDatabase:
             "Игровой ID", style="yellow", overflow="fold", max_width=44
         )
         table.add_column("Название/Состав", overflow="fold")
+        table.add_column("Visual", style="green", overflow="fold")
 
         type_labels = {
             "npc": "NPC",
@@ -702,6 +731,7 @@ class GameDatabase:
                 Text("—", style="dim"),
                 Text("—", style="dim"),
                 Text("Ничего не найдено", style="dim italic"),
+                Text("—", style="dim"),
             )
             console.print(table)
             return
@@ -746,11 +776,17 @@ class GameDatabase:
             else:
                 name_cell = str(asset.get("name_ru") or "—")
 
+            visual_cell = (
+                str(asset.get("visual") or "—")
+                if asset_type == "npc"
+                else "—"
+            )
             table.add_row(
                 Text(type_label),
                 Text(alias),
                 Text(entity_id),
                 Text(name_cell),
+                Text(visual_cell),
                 style=row_style,
             )
 

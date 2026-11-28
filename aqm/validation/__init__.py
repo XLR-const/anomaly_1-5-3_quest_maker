@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from aqm.validation.catalog_validator import CatalogValidator
 from aqm.validation.graph_validator import GraphIndex, GraphValidator
-from aqm.validation.merger import MergeValidator
+from aqm.validation.merger import MergeValidator, merge_projects
 from aqm.validation.report import (
     Severity,
     ValidationIssue,
@@ -51,6 +51,7 @@ __all__ = [
     "GraphIndex",
     "GraphValidator",
     "MergeValidator",
+    "merge_projects",
     "Severity",
     "ValidationIssue",
     "ValidationReport",

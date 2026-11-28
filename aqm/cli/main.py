@@ -31,12 +31,14 @@ from aqm.logger import get_logger
 from aqm.paths import (
     find_workspace_root,
     get_default_db_path,
+    get_default_vanilla_dir,
     get_templates_dir,
     load_workspace_config,
 )
 from aqm.validation import (
     MergeValidator,
     ValidationReport,
+    merge_projects,
     validate_project,
 )
 
@@ -185,7 +187,13 @@ def _workspace() -> tuple[Path, dict, Path, Path, Path | None]:
     vanilla_dir = _resolve_config_path(root, config.get("vanilla_dir"))
     if vanilla_dir is None:
         candidate = root / "_unpacked"
-        vanilla_dir = candidate if candidate.is_dir() else None
+        if candidate.is_dir():
+            vanilla_dir = candidate
+        else:
+            default_vanilla = get_default_vanilla_dir()
+            vanilla_dir = (
+                default_vanilla if default_vanilla.is_dir() else None
+            )
     return root, config, db_path, output_dir, vanilla_dir
 
 
@@ -486,7 +494,7 @@ def merge(
         if merge_report.has_errors:
             raise typer.Exit(code=1)
 
-        merged = ModProject.merge(*chapters, mod_slug=mod_slug)
+        merged = merge_projects(*chapters, mod_slug=mod_slug)
         with _open_db(db_path) as db:
             project_report = validate_project(merged, db=db)
             typer.echo(project_report.to_text())

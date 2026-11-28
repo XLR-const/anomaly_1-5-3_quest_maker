@@ -38,6 +38,15 @@ def get_default_db_path() -> Path:
     return get_package_dir() / "data" / "anomaly_db.sqlite"
 
 
+def get_default_vanilla_dir() -> Path:
+    """Возвращает корень вшитых ванильных индексов ``configs``.
+
+    Returns:
+        Path: ``<package>/data/vanilla``.
+    """
+    return get_package_dir() / "data" / "vanilla"
+
+
 def get_templates_dir() -> Path:
     """Возвращает каталог шаблонов, поставляемых вместе с пакетом.
 
@@ -103,6 +112,7 @@ __all__ = [
     "WORKSPACE_MARKER",
     "find_workspace_root",
     "get_default_db_path",
+    "get_default_vanilla_dir",
     "get_package_dir",
     "get_templates_dir",
     "load_workspace_config",
