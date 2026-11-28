@@ -1,6 +1,6 @@
 """Runtime-проверки игровых ассетов, на которые ссылаются действия.
 
-Pydantic-модели из :mod:`src.core.models` проверяют структуру действия, но не
+Pydantic-модели из :mod:`aqm.core.models` проверяют структуру действия, но не
 могут определить, существует ли отряд или предмет в SQLite-базе конкретной
 сборки Anomaly. Модуль содержит точку расширения для такой проверки и получает
 клиент базы через dependency injection.
@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from src.core.models import BaseAction, GiveItem, SpawnSquad
-from src.logger import get_logger
+from aqm.core.models import BaseAction, GiveItem, SpawnSquad
+from aqm.logger import get_logger
 
 if TYPE_CHECKING:
-    from src.db.repository import GameDatabase
+    from aqm.db.repository import GameDatabase
 
 logger = get_logger("core.actions")
 
@@ -29,7 +29,7 @@ def validate_action_assets(
 ) -> bool:
     """Проверяет существование и безопасность ассетов, используемых действием.
 
-    Функция вызывается оркестратором :class:`src.core.validator.ProjectValidator`
+    Функция вызывается оркестратором :class:`aqm.core.validator.ProjectValidator`
     для каждого действия квеста или реплики. В будущем она будет валидировать
     ссылки на отряды, смарты и предметы по SQLite-базе, а при обнаружении
     коллизии писать ``logger.error`` и возвращать ``False``.
@@ -58,7 +58,7 @@ def validate_action_assets(
 
         Глубокий анализ графа (сиротские инфопоршни, циклы зависимостей
         и достижимость квестов) уже выполняет
-        :class:`src.validation.graph_validator.GraphValidator`.
+        :class:`aqm.validation.graph_validator.GraphValidator`.
 
     Notes:
         Проверка ``GiveMoney`` не требует обращения к таблице ассетов, так как

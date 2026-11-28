@@ -2,7 +2,7 @@
 
 Модуль реализует проверки ``CAT-*`` из ``docs/VALIDATION_SPEC.md`` (§4.3).
 Валидатор не изменяет проект и не поднимает исключений: все нарушения
-накапливаются в переданном :class:`~src.validation.report.ValidationReport`.
+накапливаются в переданном :class:`~aqm.validation.report.ValidationReport`.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import re
 import sqlite3
 from typing import TYPE_CHECKING, Any, Iterator
 
-from src.core.models import (
+from aqm.core.models import (
     BaseAction,
     BaseCondition,
     ClearSmart,
@@ -31,10 +31,10 @@ from src.core.models import (
     TakeItem,
     WarfareCapture,
 )
-from src.validation.report import Severity, ValidationReport
+from aqm.validation.report import Severity, ValidationReport
 
 if TYPE_CHECKING:
-    from src.db.repository import GameDatabase
+    from aqm.db.repository import GameDatabase
 
 
 #: Синонимы полных названий локаций и технических префиксов БД.

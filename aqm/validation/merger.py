@@ -1,6 +1,6 @@
 """Проверки слияния независимых глав мода в единый проект.
 
-Модуль дополняет :meth:`src.core.models.ModProject.merge`: сама модель
+Модуль дополняет :meth:`aqm.core.models.ModProject.merge`: сама модель
 гарантирует отсутствие коллизий, а :class:`MergeValidator` объясняет
 пользователю, какие именно ID пересеклись и чем опасны общие инфопоршни.
 """
@@ -11,8 +11,8 @@ import re
 from collections.abc import Sequence
 from typing import Any
 
-from src.core.models import GiveInfo, ModProject, Quest
-from src.validation.report import Severity, ValidationReport
+from aqm.core.models import GiveInfo, ModProject, Quest
+from aqm.validation.report import Severity, ValidationReport
 
 _SLUG_PATTERN = re.compile(r"[^a-z0-9_]+")
 _REPEATED_UNDERSCORES = re.compile(r"_+")

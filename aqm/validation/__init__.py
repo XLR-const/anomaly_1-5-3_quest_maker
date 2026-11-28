@@ -4,20 +4,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from src.validation.catalog_validator import CatalogValidator
-from src.validation.graph_validator import GraphIndex, GraphValidator
-from src.validation.merger import MergeValidator
-from src.validation.report import (
+from aqm.validation.catalog_validator import CatalogValidator
+from aqm.validation.graph_validator import GraphIndex, GraphValidator
+from aqm.validation.merger import MergeValidator
+from aqm.validation.report import (
     Severity,
     ValidationIssue,
     ValidationReport,
     ValidationReportError,
 )
-from src.validation.xray_linter import XrayLinter
+from aqm.validation.xray_linter import XrayLinter
 
 if TYPE_CHECKING:
-    from src.core.models import ModProject
-    from src.db.repository import GameDatabase
+    from aqm.core.models import ModProject
+    from aqm.db.repository import GameDatabase
 
 
 def validate_project(

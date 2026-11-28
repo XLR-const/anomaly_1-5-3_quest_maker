@@ -2,18 +2,18 @@
 
 Модуль реализует правила ``XRAY-*`` из ``docs/VALIDATION_SPEC.md`` (§4.5).
 Он не читает ``_unpacked/`` и не пишет в ``examples/``: единственные
-источники данных — :class:`~src.core.models.ModProject` и необязательная
-:class:`~src.db.repository.GameDatabase`.
+источники данных — :class:`~aqm.core.models.ModProject` и необязательная
+:class:`~aqm.db.repository.GameDatabase`.
 
 Линтер намеренно не бросает исключений: все замечания складываются в
-:class:`~src.validation.report.ValidationReport`.
+:class:`~aqm.validation.report.ValidationReport`.
 """
 
 from __future__ import annotations
 
 from typing import Any, Iterator
 
-from src.core.models import (
+from aqm.core.models import (
     ClearSmart,
     CompleteTask,
     CustomSquad,
@@ -34,8 +34,8 @@ from src.core.models import (
     SpawnNpcItem,
     SpawnSquad,
 )
-from src.db.repository import GameDatabase
-from src.validation.report import Severity, ValidationReport
+from aqm.db.repository import GameDatabase
+from aqm.validation.report import Severity, ValidationReport
 
 #: Роли NPC из БД, для которых ``meet``-диалог может перекрыть ``actor_dialog``.
 _UNIQUE_MEET_ROLES = frozenset(

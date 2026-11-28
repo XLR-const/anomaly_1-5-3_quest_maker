@@ -7,7 +7,7 @@
 * ``gamedata/configs/text/rus|eng/st_<mod>.xml`` — строки реплик и квестов.
 
 Генератор намеренно не создаёт ``character_desc_*.xml``: привязка диалогов к
-NPC выполняется текстовым патчером :class:`src.compiler.builder.ModBuilder`,
+NPC выполняется текстовым патчером :class:`aqm.compiler.builder.ModBuilder`,
 который копирует ванильный файл локации и вставляет ``<actor_dialog>``.
 """
 
@@ -15,17 +15,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from src.compiler.encoding import escape_xml_text
-from src.core.models import (
+from aqm.compiler.encoding import escape_xml_text
+from aqm.core.models import (
     DontHasInfo,
     GiveInfo,
     HasInfo,
     phrase_action_mode,
 )
-from src.logger import get_logger
+from aqm.logger import get_logger
 
 if TYPE_CHECKING:
-    from src.core.models import Dialog, ModProject, Phrase
+    from aqm.core.models import Dialog, ModProject, Phrase
 
 logger = get_logger("compiler.xml_gen")
 
@@ -46,7 +46,7 @@ class XmlGenerator:
     """Собирает ``dialogs_<mod>.xml`` и ``st_<mod>.xml`` из моделей проекта.
 
     Класс не знает имени мода: имена файлов подставляет
-    :class:`src.compiler.builder.ModBuilder`. Все идентификаторы диалогов
+    :class:`aqm.compiler.builder.ModBuilder`. Все идентификаторы диалогов
     берутся из модели (``Dialog.dialog_id`` или ``Dialog.id``), а не из ключа
     словаря, чтобы XML и ``<actor_dialog>`` всегда совпадали.
     """

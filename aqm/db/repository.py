@@ -15,7 +15,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from src.logger import get_logger
+from aqm.logger import get_logger
 
 logger = get_logger("db.repository")
 

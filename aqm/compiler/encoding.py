@@ -17,7 +17,7 @@ from __future__ import annotations
 import codecs
 from pathlib import Path
 
-from src.logger import get_logger
+from aqm.logger import get_logger
 
 logger = get_logger("compiler.encoding")
 

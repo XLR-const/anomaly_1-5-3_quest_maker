@@ -1,0 +1,91 @@
+"""Конструктор сюжетных квестов для S.T.A.L.K.E.R. Anomaly 1.5.3.
+
+Пакет ``aqm`` — единая публичная точка входа: модели предметной области,
+условия и действия, сборщик мода и пути к вшитым ресурсам.
+"""
+
+from __future__ import annotations
+
+from aqm.compiler.builder import ModBuilder
+from aqm.core.models import (
+    BaseAction,
+    BaseCondition,
+    ClearSmart,
+    CompleteTask,
+    CustomNpc,
+    CustomSquad,
+    DescrVariant,
+    Dialog,
+    DontHasInfo,
+    GiveInfo,
+    GiveItem,
+    GiveMoney,
+    GiveTask,
+    HasInfo,
+    HasItem,
+    HasMoney,
+    ModProject,
+    Phrase,
+    Quest,
+    QuestCondlist,
+    RemoveInfo,
+    RemoveItem,
+    RemoveSquad,
+    SetTarget,
+    SmartOwner,
+    SpawnNpcItem,
+    SpawnSquad,
+    Stage,
+    TakeItem,
+    TakeMoney,
+    TargetVariant,
+    WarfareCapture,
+)
+from aqm.paths import (
+    find_workspace_root,
+    get_default_db_path,
+    get_package_dir,
+    load_workspace_config,
+)
+
+__version__ = "1.0.0"
+
+__all__ = [
+    "BaseAction",
+    "BaseCondition",
+    "ClearSmart",
+    "CompleteTask",
+    "CustomNpc",
+    "CustomSquad",
+    "DescrVariant",
+    "Dialog",
+    "DontHasInfo",
+    "GiveInfo",
+    "GiveItem",
+    "GiveMoney",
+    "GiveTask",
+    "HasInfo",
+    "HasItem",
+    "HasMoney",
+    "ModBuilder",
+    "ModProject",
+    "Phrase",
+    "Quest",
+    "QuestCondlist",
+    "RemoveInfo",
+    "RemoveItem",
+    "RemoveSquad",
+    "SetTarget",
+    "SmartOwner",
+    "SpawnNpcItem",
+    "SpawnSquad",
+    "Stage",
+    "TakeItem",
+    "TakeMoney",
+    "TargetVariant",
+    "WarfareCapture",
+    "find_workspace_root",
+    "get_default_db_path",
+    "get_package_dir",
+    "load_workspace_config",
+]

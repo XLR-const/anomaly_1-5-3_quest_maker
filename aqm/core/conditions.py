@@ -1,6 +1,6 @@
 """Runtime-проверки игровых ассетов, на которые ссылаются условия.
 
-Pydantic-модели из :mod:`src.core.models` гарантируют структурную корректность
+Pydantic-модели из :mod:`aqm.core.models` гарантируют структурную корректность
 условия, но не знают, существует ли предмет или смарт-террейн в конкретной
 сборке S.T.A.L.K.E.R. Anomaly. Этот модуль отделяет такую проверку от слоя
 моделей и получает клиент SQLite-базы через dependency injection.
@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from src.core.models import BaseCondition, HasItem, SmartOwner
-from src.logger import get_logger
+from aqm.core.models import BaseCondition, HasItem, SmartOwner
+from aqm.logger import get_logger
 
 if TYPE_CHECKING:
-    from src.db.repository import GameDatabase
+    from aqm.db.repository import GameDatabase
 
 logger = get_logger("core.conditions")
 
@@ -29,7 +29,7 @@ def validate_condition_assets(
 ) -> bool:
     """Проверяет существование игровых ассетов, упомянутых в условии.
 
-    Функция вызывается оркестратором :class:`src.core.validator.ProjectValidator`
+    Функция вызывается оркестратором :class:`aqm.core.validator.ProjectValidator`
     для каждого условия диалога или реплики. В будущем она будет обращаться к
     SQLite-базе через переданный ``db_client`` и сообщать о коллизиях через
     ``logger.error``.

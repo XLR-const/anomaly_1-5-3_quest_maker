@@ -12,18 +12,18 @@
   из Lua-эффекта ``<task_id>_reward``;
 * каждый сгенерированный функтор имеет одноимённый ключ в
   ``task_functor``/``task_status_functor``/``xr_effects``
-  (регистрацию создаёт :class:`src.compiler.lua_gen.LuaGenerator`).
+  (регистрацию создаёт :class:`aqm.compiler.lua_gen.LuaGenerator`).
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from src.core.models import DontHasInfo, HasInfo, HasItem
-from src.logger import get_logger
+from aqm.core.models import DontHasInfo, HasInfo, HasItem
+from aqm.logger import get_logger
 
 if TYPE_CHECKING:
-    from src.core.models import CustomSquad, Quest
+    from aqm.core.models import CustomSquad, Quest
 
 logger = get_logger("compiler.ltx_gen")
 
@@ -31,7 +31,7 @@ logger = get_logger("compiler.ltx_gen")
 class LtxGenerator:
     """Собирает LTX-секции задач мода из карты квестов.
 
-    Один :class:`~src.core.models.Quest` превращается в одну секцию
+    Один :class:`~aqm.core.models.Quest` превращается в одну секцию
     ``[<quest_id>]``. Файл целиком подхватывается ванильным
     ``task_manager.ltx`` через ``#include "tm_*.ltx"``, поэтому сам
     ``task_manager.ltx`` не патчится.
@@ -70,7 +70,7 @@ class LtxGenerator:
             raise error
 
         # Ленивый импорт разрывает цикл builder -> ltx_gen -> builder.
-        from src.compiler.builder import BuildError
+        from aqm.compiler.builder import BuildError
 
         sections: list[str] = []
         skipped = 0
@@ -362,7 +362,7 @@ class LtxGenerator:
         Raises:
             BuildError: Если тип условия не поддерживается в LTX condlist.
         """
-        from src.compiler.builder import BuildError
+        from aqm.compiler.builder import BuildError
 
         if isinstance(condition, HasInfo):
             return f"+{condition.info}"

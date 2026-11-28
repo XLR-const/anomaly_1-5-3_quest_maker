@@ -17,7 +17,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-from src.core.models import (
+from aqm.core.models import (
     CompleteTask,
     DontHasInfo,
     GiveInfo,
@@ -35,7 +35,7 @@ from src.core.models import (
     TakeItem,
     TakeMoney,
 )
-from src.validation.report import Severity, ValidationReport
+from aqm.validation.report import Severity, ValidationReport
 
 #: Допустимые типы узлов графа (контракт §4.4).
 NODE_TYPES = frozenset({"quest", "dialog", "phrase", "stage", "squad"})

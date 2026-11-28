@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Sequence
 
-from src.core.models import (
+from aqm.core.models import (
     ClearSmart,
     CompleteTask,
     DontHasInfo,
@@ -41,10 +41,10 @@ from src.core.models import (
     TakeMoney,
     phrase_action_mode,
 )
-from src.logger import get_logger
+from aqm.logger import get_logger
 
 if TYPE_CHECKING:
-    from src.core.models import Condition, Dialog, ModProject, Quest, Stage
+    from aqm.core.models import Condition, Dialog, ModProject, Quest, Stage
 
 logger = get_logger("compiler.lua_gen")
 
@@ -702,7 +702,7 @@ class LuaGenerator:
 
     Класс реализует только ``[4] RENDER``: он не пишет файлы и не патчит
     конфиги. Имя файла ``<mod>_quests.script`` и префикс pstor-ключей передаёт
-    :class:`src.compiler.builder.ModBuilder`.
+    :class:`aqm.compiler.builder.ModBuilder`.
     """
 
     def __init__(self, db_client: Any | None = None) -> None:
@@ -711,7 +711,7 @@ class LuaGenerator:
         Args:
             db_client (Any | None):
                 Клиент SQLite-базы. Генератор сейчас не обращается к нему, но
-                сохраняет совместимость с :class:`src.core.validator`.
+                сохраняет совместимость с :class:`aqm.core.validator`.
         """
         self.db_client = db_client
 

@@ -29,14 +29,14 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
-from src.compiler.encoding import (
+from aqm.compiler.encoding import (
     escape_xml_text,
     read_file_cp1251,
     write_file_cp1251,
 )
-from src.compiler.ltx_gen import LtxGenerator
-from src.compiler.lua_gen import LuaGenerator
-from src.compiler.npc_gen import (
+from aqm.compiler.ltx_gen import LtxGenerator
+from aqm.compiler.lua_gen import LuaGenerator
+from aqm.compiler.npc_gen import (
     build_character_desc_xml,
     build_npc_profile_xml,
     build_npc_text_entries,
@@ -45,13 +45,18 @@ from src.compiler.npc_gen import (
     patch_system_ltx_profiles,
     resolve_npc_template,
 )
-from src.compiler.xml_gen import XmlGenerator
-from src.core.models import CustomSquad, find_phrase_reward_conflicts
-from src.logger import get_logger
+from aqm.compiler.xml_gen import XmlGenerator
+from aqm.core.models import CustomSquad, find_phrase_reward_conflicts
+from aqm.logger import get_logger
+from aqm.paths import (
+    find_workspace_root,
+    get_default_db_path,
+    load_workspace_config,
+)
 
 if TYPE_CHECKING:
-    from src.core.models import CustomNpc, Dialog, ModProject, Quest
-    from src.db.repository import GameDatabase
+    from aqm.core.models import CustomNpc, Dialog, ModProject, Quest
+    from aqm.db.repository import GameDatabase
 
 logger = get_logger("compiler.builder")
 
@@ -246,8 +251,27 @@ class ModBuilder:
                 f"vanilla_root должен быть Path, str или None, получено "
                 f"{type(vanilla_root).__name__}."
             )
+        workspace_root = find_workspace_root()
+        workspace_config = load_workspace_config(workspace_root)
+        if Path(output_dir) == Path("output"):
+            configured_output = workspace_config.get("output_dir")
+            if configured_output:
+                output_dir = workspace_root / str(configured_output)
         self.output_dir = Path(output_dir)
         self.db_client = db_client
+        if vanilla_root is not None and Path(vanilla_root) == Path("_unpacked"):
+            configured_vanilla = workspace_config.get("vanilla_dir")
+            if configured_vanilla:
+                vanilla_root = Path(str(configured_vanilla))
+                if not vanilla_root.is_absolute():
+                    vanilla_root = workspace_root / vanilla_root
+        if vanilla_root is not None and not Path(vanilla_root).is_dir():
+            logger.info(
+                "Каталог vanilla_root '%s' не найден: сборка выполняется "
+                "автономно без патча ванильных конфигов.",
+                vanilla_root,
+            )
+            vanilla_root = None
         self.vanilla_root = (
             Path(vanilla_root) if vanilla_root is not None else None
         )
@@ -272,7 +296,7 @@ class ModBuilder:
         Порядок шагов соответствует ``standart_of_auto.md``:
 
         1. Проверить ``name``/``quests``/``dialogs`` и вычислить slug.
-        2. Прогнать единый пайплайн :func:`src.validation.validate_project`.
+        2. Прогнать единый пайплайн :func:`aqm.validation.validate_project`.
         3. Очистить старый каталог ``output/<slug>`` и создать структуру
            ``gamedata``.
         4. Отрендерить собственные LTX/XML/Lua-файлы генераторами.
@@ -349,10 +373,10 @@ class ModBuilder:
                 )
 
             if validate:
-                from src.db.repository import GameDatabase
-                from src.validation import Severity, validate_project
+                from aqm.db.repository import GameDatabase
+                from aqm.validation import Severity, validate_project
 
-                db_path = Path("data/anomaly_db.sqlite")
+                db_path = get_default_db_path()
                 if self.db_client is not None:
                     report = validate_project(project, db=self.db_client)
                 elif db_path.is_file():
@@ -571,7 +595,7 @@ class ModBuilder:
                 (project_dir / "gamedata" / "configs" / "text" / "rus"
                  / f"st_{slug}.xml").is_file()
             ):
-                from src.validation.post_build import verify_built_mod
+                from aqm.validation.post_build import verify_built_mod
 
                 problems = verify_built_mod(project_dir, slug)
                 if problems:
@@ -919,10 +943,18 @@ class ModBuilder:
             OSError: Если файл не читается.
         """
         if self.vanilla_root is None:
-            raise BuildError(
-                "vanilla_root не задан: невозможно прочитать ванильный "
-                "system.ltx для патча диалогов/профилей."
+            logger.info(
+                "vanilla_root не задан: создаётся минимальный system.ltx "
+                "только с файлами мода (автономная сборка)."
             )
+            lines = ["[dialogs]", f"files = dialogs_{slug}", ""]
+            profile_files = (
+                f"npc_profile_{slug}" if register_npc_profile else ""
+            )
+            descr_files = ", ".join(character_desc_files)
+            lines.extend(["[profiles]", f"files = {profile_files}"])
+            lines.append(f"specific_characters_files = {descr_files}")
+            return "\n".join(lines) + "\n", False
         source = self.vanilla_root / "configs" / "system.ltx"
         if not source.is_file():
             raise BuildError(
@@ -1468,10 +1500,11 @@ class ModBuilder:
             by_level.setdefault(level, {})[npc_id] = dialog_ids
 
         if by_level and self.vanilla_root is None:
-            raise BuildError(
-                "vanilla_root не задан: невозможно прочитать ванильные "
-                "character_desc_<level>.xml для привязки диалогов."
+            logger.info(
+                "vanilla_root не задан: привязка диалогов к ванильным NPC "
+                "пропущена (автономная сборка)."
             )
+            return {}
 
         patched: dict[str, tuple[str, bool]] = {}
         for level, npc_map in sorted(by_level.items()):

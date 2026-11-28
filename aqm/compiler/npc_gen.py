@@ -2,7 +2,7 @@
 
 Модуль изолирован от ``builder.py`` и ``lua_gen.py``: он только формирует
 тексты/байты артефактов и идемпотентные патчи. Вызов функций выполняет
-сборочный конвейер :class:`src.compiler.builder.ModBuilder`.
+сборочный конвейер :class:`aqm.compiler.builder.ModBuilder`.
 
 Артефакты (``docs/CUSTOM_ENTITIES_SPEC.md``, §4):
 
@@ -25,11 +25,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from xml.etree import ElementTree
 
-from src.compiler.encoding import escape_xml_text
-from src.core.models import CustomNpc, ModProject
+from aqm.compiler.encoding import escape_xml_text
+from aqm.core.models import CustomNpc, ModProject
 
 if TYPE_CHECKING:
-    from src.db.repository import GameDatabase
+    from aqm.db.repository import GameDatabase
 
 #: XML-декларация ``character_desc_<slug>.xml`` (windows-1251).
 CHARACTER_DESC_DECLARATION = (

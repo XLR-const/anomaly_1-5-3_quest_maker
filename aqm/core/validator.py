@@ -1,12 +1,12 @@
 """Оркестратор runtime-валидации проекта мода.
 
-Модуль связывает Pydantic-модели :mod:`src.core.models` с проверками игровых
-ассетов из :mod:`src.core.conditions` и :mod:`src.core.actions`. Структурная
+Модуль связывает Pydantic-модели :mod:`aqm.core.models` с проверками игровых
+ассетов из :mod:`aqm.core.conditions` и :mod:`aqm.core.actions`. Структурная
 валидация типов и графов уже выполняется Pydantic при создании моделей; здесь
 добавляется следующий уровень — сверка ссылок с SQLite-базой игры.
 
 Класс :class:`ProjectValidator` получает клиент базы через конструктор, что
-позволяет использовать как реальный :class:`src.db.repository.GameDatabase`,
+позволяет использовать как реальный :class:`aqm.db.repository.GameDatabase`,
 так и тестовый двойник с тем же интерфейсом.
 """
 
@@ -15,19 +15,19 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
-from src.core.actions import validate_action_assets
-from src.core.conditions import validate_condition_assets
-from src.core.models import (
+from aqm.core.actions import validate_action_assets
+from aqm.core.conditions import validate_condition_assets
+from aqm.core.models import (
     BaseAction,
     BaseCondition,
     ModProject,
     RemoveSquad,
     SpawnSquad,
 )
-from src.logger import get_logger
+from aqm.logger import get_logger
 
 if TYPE_CHECKING:
-    from src.db.repository import GameDatabase
+    from aqm.db.repository import GameDatabase
 
 logger = get_logger("core.validator")
 
@@ -36,11 +36,11 @@ class ProjectValidator:
     """Проводит runtime-валидацию всех квестов и диалогов проекта мода.
 
     Валидатор обходит действия этапов/квестов и условия диалогов/реплик,
-    делегируя проверку конкретных ассетов функциям :mod:`src.core.conditions`
-    и :mod:`src.core.actions`. Дополнительно он проверяет Story-отряды и
+    делегируя проверку конкретных ассетов функциям :mod:`aqm.core.conditions`
+    и :mod:`aqm.core.actions`. Дополнительно он проверяет Story-отряды и
     запрещает смешивать Warfare-захват со Story-спавном в одном квесте.
     Глубокий анализ графа (сиротские инфопоршни, циклы и достижимость)
-    выполняет :class:`src.validation.graph_validator.GraphValidator`.
+    выполняет :class:`aqm.validation.graph_validator.GraphValidator`.
 
     Attributes:
         db_client (GameDatabase):
@@ -73,7 +73,7 @@ class ProjectValidator:
           каждой реплики диалога.
 
         Для каждого элемента вызываются соответствующие функции из
-        :mod:`src.core.conditions` и :mod:`src.core.actions`. Если хотя бы одна
+        :mod:`aqm.core.conditions` и :mod:`aqm.core.actions`. Если хотя бы одна
         проверка вернула ``False``, итоговый результат также будет ``False``.
 
         Args:
@@ -90,7 +90,7 @@ class ProjectValidator:
 
         TODO:
             Реализовать поиск логических ошибок в сюжете, если он ещё не
-            покрыт :class:`src.validation.graph_validator.GraphValidator`:
+            покрыт :class:`aqm.validation.graph_validator.GraphValidator`:
             1) Проверка на сиротские инфопоршни (квест или фраза требуют
                ``has_info``, но этот поршень физически никогда не выдается ни
                в одном действии ``GiveInfo`` внутри проекта).
