@@ -208,21 +208,22 @@ class ModBuilder:
     Attributes:
         output_dir (Path): Корень, внутри которого создаётся каталог
             ``<slug>`` с готовой ``gamedata``.
-        db_client (GameDatabase | None): Необязательный клиент SQLite,
-            передаваемый генератору Lua для будущих проверок ассетов.
+        db_client (GameDatabase | None): Клиент SQLite. Если не передан,
+            автоматически открывается вшитая база пакета.
+        db_path (Path | None): Альтернативный путь к SQLite вместо вшитой.
         vanilla_root (Path | None): Корень распакованной ванильной игры. По
-            умолчанию ``_unpacked``; тесты обязаны передавать временную
-            копию и не читать реальный ``_unpacked``. ``None`` допустим
-            только для проектов без ванильных патчей; при наличии
-            ``project.squads`` сборщик предупредит, что индекс
-            ``squad_descr.ltx`` не пропатчен.
+            умолчанию ``_unpacked``; если каталога нет, сборка продолжается
+            автономно. ``None`` создаёт минимальный ``system.ltx`` и не
+            патчит ванильные ``character_desc_*.xml``.
     """
 
     def __init__(
         self,
-        output_dir: Path = Path("output"),
+        output_dir: Path | None = None,
         db_client: "GameDatabase | None" = None,
         vanilla_root: Path | None = Path("_unpacked"),
+        db_path: Path | None = None,
+        db: "GameDatabase | None" = None,
     ) -> None:
         """Инициализирует сборщик путями вывода и ванильных исходников.
 
@@ -230,18 +231,21 @@ class ModBuilder:
             output_dir (Path):
                 Корень сборки. Внутри создаётся каталог ``<slug>``.
             db_client (GameDatabase | None):
-                Необязательный клиент БД для :class:`LuaGenerator`.
-            vanilla_root (Path):
+                Клиент БД для :class:`LuaGenerator`. При ``None`` открывается
+                вшитая ``aqm/data/anomaly_db.sqlite``.
+            vanilla_root (Path | None):
                 Каталог ``_unpacked`` с ванильными ``configs``. Может быть
-                подменён временным деревом в тестах.
+                подменён временным деревом или отключён через ``None``.
+            db_path (Path | None):
+                Путь к SQLite вместо вшитой базы (если нет ``db_client``).
 
         Raises:
             TypeError: Если ``output_dir`` или ``vanilla_root`` не являются
                 ``str``/``Path``.
         """
-        if not isinstance(output_dir, (str, Path)):
+        if output_dir is not None and not isinstance(output_dir, (str, Path)):
             raise TypeError(
-                f"output_dir должен быть Path или str, получено "
+                f"output_dir должен быть Path, str или None, получено "
                 f"{type(output_dir).__name__}."
             )
         if vanilla_root is not None and not isinstance(
@@ -253,11 +257,23 @@ class ModBuilder:
             )
         workspace_root = find_workspace_root()
         workspace_config = load_workspace_config(workspace_root)
-        if Path(output_dir) == Path("output"):
+        if output_dir is None or Path(output_dir) == Path("output"):
             configured_output = workspace_config.get("output_dir")
             if configured_output:
                 output_dir = workspace_root / str(configured_output)
+            elif output_dir is None:
+                output_dir = Path("output")
         self.output_dir = Path(output_dir)
+        if db_client is None and db is not None:
+            db_client = db
+        self.db_path = (
+            Path(db_path) if db_path is not None else get_default_db_path()
+        )
+        self._owns_db = db_client is None
+        if db_client is None and self.db_path.is_file():
+            from aqm.db.repository import GameDatabase
+
+            db_client = GameDatabase(self.db_path)
         self.db_client = db_client
         if vanilla_root is not None and Path(vanilla_root) == Path("_unpacked"):
             configured_vanilla = workspace_config.get("vanilla_dir")
@@ -281,6 +297,27 @@ class ModBuilder:
             self.vanilla_root if self.vanilla_root is not None else "None",
             type(db_client).__name__ if db_client else "не передана",
         )
+
+    def close(self) -> None:
+        """Закрывает SQLite-соединение, открытое самим ``ModBuilder``."""
+        if not getattr(self, "_owns_db", False):
+            return
+        client = getattr(self, "db_client", None)
+        self.db_client = None
+        self._owns_db = False
+        if client is None:
+            return
+        try:
+            client.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001 - закрытие не должно ломать сборку
+            logger.debug("Не удалось закрыть собственную БД ModBuilder.")
+
+    def __del__(self) -> None:
+        """Гарантирует закрытие собственного соединения при сборке мусора."""
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Публичная точка входа

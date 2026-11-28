@@ -74,6 +74,7 @@ class XrayLinter:
         self._project: ModProject | None = None
         self._custom_npc_aliases: set[str] = set()
         self._custom_npc_spawn_smarts: set[str] = set()
+        self._custom_npc_spawn_by_alias: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Публичная точка входа
@@ -88,7 +89,9 @@ class XrayLinter:
         self._project = project
         self._custom_npc_aliases: set[str] = set()
         self._custom_npc_spawn_smarts: set[str] = set()
+        self._custom_npc_spawn_by_alias: dict[str, str] = {}
         for npc in (getattr(project, "npcs", None) or {}).values():
+            aliases: set[str] = set()
             for value in (
                 getattr(npc, "id", None),
                 getattr(npc, "character_profile", None),
@@ -97,11 +100,14 @@ class XrayLinter:
                 name = str(value or "").strip()
                 if name:
                     self._custom_npc_aliases.add(name)
+                    aliases.add(name)
             spawn_smart = str(
                 getattr(npc, "spawn_smart", None) or ""
             ).strip()
             if spawn_smart:
                 self._custom_npc_spawn_smarts.add(spawn_smart)
+                for name in aliases:
+                    self._custom_npc_spawn_by_alias[name] = spawn_smart
         self._check_names(project)
 
         for quest in project.quests.values():
@@ -205,16 +211,39 @@ class XrayLinter:
             )
 
     def _giver_smarts(self, quest: Quest) -> set[str]:
-        """Возвращает смарты, которые проект использует как маркер квестодателя."""
-        values: set[str] = set(self._custom_npc_spawn_smarts)
-        for stage in (getattr(quest, "stages", None) or {}).values():
-            target = str(getattr(stage, "target_alias", "") or "").strip()
-            if target:
-                values.add(target)
-            for variant in getattr(stage, "target_variants", None) or []:
-                value = str(getattr(variant, "value", "") or "").strip()
-                if value:
-                    values.add(value)
+        """Возвращает смарты только самого NPC-квестодателя.
+
+        Смарты цели этапа здесь намеренно не учитываются: ``ClearSmart`` на
+        смарте цели — штатный сценарий и не должен давать
+        ``XRAY-SPAWN-001``.
+
+        Args:
+            quest (Quest): Проверяемый квест.
+
+        Returns:
+            set[str]: ``spawn_smart`` квестодателя (если он кастомный NPC).
+        """
+        values: set[str] = set()
+        giver_ids = [
+            str(value or "").strip()
+            for value in (
+                getattr(quest, "npc_id", None),
+                getattr(quest, "giver_npc_id", None),
+            )
+            if str(value or "").strip()
+        ]
+        for name in giver_ids:
+            smart = self._custom_npc_spawn_by_alias.get(name)
+            if smart:
+                values.add(smart)
+
+        # Обратная совместимость для проектов без явного NPC-квестодателя:
+        # только в этом случае цель этапа считается единственным маркером.
+        if not values and not giver_ids and not self._custom_npc_spawn_by_alias:
+            for stage in (getattr(quest, "stages", None) or {}).values():
+                target = str(getattr(stage, "target_alias", "") or "").strip()
+                if target:
+                    values.add(target)
         return values
 
     def _has_completion_path(self, quest: Quest) -> bool:
@@ -703,15 +732,36 @@ class XrayLinter:
         """``XRAY-DIALOG-001``: turnin без гейта готовности."""
         if not role.startswith("turnin"):
             return
-        has_info_gate = any(
-            isinstance(condition, HasInfo)
-            for condition in (getattr(dialog, "preconditions", None) or [])
+
+        def is_readiness_gate(condition: Any) -> bool:
+            """Проверяет HasInfo/HasItem/HasMoney/TaskStage-условие."""
+            if isinstance(condition, (HasInfo, HasItem, HasMoney)):
+                return True
+            return type(condition).__name__ in {
+                "TaskStage",
+                "TaskActive",
+            } or str(getattr(condition, "type", "")) in {
+                "task_stage",
+                "task_active",
+            }
+
+        dialog_conditions = list(
+            getattr(dialog, "preconditions", None) or []
+        )
+        phrase_conditions = [
+            condition
+            for phrase in (getattr(dialog, "phrases", None) or {}).values()
+            for condition in (getattr(phrase, "preconditions", None) or [])
+        ]
+        has_readiness_gate = any(
+            is_readiness_gate(condition)
+            for condition in (*dialog_conditions, *phrase_conditions)
         )
         has_stage_gate = (
             linked_quest is not None
             and getattr(linked_quest, "return_to_giver_stage", None) is not None
         )
-        if has_info_gate or has_stage_gate:
+        if has_readiness_gate or has_stage_gate:
             return
         self.report.add(
             "XRAY-DIALOG-001",
@@ -719,7 +769,8 @@ class XrayLinter:
             dialog_id,
             "Turnin-диалог не имеет гейта готовности.",
             hint=(
-                "Добавьте HasInfo(complete/death info) или задайте "
+                "Добавьте HasInfo/HasItem/HasMoney/TaskStage-условие в "
+                "Dialog.preconditions или стартовые фразы, либо задайте "
                 "Quest.return_to_giver_stage."
             ),
             owner="dialog",

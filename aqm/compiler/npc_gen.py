@@ -12,9 +12,10 @@
 * ``gameplay/character_desc_<slug>.xml`` — ``<specific_character>``
   (windows-1251).
 
-Резолвер ``template_npc_id`` открывает **ровно один** файл
-``<vanilla_root>/configs/gameplay/<source_file>``; ``source_file`` берётся
-только из колонки ``npcs.source_file`` базы ``anomaly_db.sqlite``.
+Резолвер ``template_npc_id`` сначала читает строку из таблицы ``npcs``
+вшитой ``anomaly_db.sqlite``. Если ``vanilla_root`` задан и XML-файл
+``<vanilla_root>/configs/gameplay/<source_file>`` существует, поля дополняются
+из него; иначе используются данные SQLite и безопасный резервный ``visual``.
 Сканирование ``_unpacked/`` запрещено спецификацией (§3.2, CAT-CUSTOM-011).
 """
 
@@ -226,6 +227,131 @@ def _query_source_file(
     return cleaned or None
 
 
+#: Резервный visual для полностью автономной сборки из SQLite.
+#: Используется только если ни CustomNpc, ни строка ``npcs`` не содержат
+#: поля ``visual`` (в штатной схеме БД его нет).
+_FALLBACK_TEMPLATE_VISUAL = "actors\\stalker_black_stalker"
+
+
+def _query_npc_row(
+    db: "GameDatabase", template_id: str
+) -> dict[str, Any] | None:
+    """Возвращает строку NPC из ``npcs`` по прямому ID.
+
+    Args:
+        db (GameDatabase): База ассетов Anomaly.
+        template_id (str): ID шаблонного NPC.
+
+    Returns:
+        dict[str, Any] | None: Строка таблицы ``npcs`` либо ``None``.
+    """
+    finder = getattr(db, "find_npc_by_id", None)
+    if callable(finder):
+        try:
+            row = finder(template_id)
+        except Exception:  # noqa: BLE001 - БД не должна ронять резолвер
+            row = None
+        if isinstance(row, dict) and row:
+            return row
+
+    query = getattr(db, "_query", None)
+    if callable(query):
+        try:
+            rows = query(
+                "SELECT * FROM npcs WHERE id = ? LIMIT 1", (template_id,)
+            )
+        except Exception:  # noqa: BLE001
+            rows = []
+        if rows:
+            row = rows[0]
+            return dict(row) if not isinstance(row, dict) else row
+
+    search = getattr(db, "search_assets", None)
+    if callable(search):
+        try:
+            rows = search(template_id, "npc")
+        except Exception:  # noqa: BLE001
+            rows = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("id") or "") == template_id:
+                return row
+    return None
+
+
+def _resolved_from_db_row(
+    npc: CustomNpc,
+    row: dict[str, Any] | None,
+    template_id: str,
+) -> dict[str, Any]:
+    """Собирает поля шаблона из строки ``npcs`` без чтения XML.
+
+    Args:
+        npc (CustomNpc): Кастомный NPC.
+        row (dict[str, Any] | None): Строка ``npcs`` или ``None``.
+        template_id (str): ID шаблонного NPC.
+
+    Returns:
+        dict[str, Any]: Поля в формате :func:`resolve_npc_template`.
+    """
+    data = dict(row or {})
+    faction = str(
+        data.get("community") or data.get("faction") or npc.faction or ""
+    ).strip() or None
+
+    supplies_raw = data.get("supplies") or data.get("supplies_text")
+    if isinstance(supplies_raw, (list, tuple, set)):
+        supplies = [str(item).strip() for item in supplies_raw if str(item).strip()]
+        supplies_text = "\n".join(supplies) or None
+    elif isinstance(supplies_raw, str):
+        supplies_text = supplies_raw.strip() or None
+        supplies = [
+            line.strip()
+            for line in supplies_raw.splitlines()
+            if line.strip()
+        ]
+    else:
+        supplies = []
+        supplies_text = None
+
+    money_raw = data.get("money")
+    money: dict[str, Any] | None = None
+    if isinstance(money_raw, dict):
+        money = {
+            "min": _as_int(money_raw.get("min"), 0),
+            "max": _as_int(money_raw.get("max"), 0),
+            "infinitive": bool(money_raw.get("infinitive", False)),
+        }
+    elif any(
+        key in data for key in ("money_min", "money_max", "money_infinitive")
+    ):
+        money = {
+            "min": _as_int(data.get("money_min"), 0),
+            "max": _as_int(data.get("money_max"), 0),
+            "infinitive": str(data.get("money_infinitive", "")).strip().lower()
+            in ("1", "true", "yes"),
+        }
+
+    return {
+        "source_file": data.get("source_file"),
+        "template_npc_id": template_id,
+        "visual": data.get("visual") or npc.visual or _FALLBACK_TEMPLATE_VISUAL,
+        "icon": data.get("icon") or data.get("icon_id"),
+        "bio": data.get("bio") or data.get("bio_id"),
+        "community": faction,
+        "faction": faction,
+        "common_actor_dialogs": list(data.get("actor_dialogs") or []),
+        "rank": _as_int(data.get("rank"), 0) if data.get("rank") is not None else None,
+        "reputation": _as_int(data.get("reputation"), 0)
+        if data.get("reputation") is not None
+        else None,
+        "money": money,
+        "supplies": supplies,
+        "supplies_text": supplies_text,
+    }
+
+
 def resolve_npc_template(
     npc: CustomNpc,
     db: "GameDatabase | None",
@@ -251,9 +377,9 @@ def resolve_npc_template(
         ``supplies_text`` — исходный текст тега.
 
     Raises:
-        ValueError: Если шаблон не задан/не найден в БД, нет
-            ``vanilla_root``/файла или в файле отсутствует
-            ``<specific_character id="...">`` (CAT-CUSTOM-011).
+        ValueError: Если шаблон не задан, не найден ни в БД, ни в XML или в
+            найденном файле отсутствует ``<specific_character id="...">``
+            (CAT-CUSTOM-011).
     """
     template_id = (npc.template_npc_id or "").strip()
     if not template_id:
@@ -266,33 +392,40 @@ def resolve_npc_template(
             f"NPC '{npc.id}': для template_npc_id '{template_id}' требуется "
             "база anomaly_db.sqlite."
         )
-    if vanilla_root is None:
-        raise ValueError(
-            f"NPC '{npc.id}': для чтения шаблона '{template_id}' требуется "
-            "vanilla_root."
-        )
 
-    source_file = _query_source_file(db, "npcs", template_id)
+    db_row = _query_npc_row(db, template_id)
+    source_file = str((db_row or {}).get("source_file") or "").strip()
     if not source_file:
-        raise ValueError(
-            f"NPC '{npc.id}': template_npc_id '{template_id}' не найден в "
-            "таблице npcs БД (CAT-CUSTOM-011)."
-        )
+        source_file = _query_source_file(db, "npcs", template_id) or ""
 
-    template_path = Path(vanilla_root) / "configs" / "gameplay" / source_file
-    if not template_path.is_file():
-        # В anomaly_db.sqlite source_file иногда хранится как
-        # ``gameplay\character_desc_escape.xml``. Такой путь уже содержит
-        # каталог относительно configs.
-        relative = Path(str(source_file).replace("\\", "/"))
-        if len(relative.parts) > 1:
-            candidate = Path(vanilla_root) / "configs" / relative
-            if candidate.is_file():
-                template_path = candidate
-    if not template_path.is_file():
+    template_path: Path | None = None
+    if vanilla_root is not None and source_file:
+        candidate = Path(vanilla_root) / "configs" / "gameplay" / source_file
+        if candidate.is_file():
+            template_path = candidate
+        else:
+            # В anomaly_db.sqlite source_file иногда хранится как
+            # ``gameplay\character_desc_escape.xml``. Такой путь уже содержит
+            # каталог относительно configs.
+            relative = Path(str(source_file).replace("\\", "/"))
+            if len(relative.parts) > 1:
+                candidate = Path(vanilla_root) / "configs" / relative
+                if candidate.is_file():
+                    template_path = candidate
+
+    if template_path is None or not template_path.is_file():
+        db_path = getattr(db, "db_path", None)
+        has_real_db = bool(db_path) and Path(db_path).is_file()
+        if db_row is not None and has_real_db:
+            return _resolved_from_db_row(npc, db_row, template_id)
+        if db_row is not None and not has_real_db:
+            raise ValueError(
+                f"NPC '{npc.id}': для автономного шаблона '{template_id}' "
+                "требуется реальная anomaly_db.sqlite или vanilla_root."
+            )
         raise ValueError(
-            f"NPC '{npc.id}': файл шаблона не найден: {template_path} "
-            "(CAT-CUSTOM-011)."
+            f"NPC '{npc.id}': template_npc_id '{template_id}' не найден ни в "
+            "таблице npcs БД, ни в XML-шаблонах (CAT-CUSTOM-011)."
         )
 
     raw_bytes = template_path.read_bytes()

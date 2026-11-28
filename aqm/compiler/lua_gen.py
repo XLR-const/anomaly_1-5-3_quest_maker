@@ -751,6 +751,7 @@ class LuaGenerator:
         # Карта отрядов нужна _action_spec, чтобы понять, удерживать ли
         # Story-отряд на точке спавна или он должен идти к target_smart.
         self._project_squads = getattr(project, "squads", None) or {}
+        self._project_npcs = getattr(project, "npcs", None) or {}
 
         module_name = (script_name or DEFAULT_SCRIPT_NAME).strip() or DEFAULT_SCRIPT_NAME
         prefix = (mod_prefix or "quests").strip() or "quests"
@@ -1127,6 +1128,16 @@ class LuaGenerator:
         value = str(squad_id or "").strip()
         if not value:
             return ""
+        squad = self._find_squad_entry(value)
+        if squad is not None:
+            return str(getattr(squad, "id", "") or value)
+        for npc in (getattr(self, "_project_npcs", None) or {}).values():
+            if value in {
+                str(getattr(npc, "id", "") or ""),
+                str(getattr(npc, "story_id", "") or ""),
+                str(getattr(npc, "character_profile", "") or ""),
+            }:
+                return value
         finder = getattr(self.db_client, "find_squad_by_alias", None)
         if not callable(finder):
             return value

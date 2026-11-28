@@ -62,6 +62,13 @@ my_story_mod/
 * `vanilla_dir: null` — сборка работает автономно, без папки `_unpacked`;
 * существующие файлы `aqm init` не перезаписывает (для перезаписи: `--force`).
 
+`ModBuilder()` без аргументов сам открывает вшитую базу, читает `aqm.json` и
+собирает проект даже при полностью отсутствующей `_unpacked`. Для
+`CustomNpc(template_npc_id="...")` поля шаблона (фракция, иконка, биография,
+visual, ранг, репутация, деньги, supplies) берутся из таблицы `npcs` этой же
+базы; XML ванильной игры нужен только как необязательный источник более полных
+данных.
+
 ## Основные команды CLI
 
 | Команда | Назначение |
@@ -83,7 +90,7 @@ aqm search wolf --type npc
 
 ## Единая архитектура и режимы применения
 
-`docs/API_v2.md` — **единственное руководство** по декларативному конструктору
+`doc.md` — **единственное руководство** по декларативному конструктору
 квестов Anomaly 1.5.3. Отдельного второго руководства «для Warfare» нет:
 базовый режим конструктора — обычная свободная игра и сюжетные квесты
 (**Story**), а **Warfare** — опциональная надстройка для захвата смартов.
@@ -103,7 +110,7 @@ aqm search wolf --type npc
 3. Смешивать захват и Story-спавн в одном `Quest` запрещено: валидатор
    возвращает ошибку. Разделяйте сценарий на два квеста.
 
-Эталон Story-цепочки: `examples/build_story_relay.py`.
+Стартовый пример: `scripts/example_quest.py`, создаваемый командой `aqm init`.
 
 ---
 
@@ -269,9 +276,10 @@ print(f"Готовый мод: {builder.output_dir}")
 - пропатченные копии `configs/gameplay/character_desc_<level>.xml` для всех
   локаций, к которым привязаны диалоги.
 
-> **Важно:** `_unpacked` читается только на этапе сборки. В тестах и при
-> разработке моделей используйте временное fake-дерево, чтобы не зависеть от
-> установленной игры.
+> **Важно:** `_unpacked` полностью необязательна. Без неё `ModBuilder()`
+> создаёт минимальный `system.ltx`, пропускает патч ванильных профилей и
+> собирает мод автономно. Временное fake-дерево нужно только для проверки
+> точного патча `system.ltx`/`character_desc_*.xml`.
 
 ### Чек-лист валидности перед сборкой
 
@@ -1205,6 +1213,7 @@ class ModProject(BaseModel):
     required_mods: list[str] = []
     quests: dict[str, Quest] = {}
     dialogs: dict[str, Dialog] = {}
+    npcs: dict[str, CustomNpc] = {}
     squads: dict[str, CustomSquad] = {}
 ```
 
@@ -1214,6 +1223,7 @@ class ModProject(BaseModel):
 | `required_mods` | `list[str]` | `[]` | Декларативный список зависимостей. Ядро его не проверяет. |
 | `quests` | `dict[str, Quest]` | `{}` | Карта квестов. Ключ обязан совпадать с `Quest.id`. |
 | `dialogs` | `dict[str, Dialog]` | `{}` | Карта диалогов. Ключ может отличаться от `Dialog.id`; канонический ID всегда берётся из модели. |
+| `npcs` | `dict[str, CustomNpc]` | `{}` | Карта кастомных NPC. Ключ обязан совпадать с `CustomNpc.id`. При непустой карте генерируются `spawn_sections_<slug>.ltx`, `npc_profile_<slug>.xml` и `character_desc_<slug>.xml`. |
 | `squads` | `dict[str, CustomSquad]` | `{}` | Карта кастомных секций отрядов. Ключ обязан совпадать с `CustomSquad.id`. При непустой карте сборщик пишет `squad_descr_<slug>.ltx`. |
 
 Валидатор `ModProject._validate_cross_references` проверяет:
@@ -1222,6 +1232,7 @@ class ModProject(BaseModel):
 - каждый `Quest.dialog_id` и каждый элемент `Quest.dialog_ids` существует в
   `dialogs`;
 - каждый `Dialog.task_id` существует в `quests`;
+- ключ `npcs` совпадает с `CustomNpc.id`;
 - ключ `squads` совпадает с `CustomSquad.id`.
 
 Методы сериализации:
@@ -1332,6 +1343,7 @@ class CustomSquad(BaseModel):
 
     id: RequiredId
     faction: str
+    template_squad_id: str | None = None
     npc: list[str] = []
     npc_random: list[str] = []
     npc_in_squad: list[int] = []
@@ -1347,6 +1359,7 @@ class CustomSquad(BaseModel):
 |---|---|---|---|---|
 | `id` | `[Общее]` | `RequiredId` | обязательное | Имя LTX-секции, например `mymod_atp_bandit_leader_squad`. Ключ в `ModProject.squads` обязан совпадать. |
 | `faction` | `[Общее]` | `str` | обязательное | Фракция отряда, например `bandit` или `army`. |
+| `template_squad_id` | `[Общее]` | `str \| None` | `None` | Секция ванильного отряда из таблицы `squads` БД. При задании генерируется `[<id>]:<template_squad_id>`, а `npc`/`npc_random` можно не заполнять. |
 | `npc` | `[Общее]` | `list[str]` | `[]` | Явный список секций NPC, например `["sim_default_bandit_4"]`. |
 | `npc_random` | `[Общее]` | `list[str]` | `[]` | Пул секций, из которого движок выбирает NPC случайно. |
 | `npc_in_squad` | `[Общее]` | `list[int]` | `[]` | Размер отряда: `[n]` или `[min, max]`, где `0 <= min <= max`. Значение `max` не должно превышать число шаблонов `npc`/`npc_random`. |
@@ -1630,6 +1643,15 @@ if report.has_errors:
 # Дальше — обычная предполётная валидация объединённого проекта (§3.6).
 ```
 
+### Межглавные инфопоршни через `Quest.available_info`
+
+`Quest.available_info` — штатный способ связать главы без общих Python-объектов.
+Квест следующей главы получает `available_info="<mod_slug>_chapter_1_done"`, а его
+`take`-диалог проверяет `HasInfo(info="<mod_slug>_chapter_1_done")`. Квест
+предыдущей главы выдаёт этот поршень через `complete_info` или `GiveInfo`.
+`aqm merge` сохраняет `available_info` и все условия без изменений, поэтому
+цепочка продолжает работать после объединения.
+
 Правила изоляции глав:
 
 | Код | Severity | Что проверяется | Как исправить |
@@ -1730,16 +1752,25 @@ output/<slug>/
     ├── configs/
     │   ├── gameplay/
     │   │   ├── dialogs_<slug>.xml
-    │   │   └── character_desc_<level>.xml   # копия ванильного + патч
+    │   │   ├── character_desc_<level>.xml      # копия ванильного + патч
+    │   │   ├── character_desc_<slug>.xml       # только при project.npcs
+    │   │   └── npc_profile_<slug>.xml          # только при project.npcs
     │   ├── misc/
-    │   │   └── task/
-    │   │       └── tm_<slug>.ltx
+    │   │   ├── task/
+    │   │   │   └── tm_<slug>.ltx
+    │   │   └── squad_descr/
+    │   │       ├── squad_descr_<slug>.ltx      # только при project.squads
+    │   │       └── squad_descr.ltx             # патченный индекс (если есть ваниль)
+    │   ├── creatures/
+    │   │   ├── spawn_sections_<slug>.ltx       # только при project.npcs
+    │   │   └── spawn_sections.ltx              # патченный индекс (если есть ваниль)
     │   ├── text/
     │   │   ├── rus/
     │   │   │   └── st_<slug>.xml
     │   │   └── eng/
     │   │       └── st_<slug>.xml
-    │   └── system.ltx                        # копия ванильного + патч
+    │   └── system.ltx                          # копия ванильного + патч
+    │                                            # либо минимальный автономный файл
     └── scripts/
         └── <slug>_quests.script
 ```
@@ -2089,7 +2120,7 @@ stage_complete        = 3
 `tsk.stage >= Quest.last_stage`. В противном случае `_can_turn_in` открыл бы
 сдачу на этапе захвата.
 
-## 3.6. Предполётная валидация (`validate_project` и CLI `main.py validate`)
+## 3.6. Предполётная валидация (`validate_project` и `aqm validate`)
 
 До записи файлов проект проверяется пакетом `aqm/validation/`. Точка входа:
 
@@ -2126,10 +2157,23 @@ builder.build_project(project, validate=False) # отключить предпо
 ### CLI
 
 ```text
-python main.py validate <script.py> [--json report.json] [--strict]
+aqm validate scripts/example_quest.py [--json report.json] [--strict]
+aqm build scripts/example_quest.py
+aqm merge chapter_01.py chapter_02.py --slug mymod
+aqm search wolf --type npc
 ```
 
-- `<script.py>` — файл-сценарий, который создаёт и возвращает `ModProject`;
+Точка входа скрипта для `aqm validate` / `aqm build` / `aqm merge`:
+публичная функция без обязательных аргументов
+
+```python
+def create_project() -> ModProject: ...
+# или
+def build_project() -> ModProject: ...
+```
+
+- `scripts/<name>.py` — файл-сценарий, который создаёт и возвращает
+  `ModProject`; канонические имена — `create_project` и `build_project`;
 - `--json report.json` — сохранить машиночитаемый отчёт
   (`summary` + `issues`) в указанный файл;
 - `--strict` — считать `WARNING` ошибкой (для CI).
@@ -2211,9 +2255,10 @@ python main.py validate <script.py> [--json report.json] [--strict]
 | `validate=True` и в отчёте есть `ERROR` | `False`, коды в `logs/app.log`; файлы не пишутся. |
 | Пустое `ModProject.name` | `False`, ERROR в лог. |
 | `quests`/`dialogs` не словари | `False`, ERROR в лог. |
-| Нет ванильного `_unpacked/configs/system.ltx` | `False`, ERROR в лог. |
+| Нет `_unpacked`, но `vanilla_root=None` | Сборка продолжается: минимальный `system.ltx`, без патча ванильных профилей. |
+| `vanilla_root` задан, но `system.ltx` отсутствует | `False`, ERROR в лог. |
 | В `system.ltx` нет `[dialogs]`/`[profiles]` или нужного ключа | `False`, ERROR в лог. |
-| Нет `character_desc_<level>.xml` | `False`, ERROR в лог. |
+| Нет `character_desc_<level>.xml` при заданном `vanilla_root` | `False`, ERROR в лог. |
 | `<specific_character id="...">` не найден | `False`, ERROR в лог. |
 | `<specific_character id="...">` найден дважды | `False`, ERROR в лог. |
 | У диалога есть `npc_id`, но нет `npc_location` | `False`, ERROR в лог. |
@@ -2225,7 +2270,8 @@ python main.py validate <script.py> [--json report.json] [--strict]
 ModBuilder(
     output_dir: Path = Path("output"),
     db_client: GameDatabase | None = None,
-    vanilla_root: Path = Path("_unpacked"),
+    vanilla_root: Path | None = Path("_unpacked"),
+    db_path: Path | None = None,
 )
 
 ModBuilder.build_project(project: ModProject, *, validate: bool = True) -> bool
@@ -2245,9 +2291,16 @@ ModBuilder.patch_character_desc(
 
 | Аргумент | Тип | По умолчанию | Назначение |
 |---|---|---|---|
-| `output_dir` | `Path` | `Path("output")` | Корень сборки. Внутри создаётся каталог `<slug>`. |
-| `db_client` | `GameDatabase \| None` | `None` | Необязательный клиент SQLite. Передаётся в `LuaGenerator`; сейчас не используется для проверок ассетов. |
-| `vanilla_root` | `Path` | `Path("_unpacked")` | Корень распакованной ванильной игры. Тесты обязаны передавать временное fake-дерево. |
+| `output_dir` | `Path` | `Path("output")` | Корень сборки. При наличии `aqm.json` берётся `output_dir` из рабочего пространства. |
+| `db_client` | `GameDatabase \| None` | `None` | Если не передан, автоматически открывается вшитая `aqm/data/anomaly_db.sqlite`; клиент передаётся в `LuaGenerator` и валидаторы. |
+| `vanilla_root` | `Path \| None` | `Path("_unpacked")` | Корень распакованной игры. Если папки/файла нет, сборка работает автономно (`None`). |
+| `db_path` | `Path \| None` | `None` | Явный путь к SQLite-базе вместо вшитой. Используется, только если `db_client` не задан. |
+
+```python
+# Работает «из коробки»: вшитая БД, aqm.json и автономная сборка.
+builder = ModBuilder()
+builder.build_project(project)
+```
 
 ### `build_project(project, *, validate=True) -> bool`
 
@@ -2326,10 +2379,12 @@ from aqm.compiler.builder import BuildError
 
 ## 4.2. Полный Python-скрипт
 
-Скрипт рассчитан на запуск из корня проекта:
+Скрипт сохраняется в рабочем пространстве как `scripts/deadcity_dushman_demo.py`
+и запускается через CLI:
 
 ```text
-python examples/deadcity_dushman_demo.py
+aqm validate scripts/deadcity_dushman_demo.py --strict
+aqm build scripts/deadcity_dushman_demo.py
 ```
 
 ```python
@@ -2346,8 +2401,9 @@ python examples/deadcity_dushman_demo.py
   GiveMoney/GiveItem в actions;
 - сборку мода через ModBuilder.
 
-Запуск из корня проекта:
-    python examples/deadcity_dushman_demo.py
+Запуск из рабочего пространства:
+    aqm validate scripts/deadcity_dushman_demo.py --strict
+    aqm build scripts/deadcity_dushman_demo.py
 """
 
 from __future__ import annotations
@@ -2392,7 +2448,8 @@ REWARD_WEAPON = "wpn_ak74"
 REWARD_MONEY = 50000
 
 # Секция вражеского отряда и алиас смарта. Оба значения должны существовать
-# в вашей сборке; проверьте их через `python main.py search <имя> -t squad/smart`.
+# в вашей сборке; проверьте их через `aqm search <имя> --type squad` и
+# `aqm search <имя> --type smart`.
 # Валидный enemy-отряд Anomaly 1.5.3: squad.killer_advanced
 # (игровой ID merc_sim_squad_advanced). NPC-секция здесь недопустима.
 ENEMY_SQUAD = "squad.killer_advanced"
@@ -2593,10 +2650,8 @@ def main() -> None:
     """Создаёт проект и запускает сборку установочного каталога мода."""
     project = create_dushman_project()
 
-    builder = ModBuilder(
-        output_dir=Path("output"),
-        vanilla_root=Path("_unpacked"),
-    )
+    # Вшитая БД, aqm.json и автономная сборка без _unpacked.
+    builder = ModBuilder()
 
     if not builder.build_project(project):
         raise SystemExit("Сборка не удалась: смотрите logs/app.log.")
@@ -2661,10 +2716,10 @@ output/dead_city_dushmans_debt/gamedata/
 2. Замените `QUEST_ITEM`, `REWARD_WEAPON`, `ENEMY_SQUAD`, `TARGET_SMART` на
    существующие секции/алиасы. Проверяйте их через:
    ```text
-   python main.py search <имя> -t item
-   python main.py search <имя> -t npc
-   python main.py search <имя> -t smart
-   python main.py search <имя> -t squad
+   aqm search <имя> --type item
+   aqm search <имя> --type npc
+   aqm search <имя> --type smart
+   aqm search <имя> --type squad
    ```
 3. Переименуйте `QUEST_ID`, `TAKE_DIALOG_ID`, `TURNIN_DIALOG_ID` в уникальные
    валидные Lua-идентификаторы.
@@ -2676,8 +2731,9 @@ output/dead_city_dushmans_debt/gamedata/
 7. Если награда должна выдаваться автоматически эффектом `_reward`, заполните
    `reward_money`/`reward_item_alias`/`complete_info` и уберите соответствующие
    действия из реплики, чтобы не дублировать награду.
-8. Если диалог не должен быть привязан к NPC, не задавайте `npc_id`
-   (будет warning, диалог всё равно попадёт в XML).
+8. Неквестовый диалог обмена/скупки/лора: `task_id=None`, `role=""`,
+   привязка только через `npc_id` + `npc_location`; **не** добавляйте его в
+   `Quest.dialog_id`/`Quest.dialog_ids`.
 9. Для Warfare-квестов используйте `WarfareCapture` и **не** добавляйте в тот
    же квест `SpawnSquad(mode="story")`. Для Story-квестов используйте только
    `SpawnSquad(mode="story")` и завершайте цепочку через
@@ -2716,9 +2772,13 @@ envoy = CustomNpc(
 )
 ```
 
-* `template_npc_id` — ID из таблицы `npcs` БД. Недостающие
-  `visual/icon/bio/rank/reputation/money/supplies` копируются из
-  `<vanilla_root>/configs/gameplay/<source_file>`.
+* `template_npc_id` — ID из таблицы `npcs` вшитой БД. Все доступные поля
+  (`visual`, `icon`, `bio`, `community`/`faction`, `rank`, `reputation`,
+  `money`, `supplies`) читаются напрямую из SQLite. XML
+  `<vanilla_root>/configs/gameplay/<source_file>` — необязательный источник
+  более полных данных: при отсутствии `_unpacked`/файла сборка не падает, а
+  использует БД и безопасный резервный `visual`. Ошибка `CAT-CUSTOM-011`
+  возникает только если `template_npc_id` нет ни в БД, ни в XML.
 * Из шаблона также переносятся базовые диалоги взаимодействия:
   `<start_dialog>` и общие `<actor_dialog>` (`actor_break_dialog`, `dm_*`,
   `hello_dialog`, `meet_*`); чужие сюжетные диалоги шаблона не копируются.
@@ -2810,6 +2870,12 @@ trade_dialog = Dialog(
     },
 )
 ```
+
+Такой диалог **не добавляйте** в `Quest.dialog_id` / `Quest.dialog_ids` и не
+задавайте ему `task_id`: он не участвует в графе квеста, не получает
+`CompleteTask`/`GiveTask` и не должен учитываться в `aqm merge` как глава.
+Привязка выполняется только через `npc_id` + `npc_location` (для `CustomNpc`
+допустим его `id`), а доступность регулируется `preconditions`/`HasItem`.
 
 ---
 
@@ -2947,7 +3013,7 @@ Warfare-квест с `requires_warfare=True` и Story-квест со
 
 **Как проверить проект до сборки?**
 Вызовите `validate_project(project, db)` или CLI
-`python main.py validate <script.py> --json report.json --strict`.
+`aqm validate <script.py> --json report.json --strict`.
 `ERROR` блокирует сборку; `build_project(..., validate=True)` делает это
 автоматически и пишет отчёт в `logs/app.log` (см. §3.6).
 

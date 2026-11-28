@@ -307,6 +307,33 @@ class GameDatabase:
     # Точечный поиск по алиасу
     # ------------------------------------------------------------------
 
+    def find_npc_by_id(self, npc_id: str) -> dict[str, Any] | None:
+        """Найти NPC по прямому ``id`` из таблицы ``npcs``.
+
+        Args:
+            npc_id (str): Игровой ID профиля NPC.
+
+        Returns:
+            dict[str, Any] | None: Строка NPC либо ``None``.
+        """
+        value = str(npc_id or "").strip()
+        if not value:
+            return None
+        try:
+            rows = self._query(
+                """
+                SELECT 'npc' AS entity_type, NULL AS alias, n.*
+                FROM npcs AS n
+                WHERE n.id = ?
+                LIMIT 1
+                """,
+                (value,),
+            )
+            return dict(rows[0]) if rows else None
+        except sqlite3.Error:
+            logger.exception("Ошибка поиска NPC по id: %r", npc_id)
+            return None
+
     def find_npc_by_alias(self, alias: str) -> dict[str, Any] | None:
         """Найти NPC по алиасу (например, ``esc.mayor_zhurov``)."""
         try:
@@ -343,8 +370,35 @@ class GameDatabase:
             logger.exception("Ошибка поиска смарта по алиасу: %r", alias)
             return None
 
+    def find_item_by_section(self, section: str) -> dict[str, Any] | None:
+        """Найти предмет по прямой секции ``items.id``.
+
+        Args:
+            section (str): Секция предмета (например, ``itm_pda_common``).
+
+        Returns:
+            dict[str, Any] | None: Строка предмета либо ``None``.
+        """
+        value = str(section or "").strip()
+        if not value:
+            return None
+        try:
+            rows = self._query(
+                """
+                SELECT 'item' AS entity_type, NULL AS alias, i.*
+                FROM items AS i
+                WHERE i.id = ?
+                LIMIT 1
+                """,
+                (value,),
+            )
+            return dict(rows[0]) if rows else None
+        except sqlite3.Error:
+            logger.exception("Ошибка поиска предмета по секции: %r", section)
+            return None
+
     def find_item_by_alias(self, alias: str) -> dict[str, Any] | None:
-        """Найти предмет по алиасу (например, ``weapon.vssk_vykhlop``)."""
+        """Найти предмет по алиасу или прямой секции ``items.id``."""
         try:
             rows = self._query(
                 """
@@ -356,13 +410,42 @@ class GameDatabase:
                 """,
                 (alias,),
             )
-            return dict(rows[0]) if rows else None
+            if rows:
+                return dict(rows[0])
         except sqlite3.Error:
             logger.exception("Ошибка поиска предмета по алиасу: %r", alias)
             return None
+        return self.find_item_by_section(alias)
+
+    def find_squad_by_section(self, section: str) -> dict[str, Any] | None:
+        """Найти отряд по прямой секции ``squads.id``.
+
+        Args:
+            section (str): Секция отряда.
+
+        Returns:
+            dict[str, Any] | None: Строка отряда либо ``None``.
+        """
+        value = str(section or "").strip()
+        if not value:
+            return None
+        try:
+            rows = self._query(
+                """
+                SELECT 'squad' AS entity_type, NULL AS alias, s.*
+                FROM squads AS s
+                WHERE s.id = ?
+                LIMIT 1
+                """,
+                (value,),
+            )
+            return self._decorate_squad(rows[0]) if rows else None
+        except sqlite3.Error:
+            logger.exception("Ошибка поиска отряда по секции: %r", section)
+            return None
 
     def find_squad_by_alias(self, alias: str) -> dict[str, Any] | None:
-        """Найти отряд по алиасу и добавить разобранный список NPC."""
+        """Найти отряд по алиасу или прямой секции ``squads.id``."""
         try:
             rows = self._query(
                 """
@@ -374,10 +457,12 @@ class GameDatabase:
                 """,
                 (alias,),
             )
-            return self._decorate_squad(rows[0]) if rows else None
+            if rows:
+                return self._decorate_squad(rows[0])
         except sqlite3.Error:
             logger.exception("Ошибка поиска отряда по алиасу: %r", alias)
             return None
+        return self.find_squad_by_section(alias)
 
     # ------------------------------------------------------------------
     # Живой поиск
